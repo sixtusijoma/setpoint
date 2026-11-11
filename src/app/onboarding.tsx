@@ -1,4 +1,4 @@
-import { HUB_COPY, TOKEN_PATH, WEB_SECRET_COPY } from '@/copy';
+import { HUB_COPY, SERVER_TOKEN_COPY, TOKEN_PATH, WEB_SECRET_COPY } from '@/copy';
 import { deviceNotes, type SwitchBotDevice } from '@/devices/switchbot';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
@@ -73,6 +73,7 @@ export default function OnboardingScreen() {
           <Text style={styles.body}>{TOKEN_PATH}</Text>
           <Text style={styles.body}>{HUB_COPY}</Text>
           {Platform.OS === 'web' ? <Text style={styles.note}>{WEB_SECRET_COPY}</Text> : null}
+          {app.serverConfigured ? <Text style={styles.note}>{SERVER_TOKEN_COPY}</Text> : null}
           <TextInput
             value={token}
             onChangeText={setToken}

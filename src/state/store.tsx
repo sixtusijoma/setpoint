@@ -348,6 +348,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         stateRef.current = next;
         setState(next);
+      } else if (config) {
+        const next: Persisted = { ...stateRef.current, mode: 'live' };
+        stateRef.current = next;
+        setState(next);
       }
       if (creds) {
         setHasCredentials(true);

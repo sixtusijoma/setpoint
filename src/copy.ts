@@ -4,6 +4,9 @@ export const TOKEN_PATH =
 export const HUB_COPY =
   'Remote control needs a SwitchBot Hub near the bots and the meter, with cloud service enabled. Bots should be in Press Mode. Setpoint sends press, not on or off.';
 
+export const SERVER_TOKEN_COPY =
+  'If the shared server already has your token and secret, leave both fields blank and tap Save and load devices.';
+
 export const WEB_SECRET_COPY =
   'This browser is for demo mode and is not a secure place for a real token. A token saved here lasts only for this tab session. Use the iPhone app for live control.';
 

@@ -2,12 +2,19 @@
   "expo": {
     "name": "Setpoint",
     "slug": "setpoint",
+    "owner": "setwise-sixtus",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "setpoint",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "runtimeVersion": {
+      "policy": "sdkVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/6b926210-6da5-4261-96cc-0b5c612cb452"
+    },
     "ios": {
       "icon": "./assets/expo.icon",
       "supportsTablet": false,
@@ -52,6 +59,11 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "6b926210-6da5-4261-96cc-0b5c612cb452"
+      }
     }
   }
 }
