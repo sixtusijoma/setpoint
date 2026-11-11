@@ -327,6 +327,27 @@ export async function handlePrune(request: Request, options: HandlerOptions): Pr
   return json(request, options.env, await options.db.pruneReads());
 }
 
+function meterReader(options: HandlerOptions) {
+  return async (): Promise<{ temperatureF: number; humidity: number; co2Ppm: number }> => {
+    const meter = (await options.db.readState()).deviceMap.meter;
+    if (!meter) {
+      throw new Error('No meter is mapped. Pick the meter in Settings.');
+    }
+    if (meter.enableCloudService === false) {
+      throw new Error('The meter has cloud service turned off.');
+    }
+    if (options.readMeterDevice) {
+      return options.readMeterDevice(meter.id);
+    }
+    const creds = await credentials(options.db, options.env);
+    if (!creds) {
+      throw new Error('SwitchBot credentials are not on the server.');
+    }
+    const live = await readMeter(creds, meter.id);
+    return { temperatureF: live.temperatureF, humidity: live.humidity, co2Ppm: live.co2Ppm };
+  };
+}
+
 export async function handleMcpRequest(request: Request, options: HandlerOptions): Promise<Response> {
   if (request.method === 'OPTIONS') {
     return empty(request, options.env);
@@ -339,15 +360,7 @@ export async function handleMcpRequest(request: Request, options: HandlerOptions
   const result = await handleMcp(options.db, body, {
     now: options.now,
     press: await pressWith(options, state),
-    readMeter: options.readMeterDevice
-      ? async () => {
-          const meter = (await options.db.readState()).deviceMap.meter;
-          if (!meter) {
-            throw new Error('No meter is mapped.');
-          }
-          return options.readMeterDevice!(meter.id);
-        }
-      : undefined,
+    readMeter: meterReader(options),
   });
   return json(request, options.env, result);
 }

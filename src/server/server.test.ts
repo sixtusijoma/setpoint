@@ -551,6 +551,51 @@ describe('shared server', () => {
     expect(preflight.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:43117');
     expect(preflight.headers.get('access-control-allow-headers')).toContain(APP_KEY_HEADER);
   });
+
+  it('reads the room through the MCP tool with live SwitchBot credentials', async () => {
+    const env = appEnv();
+    const call = (id: number) =>
+      handleMcpRequest(
+        new Request('http://local/mcp', {
+          method: 'POST',
+          headers: { authorization: 'Bearer mcp-placeholder', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'read_room', arguments: {} } }),
+        }),
+        { db, env, now: () => wednesdayMorning },
+      );
+
+    const noCreds = await (await call(1)).json();
+    expect(noCreds.result.isError).toBe(true);
+    expect(textOf(noCreds)).toBe('SwitchBot credentials are not on the server.');
+
+    await db.saveCredentials('placeholder-token', 'placeholder-secret');
+    const urls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({
+        statusCode: 100,
+        message: 'success',
+        body: { temperature: 20, humidity: 51, CO2: 1074, battery: 52 },
+      }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const read = await (await call(2)).json();
+      expect(read.result.isError).toBeUndefined();
+      expect(JSON.parse(textOf(read))).toEqual({ at: wednesdayMorning.toISOString(), temperatureF: 68, humidity: 51, co2Ppm: 1074 });
+      expect(urls).toHaveLength(1);
+      expect(urls[0]).toContain('/devices/meter/status');
+      expect(await db.listReads('2026-11-01T00:00:00.000Z')).toHaveLength(1);
+
+      await db.patchState(null, { deviceMap: { up: bot('up'), down: bot('down'), meter: null } });
+      const unmapped = await (await call(3)).json();
+      expect(unmapped.result.isError).toBe(true);
+      expect(textOf(unmapped)).toBe('No meter is mapped. Pick the meter in Settings.');
+      expect(urls).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe('rest client', () => {
