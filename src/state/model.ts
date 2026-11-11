@@ -1,5 +1,10 @@
+import type { HistorySample, SetpointChange } from '@/domain/history';
+import type { CommandSource } from '@/domain/pressSession';
 import { defaultEvents, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
+import type { SchedulePhase } from '@/domain/scheduleRunner';
 import { initialClimate, type ClimateState } from '@/devices/simulator';
+
+export type { CommandSource };
 
 export type Mode = 'demo' | 'live';
 
@@ -75,15 +80,11 @@ export type Persisted = {
   log: LogEntry[];
   demoClimate: ClimateState;
   lastLive: LiveReading | null;
+  catchupNote: string | null;
+  schedulePhase: SchedulePhase;
+  history: HistorySample[];
+  changes: SetpointChange[];
 };
-
-export type CommandSource =
-  | { kind: 'manual' }
-  | { kind: 'set-to' }
-  | { kind: 'preset'; label: string }
-  | { kind: 'schedule' }
-  | { kind: 'resume' }
-  | { kind: 'apply-now' };
 
 export function createId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -124,6 +125,10 @@ export function createDefaultState(nowIso: string): Persisted {
     log: [],
     demoClimate: initialClimate(nowIso),
     lastLive: null,
+    catchupNote: null,
+    schedulePhase: 'armed',
+    history: [],
+    changes: [],
   };
 }
 

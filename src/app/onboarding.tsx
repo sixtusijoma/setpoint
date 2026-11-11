@@ -154,8 +154,8 @@ export default function OnboardingScreen() {
           <Stepper
             testID="calibration-value"
             value={`${temperature}°`}
-            onMinus={() => setTemperature((value) => Math.max(40, value - 1))}
-            onPlus={() => setTemperature((value) => Math.min(95, value + 1))}
+            onMinus={() => setTemperature((value) => Math.max(app.state.settings.minF, value - 1))}
+            onPlus={() => setTemperature((value) => Math.min(app.state.settings.maxF, value + 1))}
             minusLabel="Lower calibration temperature"
             plusLabel="Raise calibration temperature"
           />

@@ -1,5 +1,6 @@
 import { ConfirmDialog, PillButton, Sheet, Stepper } from '@/components/ui';
-import { latestRecord, nextOccurrence, upcomingOccurrences, type ScheduleEvent } from '@/domain/schedule';
+import { upcomingForEvent } from '@/domain/occurrences';
+import { latestRecord, nextOccurrence, openCancelled, upcomingOccurrences, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import { TIME_ZONE_LABEL, dayNames, formatClock, formatInstant, to12Hour, to24Hour } from '@/domain/time';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
@@ -13,12 +14,13 @@ export default function ScheduleScreen() {
   const app = useApp();
   const insets = useSafeAreaInsets();
   const [editing, setEditing] = useState<ScheduleEvent | null>(null);
+  const [skipping, setSkipping] = useState<ScheduleEvent | null>(null);
   const [restoreOpen, setRestoreOpen] = useState(false);
-  const last = latestRecord(app.state.records, ['ran', 'already']);
+  const last = latestRecord(app.state.records, ['done-early', 'done-on-time', 'done-late', 'already']);
   const missed = latestRecord(app.state.records, ['missed']);
   const next = nextOccurrence(app.state.events, app.clock);
   const reminders = upcomingOccurrences(app.state.events, app.clock, 14).slice(0, 8);
-  const cancelled = app.state.records.filter((record) => record.status === 'cancelled');
+  const cancelled = openCancelled(app.state.records);
 
   return (
     <ScrollView
@@ -37,9 +39,16 @@ export default function ScheduleScreen() {
       </View>
       <Text style={styles.body}>
         {app.state.hold
-          ? 'A temporary hold is on. The next due change ends it, or you can resume from Home.'
-          : 'Following the schedule. Due changes run while Setpoint is open.'}
+          ? 'A temporary hold is on. When it ends, Setpoint applies only the latest due change and marks earlier ones missed. Resume from Home.'
+          : app.serverConfigured && app.state.mode === 'live'
+            ? 'The shared server runs due changes even when the phone is asleep.'
+            : 'Following the schedule. Due changes run while Setpoint is open, and when you bring it back.'}
       </Text>
+      {app.state.catchupNote ? (
+        <Text testID="catchup-note" style={styles.note}>
+          {app.state.catchupNote}
+        </Text>
+      ) : null}
       {cancelled.map((record) => (
         <View key={record.key} style={styles.cancelled}>
           <Text style={styles.eventTitle}>
@@ -58,21 +67,66 @@ export default function ScheduleScreen() {
       {app.state.events.length === 0 ? (
         <Text style={styles.body}>No events. The thermostat stays where you set it until you add one.</Text>
       ) : null}
-      {app.state.events.map((event) => (
-        <Pressable key={event.id} testID={`event-${event.id}`} style={styles.event} onPress={() => setEditing(event)}>
-          <View style={styles.eventTop}>
-            <Text style={styles.eventTitle}>{event.label}</Text>
-            <Text style={styles.eventTemp}>{event.targetF}°</Text>
+      {app.state.events.map((event) => {
+        const related = app.state.records.filter((record) => record.eventId === event.id).slice(-3).reverse();
+        return (
+          <View key={event.id} testID={`event-${event.id}`} style={styles.event}>
+            <Pressable onPress={() => setEditing(event)}>
+              <View style={styles.eventTop}>
+                <Text style={styles.eventTitle}>{event.label}</Text>
+                <Text style={styles.eventTemp}>{event.targetF}°</Text>
+              </View>
+              <Text style={styles.body}>
+                {dayNames(event.days)} · {formatClock(event.hour, event.minute)}
+                {event.enabled ? '' : ' · off'}
+              </Text>
+            </Pressable>
+            {related.map((record) => (
+              <View key={record.key} style={styles.related}>
+                <Text style={styles.body}>{occurrenceCopy(record)}</Text>
+                {canUndo(record) ? (
+                  <PillButton
+                    label="Undo"
+                    tone="ghost"
+                    testID={`undo-${record.eventId}`}
+                    onPress={() => {
+                      void app.undoOccurrence(record.key);
+                    }}
+                  />
+                ) : null}
+              </View>
+            ))}
+            <View style={styles.actions}>
+              <PillButton
+                label={runLabel(event.label)}
+                testID={`run-now-${event.id}`}
+                onPress={() => {
+                  void app.runEventNow(event.id);
+                }}
+              />
+              <PillButton
+                label="Skip next"
+                tone="ghost"
+                testID={`skip-next-${event.id}`}
+                onPress={() => app.skipNext(event.id)}
+              />
+              <PillButton
+                label="Skip a day"
+                tone="ghost"
+                testID={`skip-day-${event.id}`}
+                onPress={() => setSkipping(event)}
+              />
+            </View>
           </View>
-          <Text style={styles.body}>
-            {dayNames(event.days)} · {formatClock(event.hour, event.minute)}
-            {event.enabled ? '' : ' · off'}
-          </Text>
-        </Pressable>
-      ))}
+        );
+      })}
       <PillButton label="Add event" onPress={app.addEvent} />
       <Text style={styles.section}>Reminders</Text>
-      <Text style={styles.body}>Open Setpoint to run each one. A suspended phone will not press the bots on its own.</Text>
+      <Text style={styles.body}>
+        {app.serverConfigured && app.state.mode === 'live'
+          ? 'The server runs each change on its timer. These reminders are a backup if you also want a nudge.'
+          : 'Open Setpoint to run each one. A suspended phone will not press the bots on its own.'}
+      </Text>
       {reminders.map((item) => (
         <Text key={item.key} style={styles.reminder}>
           {item.label} · set to {item.targetF}° · {formatInstant(item.at, true)}
@@ -84,6 +138,8 @@ export default function ScheduleScreen() {
           event={editing}
           minF={app.state.settings.minF}
           maxF={app.state.settings.maxF}
+          step={app.state.settings.step}
+          setpoint={app.state.virtualSetpoint}
           onClose={() => setEditing(null)}
           onSave={(event) => {
             app.saveEvent(event);
@@ -94,6 +150,34 @@ export default function ScheduleScreen() {
             setEditing(null);
           }}
         />
+      ) : null}
+      {skipping ? (
+        <Sheet visible onClose={() => setSkipping(null)}>
+          <Text style={styles.editorTitle}>Skip a day</Text>
+          <Text style={styles.body}>Pick one date. There is no holiday list. Undo it from the schedule afterward.</Text>
+          {upcomingForEvent(app.state.events, skipping.id, app.clock, 21)
+            .slice(0, 8)
+            .map((item) => {
+              const day = item.at.slice(0, 10);
+              return (
+                <PillButton
+                  key={item.key}
+                  label={`${skipping.label} · ${formatInstant(item.at, true)}`}
+                  testID={`skip-date-${skipping.id}`}
+                  onPress={() => {
+                    const local = new Intl.DateTimeFormat('en-CA', {
+                      timeZone: 'America/New_York',
+                      year: 'numeric',
+                      month: '2-digit',
+                      day: '2-digit',
+                    }).format(new Date(item.at));
+                    app.skipOnDate(skipping.id, local || day);
+                    setSkipping(null);
+                  }}
+                />
+              );
+            })}
+        </Sheet>
       ) : null}
       <ConfirmDialog
         visible={restoreOpen}
@@ -119,10 +203,54 @@ function Summary({ label, value }: { label: string; value: string }) {
   );
 }
 
+function runLabel(label: string): string {
+  if (label === 'Sleep') {
+    return 'Sleep now';
+  }
+  if (label === 'Wake') {
+    return 'Wake now';
+  }
+  return 'Run now';
+}
+
+function canUndo(record: RunRecord): boolean {
+  if (record.status === 'skipped') {
+    return true;
+  }
+  if (record.via === 'run-now' && (record.status === 'done-early' || record.status === 'done-late')) {
+    return true;
+  }
+  return false;
+}
+
+function occurrenceCopy(record: RunRecord): string {
+  if (record.status === 'skipped') {
+    return `Skipped ${formatInstant(record.occurrenceAt, true)}`;
+  }
+  if (record.status === 'done-early') {
+    return `Ran early · ${formatInstant(record.occurrenceAt, true)}`;
+  }
+  if (record.status === 'done-late') {
+    return `Ran late · ${formatInstant(record.occurrenceAt, true)}`;
+  }
+  if (record.status === 'done-on-time' || record.status === 'already') {
+    return `Ran on time · ${formatInstant(record.occurrenceAt, true)}`;
+  }
+  if (record.status === 'missed') {
+    return `Missed · ${formatInstant(record.occurrenceAt, true)}`;
+  }
+  if (record.status === 'failed' || record.status === 'ambiguous' || record.status === 'refused' || record.status === 'cancelled') {
+    return record.message;
+  }
+  return record.message;
+}
+
 function Editor({
   event,
   minF,
   maxF,
+  step,
+  setpoint,
   onClose,
   onSave,
   onDelete,
@@ -130,12 +258,16 @@ function Editor({
   event: ScheduleEvent;
   minF: number;
   maxF: number;
+  step: number;
+  setpoint: number | null;
   onClose: () => void;
   onSave: (event: ScheduleEvent) => void;
   onDelete: () => void;
 }) {
   const [draft, setDraft] = useState(event);
+  const [error, setError] = useState<string | null>(null);
   const clock = to12Hour(draft.hour);
+  const aligned = setpoint === null || (draft.targetF - setpoint) % step === 0;
   return (
     <Sheet visible onClose={onClose}>
       <Text style={styles.editorTitle}>Edit event</Text>
@@ -208,9 +340,15 @@ function Editor({
       </View>
       <Stepper
         value={`${draft.targetF}°`}
-        onMinus={() => setDraft({ ...draft, targetF: Math.max(minF, draft.targetF - 1) })}
-        onPlus={() => setDraft({ ...draft, targetF: Math.min(maxF, draft.targetF + 1) })}
+        onMinus={() => setDraft({ ...draft, targetF: Math.max(minF, draft.targetF - step) })}
+        onPlus={() => setDraft({ ...draft, targetF: Math.min(maxF, draft.targetF + step) })}
       />
+      {aligned ? null : (
+        <Text style={styles.body}>
+          {draft.targetF}° does not line up with the {step}° step from {setpoint}°.
+        </Text>
+      )}
+      {error ? <Text style={styles.body}>{error}</Text> : null}
       <View style={styles.enabled}>
         <Text style={styles.body}>Enabled</Text>
         <Switch
@@ -220,7 +358,18 @@ function Editor({
           thumbColor={colors.text}
         />
       </View>
-      <PillButton label="Save event" testID="save-event" onPress={() => onSave(draft)} />
+      <PillButton
+        label="Save event"
+        testID="save-event"
+        disabled={!aligned}
+        onPress={() => {
+          if (!aligned) {
+            setError(`Change the target so it lines up with the ${step}° step.`);
+            return;
+          }
+          onSave(draft);
+        }}
+      />
       <PillButton label="Delete" tone="ghost" onPress={onDelete} />
     </Sheet>
   );
@@ -242,6 +391,9 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   body: { color: colors.muted, fontFamily: fonts.body, fontSize: 14, lineHeight: 20 },
+  note: { color: colors.neutral, fontFamily: fonts.medium, fontSize: 14, lineHeight: 20 },
+  actions: { gap: 8, marginTop: 8 },
+  related: { gap: 6, marginTop: 8 },
   event: { backgroundColor: colors.card, borderRadius: 16, padding: 14, gap: 4 },
   eventTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   eventTitle: { color: colors.text, fontFamily: fonts.semibold, fontSize: 18 },

@@ -1,11 +1,13 @@
 import type { PressAction, SetPlan } from '@/domain/planSetTo';
+import { runPressSession, type CommandSource } from '@/domain/pressSession';
 
 export type ExecuteResult = {
-  status: 'done' | 'cancelled' | 'failed';
+  status: 'done' | 'cancelled' | 'failed' | 'ambiguous';
   completedPresses: number;
   stoppedAt: number;
   wanted: number;
   error?: string;
+  notifyCheck: boolean;
 };
 
 export type ExecuteDeps = {
@@ -24,45 +26,78 @@ export async function executePlan(
   plan: OkPlan,
   startSetpoint: number,
   deps: ExecuteDeps,
+  source: CommandSource = { kind: 'manual' },
 ): Promise<ExecuteResult> {
-  let setpoint = startSetpoint;
   let completedPresses = 0;
-  const total = plan.actions.length;
-  for (let index = 0; index < plan.actions.length; index += 1) {
-    const action = plan.actions[index];
-    if (deps.isCancelled()) {
-      return { status: 'cancelled', completedPresses, stoppedAt: setpoint, wanted: plan.target };
-    }
-    deps.onProgress(index + 1, total, action);
-    if (index > 0) {
-      const aborted = await deps.sleep(deps.delayMs, deps.isCancelled);
-      if (aborted || deps.isCancelled()) {
-        return { status: 'cancelled', completedPresses, stoppedAt: setpoint, wanted: plan.target };
-      }
-    }
-    try {
-      if (action.direction === 'up') {
+  const settled = await runPressSession({
+    current: startSetpoint,
+    target: plan.target,
+    source,
+    mode: 'demo',
+    plan,
+    delayMs: deps.delayMs,
+    press: async (direction) => {
+      if (direction === 'up') {
         await deps.pressUp();
-      } else {
-        await deps.pressDown();
+        return;
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'The press failed.';
-      return {
-        status: 'failed',
-        completedPresses,
-        stoppedAt: setpoint,
-        wanted: plan.target,
-        error: message,
-      };
-    }
-    completedPresses += 1;
-    if (action.kind === 'adjust' && action.setpointAfter !== null) {
-      setpoint = action.setpointAfter;
-    }
-    deps.onCommitted(action);
+      await deps.pressDown();
+    },
+    sleep: deps.sleep,
+    beforeSend: async (index, isCancelled) => {
+      const action = plan.actions[index];
+      if (action) {
+        deps.onProgress(index + 1, plan.actions.length, action);
+      }
+      if (index === 0) {
+        return isCancelled();
+      }
+      return false;
+    },
+    isCancelled: deps.isCancelled,
+    isInterrupted: () => false,
+    onSession: () => undefined,
+    onCommitted: (action) => {
+      completedPresses += 1;
+      deps.onCommitted(action);
+    },
+  });
+  if (settled.status === 'done') {
+    return {
+      status: 'done',
+      completedPresses,
+      stoppedAt: settled.stoppedAt,
+      wanted: settled.wanted,
+      notifyCheck: false,
+    };
   }
-  return { status: 'done', completedPresses, stoppedAt: setpoint, wanted: plan.target };
+  if (settled.status === 'cancelled') {
+    return {
+      status: 'cancelled',
+      completedPresses,
+      stoppedAt: settled.stoppedAt,
+      wanted: settled.wanted,
+      notifyCheck: false,
+    };
+  }
+  if (settled.status === 'ambiguous') {
+    return {
+      status: 'ambiguous',
+      completedPresses,
+      stoppedAt: settled.stoppedAt,
+      wanted: settled.wanted,
+      error: settled.reason,
+      notifyCheck: true,
+    };
+  }
+  return {
+    status: 'failed',
+    completedPresses,
+    stoppedAt: settled.stoppedAt,
+    wanted: settled.wanted,
+    error: settled.reason,
+    notifyCheck: false,
+  };
 }
 
 export function sleepUnlessCancelled(ms: number, isCancelled: () => boolean): Promise<boolean> {

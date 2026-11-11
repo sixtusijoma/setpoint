@@ -22,6 +22,17 @@ export async function requestReminderPermission(): Promise<string> {
   return 'This browser can notify you now, but it cannot be trusted to fire later. Upcoming changes stay listed in Setpoint.';
 }
 
+export async function notifyCheckThermostat(body: string): Promise<void> {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+    return;
+  }
+  try {
+    new Notification('Check the thermostat', { body });
+  } catch {
+    return;
+  }
+}
+
 export function watchNotificationOpen(_onOpen: () => void): () => void {
   return () => undefined;
 }

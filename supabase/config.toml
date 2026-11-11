@@ -1,0 +1,34 @@
+project_id = "setpoint"
+
+[api]
+enabled = true
+
+[functions.state]
+verify_jwt = false
+
+[functions.press]
+verify_jwt = false
+
+[functions.session]
+verify_jwt = false
+
+[functions.tick]
+verify_jwt = false
+
+[functions.meter]
+verify_jwt = false
+
+[functions.history]
+verify_jwt = false
+
+[functions.credentials]
+verify_jwt = false
+
+[functions.devices]
+verify_jwt = false
+
+[functions.prune]
+verify_jwt = false
+
+[functions.mcp]
+verify_jwt = false

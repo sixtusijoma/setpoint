@@ -7,6 +7,7 @@ import {
   defaultEvents,
   listOccurrences,
   nextOccurrence,
+  openCancelled,
   planDue,
   type RunRecord,
 } from '@/domain/schedule';
@@ -108,7 +109,12 @@ describe('schedule clock', () => {
       events: defaultEvents(),
       records: [],
       now: during,
-      hold: { until: sleep?.at ?? null, label: 'Sleep' },
+      hold: {
+        kind: 'until-event',
+        eventId: sleep?.eventId ?? 'default-sleep',
+        label: 'Sleep',
+        occurrenceAt: sleep?.at ?? '',
+      },
       catchupFrom: iso({ year: 2026, month: 11, day: 6, hour: 12, minute: 0 }),
       retryFailed: true,
     });
@@ -119,7 +125,12 @@ describe('schedule clock', () => {
       events: defaultEvents(),
       records: [],
       now: at({ year: 2026, month: 11, day: 7, hour: 8, minute: 0 }),
-      hold: { until: sleep?.at ?? null, label: 'Sleep' },
+      hold: {
+        kind: 'until-event',
+        eventId: sleep?.eventId ?? 'default-sleep',
+        label: 'Sleep',
+        occurrenceAt: sleep?.at ?? '',
+      },
       catchupFrom: iso({ year: 2026, month: 11, day: 6, hour: 12, minute: 0 }),
       retryFailed: true,
     });
@@ -170,5 +181,30 @@ describe('schedule clock', () => {
       retryFailed: true,
     });
     expect(cancelled.apply?.label).not.toBe('Wake');
+  });
+});
+
+describe('cancelled inbox', () => {
+  it('hides a cancelled occurrence once a later one has run', () => {
+    const early: RunRecord = {
+      key: 'early',
+      eventId: 'default-wake',
+      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 6, minute: 45 }),
+      label: 'Wake',
+      targetF: 70,
+      status: 'cancelled',
+      message: 'Cancelled',
+      recordedAt: iso({ year: 2026, month: 11, day: 10, hour: 6, minute: 50 }),
+    };
+    const later: RunRecord = {
+      ...early,
+      key: 'later',
+      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 23, minute: 45 }),
+      label: 'Sleep',
+      targetF: 61,
+      status: 'done-on-time',
+    };
+    expect(openCancelled([early]).map((record) => record.key)).toEqual(['early']);
+    expect(openCancelled([early, later])).toEqual([]);
   });
 });

@@ -1,9 +1,33 @@
+import { BROWSER_BLOCKED, CHECK_THERMOSTAT } from '@/copy';
 import { co2ForBand, type Co2Tone } from '@/domain/co2';
-import { executePlan, sleepUnlessCancelled } from '@/domain/execute';
+import { deriveLink, mapRejection } from '@/domain/link';
+import { reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
+import { pushMessage, type AppMessage } from '@/domain/messages';
+import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '@/domain/occurrences';
 import { nearestTarget, planSetTo } from '@/domain/planSetTo';
-import { currentTarget, defaultEvents, nextOccurrence, upsertRecord, type ScheduleEvent } from '@/domain/schedule';
+import {
+  idleSession,
+  isRunning,
+  PressOutcomeError,
+  runPressSession,
+  sessionProgress,
+  shouldStartHold,
+  type CommandSource,
+  type PressSession,
+} from '@/domain/pressSession';
+import {
+  chipFor,
+  currentTarget,
+  defaultEvents,
+  holdFor,
+  intendedTarget,
+  scheduleEditResetsCursor,
+  type ScheduleEvent,
+} from '@/domain/schedule';
 import { runDueSchedule } from '@/domain/scheduleRunner';
-import { formatClock, formatInstant } from '@/domain/time';
+import { writeSetpoint } from '@/domain/setpoint';
+import { formatClock } from '@/domain/time';
+import { seedDemoHistory } from '@/domain/history';
 import { driftClimate, initialClimate } from '@/devices/simulator';
 import {
   deviceNotes,
@@ -14,9 +38,22 @@ import {
   TransportError,
   type SwitchBotDevice,
 } from '@/devices/switchbot';
-import { BROWSER_BLOCKED } from '@/copy';
 import { errorFeedback, pressFeedback, successFeedback } from '@/haptics';
-import { requestReminderPermission, syncReminders, watchNotificationOpen } from '@/notifications/reminders';
+import { notifyCheckThermostat, requestReminderPermission, syncReminders, watchNotificationOpen } from '@/notifications/reminders';
+import {
+  cancelRemotePress,
+  fetchHistory,
+  fetchRemoteDevices,
+  fetchRemoteSession,
+  fetchState,
+  readServerConfig,
+  requestRemoteMeter,
+  runRemotePress,
+  saveRemoteCredentials,
+  saveState,
+  type ServerConfig,
+  type SharedSnapshot,
+} from '@/server/appClient';
 import { clearCredentials, loadCredentials, maskSecret, saveCredentials } from '@/storage/credentials';
 import { loadPersisted, savePersisted } from '@/storage/persist';
 import {
@@ -24,22 +61,24 @@ import {
   createDefaultState,
   createId,
   deviceFromApi,
-  type CommandSource,
-  type DeviceRef,
   type Persisted,
   type Preset,
 } from '@/state/model';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AppState, Platform, type AppStateStatus } from 'react-native';
 
+const FIRST_ARM_MS = 800;
+const DEMO_PRESS_MS = 1200;
+
 export type CommandProgress = {
   index: number;
   total: number;
   target: number;
+  label: 'press' | 'finishing';
 };
 
 export type CommandResult = {
-  status: 'done' | 'already' | 'cancelled' | 'failed' | 'refused' | 'busy';
+  status: 'done' | 'already' | 'cancelled' | 'failed' | 'refused' | 'busy' | 'ambiguous';
   stoppedAt: number;
   wanted: number;
   reason?: string;
@@ -57,6 +96,7 @@ type AppContextValue = {
   hasCredentials: boolean;
   tokenMask: string | null;
   secretMask: string | null;
+  serverConfigured: boolean;
   clearBanner: () => void;
   setMode: (mode: Persisted['mode']) => void;
   setRoomLabel: (label: string) => void;
@@ -66,7 +106,7 @@ type AppContextValue = {
   forgetCredentials: () => Promise<void>;
   mapRole: (role: 'up' | 'down' | 'meter', device: SwitchBotDevice | null) => void;
   completeCalibration: (temp: number) => void;
-  recalibrate: (temp: number) => void;
+  recalibrate: (temp: number) => string | null;
   bump: (direction: 1 | -1) => Promise<void>;
   setTo: (target: number) => Promise<CommandResult>;
   applyPreset: (preset: Preset) => Promise<void>;
@@ -74,6 +114,7 @@ type AppContextValue = {
   refreshClimate: () => Promise<void>;
   setCo2Band: (tone: Co2Tone) => void;
   setFailNext: (value: boolean) => void;
+  setLoseNext: (value: boolean) => void;
   resetDemo: () => void;
   updatePreset: (id: string, patch: Partial<Pick<Preset, 'label' | 'tempF'>>) => void;
   saveEvent: (event: ScheduleEvent) => void;
@@ -83,13 +124,15 @@ type AppContextValue = {
   resumeSchedule: () => Promise<void>;
   applyCancelled: (key: string) => Promise<void>;
   allowReminders: () => Promise<string>;
+  skipNext: (eventId: string) => void;
+  skipOnDate: (eventId: string, day: string) => void;
+  undoOccurrence: (key: string) => Promise<void>;
+  runEventNow: (eventId: string) => Promise<void>;
+  retrySchedule: () => Promise<void>;
+  loadHistory: (span: 'day' | 'week') => Promise<void>;
 };
 
 const AppContext = createContext<AppContextValue | null>(null);
-
-function startsHold(source: CommandSource): boolean {
-  return source.kind === 'manual' || source.kind === 'set-to' || source.kind === 'preset';
-}
 
 function explainError(error: unknown): string {
   if (Platform.OS === 'web' && (error instanceof TransportError || isFetchFailure(error))) {
@@ -108,30 +151,138 @@ function isFetchFailure(error: unknown): boolean {
   return /failed to fetch|network request failed|load failed/i.test(error.message);
 }
 
+function changeMark(source: CommandSource, setpoint: number): { source: string; label: string } {
+  if (source.kind === 'run-now' && source.label === 'Sleep') {
+    return { source: 'sleep-now', label: `Sleep now · ${setpoint}°` };
+  }
+  if (source.kind === 'run-now' && source.label === 'Wake') {
+    return { source: 'wake-now', label: `Wake now · ${setpoint}°` };
+  }
+  if (source.kind === 'run-now') {
+    return { source: 'run-now', label: `${source.label} now · ${setpoint}°` };
+  }
+  if (source.kind === 'schedule' || source.kind === 'resume' || source.kind === 'retry') {
+    return { source: 'schedule', label: `Schedule · ${setpoint}°` };
+  }
+  if (source.kind === 'preset') {
+    return { source: 'manual', label: `${source.label} · ${setpoint}°` };
+  }
+  return { source: 'manual', label: `Manual · ${setpoint}°` };
+}
+
+function snapshotFrom(state: Persisted, version: number): SharedSnapshot {
+  return {
+    version,
+    virtualSetpoint: state.virtualSetpoint,
+    catchupFrom: state.catchupFrom,
+    mode: 'live',
+    hold: state.hold,
+    settings: state.settings,
+    deviceMap: state.deviceMap,
+    presets: state.presets,
+    events: state.events,
+    records: state.records,
+    schedulePhase: state.schedulePhase,
+    catchupNote: state.catchupNote,
+    roomLabel: state.roomLabel,
+  };
+}
+
+function applySnapshot(prev: Persisted, snap: SharedSnapshot): Persisted {
+  return {
+    ...prev,
+    virtualSetpoint: snap.virtualSetpoint,
+    catchupFrom: snap.catchupFrom,
+    hold: snap.hold,
+    settings: { ...prev.settings, ...snap.settings },
+    deviceMap: snap.deviceMap,
+    presets: snap.presets,
+    events: snap.events,
+    records: snap.records,
+    schedulePhase: snap.schedulePhase,
+    catchupNote: snap.catchupNote,
+    roomLabel: snap.roomLabel || prev.roomLabel,
+    mode: 'live',
+  };
+}
+
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<Persisted>(() => createDefaultState(new Date().toISOString()));
   const [ready, setReady] = useState(false);
   const [clock, setClock] = useState(() => new Date());
   const [command, setCommand] = useState<CommandProgress | null>(null);
-  const [banner, setBanner] = useState<string | null>(null);
+  const [message, setMessage] = useState<AppMessage>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [devices, setDevices] = useState<SwitchBotDevice[]>([]);
   const [deviceMessage, setDeviceMessage] = useState<string | null>(null);
   const [hasCredentials, setHasCredentials] = useState(false);
   const [tokenMask, setTokenMask] = useState<string | null>(null);
   const [secretMask, setSecretMask] = useState<string | null>(null);
+  const [serverConfigured] = useState(() => readServerConfig() !== null);
   const stateRef = useRef(state);
+  const messageRef = useRef<AppMessage>(null);
   const cancelRef = useRef(false);
-  const runningRef = useRef(false);
+  const interruptRef = useRef(false);
+  const sessionRef = useRef<PressSession>(idleSession());
+  const resumeAfterRef = useRef(false);
+  const refreshingRef = useRef(false);
   const tickLock = useRef(false);
-  const retryArmed = useRef(true);
   const tickImpl = useRef<(now: Date) => Promise<void>>(async () => undefined);
+  const lifecycleRef = useRef<Lifecycle>({ kind: 'boot' });
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
+  const saveLatest = useRef<Persisted | null>(null);
+  const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const serverVersion = useRef(0);
+  const pullSharedRef = useRef<() => Promise<void>>(async () => undefined);
+
+  const showMessage = useCallback((next: AppMessage) => {
+    const merged = next === null ? null : pushMessage(messageRef.current, next);
+    messageRef.current = merged;
+    setMessage(merged);
+  }, []);
 
   const commit = useCallback((recipe: (prev: Persisted) => Persisted) => {
     const next = recipe(stateRef.current);
     stateRef.current = next;
     setState(next);
   }, []);
+
+  const pushShared = useCallback((next: Persisted) => {
+    const config = readServerConfig();
+    if (!config || next.mode !== 'live') {
+      return;
+    }
+    if (pushTimer.current) {
+      clearTimeout(pushTimer.current);
+    }
+    pushTimer.current = setTimeout(() => {
+      void saveState(config, snapshotFrom(stateRef.current, serverVersion.current))
+        .then((saved) => {
+          serverVersion.current = saved.version;
+          if (saved.virtualSetpoint !== stateRef.current.virtualSetpoint) {
+            commit((prev) => ({ ...prev, virtualSetpoint: saved.virtualSetpoint }));
+          }
+        })
+        .catch((error) => {
+          const text = explainError(error);
+          if (text.includes('Pull and retry')) {
+            void pullSharedRef.current();
+            return;
+          }
+          showMessage({ source: 'link', text });
+        });
+    }, 250);
+  }, [showMessage]);
+
+  const commitShared = useCallback(
+    (recipe: (prev: Persisted) => Persisted) => {
+      const next = recipe(stateRef.current);
+      stateRef.current = next;
+      setState(next);
+      pushShared(next);
+    },
+    [pushShared],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -154,6 +305,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setTokenMask(maskSecret(creds.token));
         setSecretMask(maskSecret(creds.secret));
       }
+      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'booted');
       setReady(true);
     })();
     return () => {
@@ -165,7 +317,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!ready) {
       return;
     }
-    void savePersisted(state);
+    saveLatest.current = state;
+    saveChain.current = saveChain.current.then(async () => {
+      const snapshot = saveLatest.current;
+      if (!snapshot || saveLatest.current !== snapshot) {
+        return;
+      }
+      await savePersisted(snapshot);
+    });
   }, [ready, state]);
 
   useEffect(() => {
@@ -177,40 +336,115 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const pullShared = useCallback(async () => {
+    const config = readServerConfig();
+    if (!config || stateRef.current.mode !== 'live' || isRunning(sessionRef.current)) {
+      return;
+    }
+    try {
+      const snap = await fetchState(config);
+      serverVersion.current = snap.version;
+      if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+        const saved = await saveState(config, snapshotFrom(stateRef.current, serverVersion.current));
+        serverVersion.current = saved.version;
+        return;
+      }
+      commit((prev) => applySnapshot(prev, snap));
+    } catch (error) {
+      showMessage({ source: 'link', text: explainError(error) });
+    }
+  }, [commit, showMessage]);
+
+  pullSharedRef.current = pullShared;
+
   const pressRole = useCallback(
-    async (direction: 'up' | 'down') => {
+    async (direction: 'up' | 'down', signal: AbortSignal) => {
       const snapshot = stateRef.current;
       if (snapshot.mode === 'demo') {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, DEMO_PRESS_MS);
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(new PressOutcomeError('The press was interrupted.', 'ambiguous'));
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener('abort', onAbort, { once: true });
+        });
         if (snapshot.demoClimate.failNextPress) {
           commit((prev) => ({
             ...prev,
             demoClimate: { ...prev.demoClimate, failNextPress: false },
           }));
-          throw new Error(`The ${direction} bot did not respond.`);
+          throw new PressOutcomeError(`The ${direction} bot did not respond.`, 'rejected');
+        }
+        if (snapshot.demoClimate.loseNextResponse) {
+          commit((prev) => ({
+            ...prev,
+            demoClimate: { ...prev.demoClimate, loseNextResponse: false },
+          }));
+          throw new PressOutcomeError('The response was lost.', 'ambiguous');
         }
         return;
       }
       const creds = await loadCredentials();
       if (!creds) {
-        throw new Error('Add a SwitchBot token and secret in Settings.');
+        throw new PressOutcomeError('Add a SwitchBot token and secret in Settings.', 'rejected');
       }
       const device = direction === 'up' ? snapshot.deviceMap.up : snapshot.deviceMap.down;
       if (!device) {
-        throw new Error(`The ${direction} bot is not mapped.`);
+        throw new PressOutcomeError(`The ${direction} bot is not mapped.`, 'rejected');
+      }
+      if (device.enableCloudService === false) {
+        throw new PressOutcomeError(`${device.name} has cloud service turned off.`, 'rejected');
       }
       try {
-        await pressBot(creds, device.id);
+        await pressBot(creds, device.id, fetch, signal);
       } catch (error) {
-        throw new Error(explainError(error));
+        if (Platform.OS === 'web') {
+          throw new PressOutcomeError(BROWSER_BLOCKED, 'rejected');
+        }
+        if (error instanceof TransportError || error instanceof PressOutcomeError) {
+          throw error;
+        }
+        throw new PressOutcomeError(explainError(error), 'rejected');
       }
     },
     [commit],
   );
 
+  const finishResume = useCallback(async () => {
+    const at = new Date().toISOString();
+    commitShared((prev) =>
+      appendLog(
+        { ...prev, hold: null, schedulePhase: 'armed' },
+        'schedule',
+        'Following the schedule.',
+        at,
+      ),
+    );
+    await tickImpl.current(new Date());
+    const after = stateRef.current;
+    const target = currentTarget(after.events, new Date());
+    if (target && after.virtualSetpoint !== null && target.targetF !== after.virtualSetpoint) {
+      await runTargetRef.current(target.targetF, { kind: 'resume' });
+    }
+  }, [commitShared]);
+
+  const runTargetRef = useRef<(target: number, source: CommandSource) => Promise<CommandResult>>(async () => ({
+    status: 'refused',
+    stoppedAt: 0,
+    wanted: 0,
+  }));
+
   const runTarget = useCallback(
     async (target: number, source: CommandSource): Promise<CommandResult> => {
-      if (runningRef.current) {
-        return { status: 'busy', stoppedAt: stateRef.current.virtualSetpoint ?? target, wanted: target, reason: 'A command is already running.' };
+      if (isRunning(sessionRef.current)) {
+        const stoppedAt = stateRef.current.virtualSetpoint ?? target;
+        showMessage({ source: 'press', text: 'A command is already running.' });
+        return { status: 'busy', stoppedAt, wanted: target, reason: 'A command is already running.' };
       }
       const snapshot = stateRef.current;
       if (snapshot.virtualSetpoint === null) {
@@ -228,139 +462,231 @@ export function AppProvider({ children }: { children: ReactNode }) {
       });
       if (!plan.ok) {
         if (source.kind !== 'schedule') {
-          setBanner(plan.reason);
+          showMessage({ source: 'press', text: plan.reason });
           errorFeedback();
         }
         return { status: 'refused', stoppedAt: current, wanted: target, reason: plan.reason };
       }
+      const link = deriveLink({
+        mode: snapshot.mode,
+        hasCredentials,
+        serverConfigured,
+        up: snapshot.deviceMap.up,
+        down: snapshot.deviceMap.down,
+        meter: snapshot.deviceMap.meter,
+      });
+      if (link.kind === 'live' && link.phase === 'needs-credentials') {
+        const reason = 'Add a SwitchBot token and secret in Settings.';
+        if (source.kind !== 'schedule') {
+          showMessage({ source: 'link', text: reason });
+        }
+        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+      }
+      if (link.kind === 'live' && link.phase === 'needs-bots') {
+        const reason = 'Map the up bot and the down bot in Settings before sending presses.';
+        if (source.kind !== 'schedule') {
+          showMessage({ source: 'link', text: reason });
+        }
+        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+      }
+      if (link.kind === 'live' && link.phase === 'ready' && link.cloud === 'off') {
+        const reason = 'Cloud service is off. Turn it on in the SwitchBot app. Setpoint does not fall back to Bluetooth.';
+        if (source.kind !== 'schedule') {
+          showMessage({ source: 'link', text: reason });
+        }
+        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+      }
       if (plan.actions.length === 0) {
         if (source.kind !== 'schedule') {
           const at = new Date().toISOString();
-          commit((prev) => {
-            let next = appendLog(prev, 'schedule', `Already at ${target}°. No presses sent.`, at);
-            if (startsHold(source)) {
-              next = holdOnto(next, new Date());
-            }
-            return next;
-          });
+          commit((prev) => appendLog(prev, 'schedule', `Already at ${target}°. No presses sent.`, at));
         }
         return { status: 'already', stoppedAt: current, wanted: target };
       }
-      if (snapshot.mode === 'live') {
-        const creds = await loadCredentials();
-        if (!creds) {
-          const reason = 'Add a SwitchBot token and secret in Settings.';
-          if (source.kind !== 'schedule') {
-            setBanner(reason);
-          }
-          return { status: 'refused', stoppedAt: current, wanted: target, reason };
-        }
-        if (!snapshot.deviceMap.up || !snapshot.deviceMap.down) {
-          const reason = 'Map the up bot and the down bot in Settings before sending presses.';
-          if (source.kind !== 'schedule') {
-            setBanner(reason);
-          }
-          return { status: 'refused', stoppedAt: current, wanted: target, reason };
-        }
+      const config = readServerConfig();
+      if (snapshot.mode === 'live' && config) {
+        return runOnServer(config, target, source);
       }
-      runningRef.current = true;
       cancelRef.current = false;
-      setCommand({ index: 1, total: plan.actions.length, target });
+      interruptRef.current = false;
       if (source.kind !== 'schedule') {
-        setBanner(null);
+        showMessage(null);
       }
-      const result = await executePlan(plan, current, {
+      const settled = await runPressSession({
+        current,
+        target,
+        source,
+        mode: snapshot.mode,
+        plan,
         delayMs: snapshot.settings.delayMs,
-        sleep: sleepUnlessCancelled,
-        isCancelled: () => cancelRef.current,
-        pressUp: () => pressRole('up'),
-        pressDown: () => pressRole('down'),
-        onProgress: (index, total) => {
-          setCommand({ index, total, target });
-          pressFeedback();
+        press: (direction, signal) => pressRole(direction, signal),
+        sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
+        beforeSend: async (index, isCancelled) => {
+          if (index === 0) {
+            return sleepUnless(FIRST_ARM_MS, isCancelled);
+          }
+          return isCancelled();
         },
-        onCommitted: (action) => {
+        isCancelled: () => cancelRef.current,
+        isInterrupted: () => interruptRef.current,
+        onSession: (session) => {
+          sessionRef.current = session;
+          setCommand(sessionProgress(session));
+        },
+        onCommitted: (action, setpoint) => {
           const at = new Date().toISOString();
-          commit((prev) => {
-            if (action.kind === 'wake') {
-              return appendLog(
+          if (action.kind === 'wake') {
+            commit((prev) =>
+              appendLog(
                 prev,
                 'wake',
                 `Wake press on the ${action.direction} bot. The setpoint stayed at ${prev.virtualSetpoint}°.`,
                 at,
-              );
-            }
-            const nextSet = action.setpointAfter ?? prev.virtualSetpoint ?? current;
-            const named = action.direction === 'up' ? 'Up bot' : 'Down bot';
-            return appendLog(
-              { ...prev, virtualSetpoint: nextSet },
-              'press',
-              `${named} press. Setpoint ${nextSet}°.`,
-              at,
+              ),
             );
-          });
+            return;
+          }
+          const mark = changeMark(source, setpoint);
+          commit((prev) =>
+            appendLog(
+              {
+                ...prev,
+                virtualSetpoint: setpoint,
+                changes: [...prev.changes, { at, setpoint, source: mark.source, label: mark.label }].slice(-400),
+              },
+              'press',
+              `${action.direction === 'up' ? 'Up bot' : 'Down bot'} press. Setpoint ${setpoint}°.`,
+              at,
+            ),
+          );
+          pressFeedback();
         },
       });
-      runningRef.current = false;
+      sessionRef.current = idleSession();
       setCommand(null);
       const at = new Date().toISOString();
-      if (result.status === 'failed') {
-        const reason = result.error ? ` ${result.error}` : '';
-        const message = `Stopped at ${result.stoppedAt}°. Wanted ${result.wanted}°. No further presses sent.${reason}`;
-        setBanner(message);
+      if (settled.status === 'ambiguous') {
+        showMessage({ source: 'press', text: CHECK_THERMOSTAT });
+        errorFeedback();
+        commit((prev) => appendLog(prev, 'failure', CHECK_THERMOSTAT, at));
+        void notifyCheckThermostat(CHECK_THERMOSTAT);
+      } else if (settled.status === 'failed' || settled.status === 'refused') {
+        const text = settled.reason
+          ? `Stopped at ${settled.stoppedAt}°. Wanted ${settled.wanted}°. ${settled.reason}`
+          : `Stopped at ${settled.stoppedAt}°. Wanted ${settled.wanted}°. No further presses sent.`;
+        showMessage({ source: 'press', text });
         errorFeedback();
         if (source.kind !== 'schedule') {
-          commit((prev) => {
-            let next = appendLog(prev, 'failure', message, at);
-            if (startsHold(source)) {
-              next = holdOnto(next, new Date());
-            }
-            return next;
-          });
+          commit((prev) => appendLog(prev, 'failure', text, at));
         }
-        return { status: 'failed', stoppedAt: result.stoppedAt, wanted: result.wanted, reason: message };
-      }
-      if (result.status === 'cancelled') {
-        const message = `Cancelled. Stopped at ${result.stoppedAt}°. Wanted ${result.wanted}°. No further presses sent.`;
-        setBanner(message);
+      } else if (settled.status === 'cancelled') {
+        const text =
+          settled.committedAdjusts > 0
+            ? `Finishing the current press. Stopped at ${settled.stoppedAt}°. Wanted ${settled.wanted}°.`
+            : `Cancelled before the press was sent. Stopped at ${settled.stoppedAt}°. Wanted ${settled.wanted}°.`;
+        showMessage({ source: 'press', text });
         if (source.kind !== 'schedule') {
-          commit((prev) => {
-            let next = appendLog(prev, 'cancel', message, at);
-            if (startsHold(source)) {
-              next = holdOnto(next, new Date());
-            }
-            return next;
-          });
+          commit((prev) => appendLog(prev, 'cancel', text, at));
         }
-        return { status: 'cancelled', stoppedAt: result.stoppedAt, wanted: result.wanted, reason: message };
-      }
-      successFeedback();
-      commit((prev) => {
-        let next = prev;
+      } else if (settled.status === 'done') {
+        successFeedback();
         if (source.kind === 'preset') {
-          next = appendLog(next, 'preset', `Preset ${source.label} applied at ${target}°.`, at);
+          commit((prev) => appendLog(prev, 'preset', `Preset ${source.label} applied at ${target}°.`, at));
         }
-        if (startsHold(source)) {
-          next = holdOnto(next, new Date());
-        }
-        return next;
-      });
-      return { status: 'done', stoppedAt: result.stoppedAt, wanted: target };
+      }
+      if (shouldStartHold(source, settled) && !resumeAfterRef.current) {
+        commitShared((prev) => {
+          const hold = holdFor(prev.events, new Date());
+          const text =
+            hold?.kind === 'until-event'
+              ? `Holding ${prev.virtualSetpoint}° until ${hold.label}. Only the latest due change runs after that.`
+              : `Holding ${prev.virtualSetpoint}°. Nothing is scheduled next.`;
+          return appendLog({ ...prev, hold }, 'hold', text, at);
+        });
+      }
+      if (resumeAfterRef.current) {
+        resumeAfterRef.current = false;
+        await finishResume();
+      }
+      return {
+        status: settled.status === 'busy' ? 'busy' : settled.status,
+        stoppedAt: settled.stoppedAt,
+        wanted: settled.wanted,
+        reason: settled.reason,
+      };
     },
-    [commit, pressRole],
+    [commit, commitShared, finishResume, hasCredentials, pressRole, serverConfigured, showMessage],
   );
+
+  async function runOnServer(config: ServerConfig, target: number, source: CommandSource): Promise<CommandResult> {
+    sessionRef.current = {
+      phase: 'armed',
+      target,
+      startedFrom: stateRef.current.virtualSetpoint ?? target,
+      setpoint: stateRef.current.virtualSetpoint ?? target,
+      actionIndex: 0,
+      actions: [],
+      source,
+      mode: 'live',
+      committedAdjusts: 0,
+      cancelRequested: false,
+    };
+    const poll = setInterval(() => {
+      void fetchRemoteSession(config)
+        .then((remote) => {
+          if (remote.progress) {
+            setCommand(remote.progress);
+          }
+        })
+        .catch(() => undefined);
+    }, 400);
+    try {
+      const result = await runRemotePress(config, { target, source });
+      if (result.notifyCheck || result.status === 'ambiguous') {
+        showMessage({ source: 'press', text: CHECK_THERMOSTAT });
+        void notifyCheckThermostat(CHECK_THERMOSTAT);
+      } else if (result.reason && result.status !== 'done' && result.status !== 'already') {
+        showMessage({ source: 'press', text: result.reason });
+      }
+      await pullShared();
+      return {
+        status: result.status,
+        stoppedAt: result.stoppedAt,
+        wanted: result.wanted,
+        reason: result.reason,
+      };
+    } catch (error) {
+      const reason = explainError(error);
+      showMessage({ source: 'press', text: reason });
+      return {
+        status: 'failed',
+        stoppedAt: stateRef.current.virtualSetpoint ?? target,
+        wanted: target,
+        reason,
+      };
+    } finally {
+      clearInterval(poll);
+      sessionRef.current = idleSession();
+      setCommand(null);
+    }
+  }
+
+  runTargetRef.current = runTarget;
 
   const tick = useCallback(
     async (now: Date) => {
-      if (runningRef.current || tickLock.current) {
+      if (isRunning(sessionRef.current) || tickLock.current) {
         return;
       }
       const snapshot = stateRef.current;
       if (snapshot.virtualSetpoint === null) {
         return;
       }
+      if (snapshot.mode === 'live' && readServerConfig()) {
+        await pullShared();
+        return;
+      }
       tickLock.current = true;
-      const before = snapshot.virtualSetpoint;
       try {
         const outcome = await runDueSchedule({
           now,
@@ -369,42 +695,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
           hold: snapshot.hold,
           setpoint: snapshot.virtualSetpoint,
           catchupFrom: snapshot.catchupFrom,
-          retryFailed: retryArmed.current,
-          execute: async (target) => {
-            const result = await runTarget(target, { kind: 'schedule' });
-            if (result.status === 'cancelled') {
-              return { status: 'cancelled', stoppedAt: result.stoppedAt, wanted: result.wanted };
+          retryFailed: snapshot.schedulePhase === 'armed',
+          step: snapshot.settings.step,
+          schedulePhase: snapshot.schedulePhase,
+          execute: async (nextTarget) => {
+            const result = await runTarget(nextTarget, { kind: 'schedule' });
+            if (result.status === 'done' || result.status === 'already' || result.status === 'cancelled' || result.status === 'busy') {
+              return { status: result.status, stoppedAt: result.stoppedAt, wanted: result.wanted, reason: result.reason };
             }
-            if (result.status === 'done') {
-              return { status: 'done', stoppedAt: result.stoppedAt, wanted: result.wanted };
+            if (result.status === 'refused' || result.status === 'ambiguous') {
+              return { status: result.status, stoppedAt: result.stoppedAt, wanted: result.wanted, reason: result.reason };
             }
-            retryArmed.current = false;
-            return {
-              status: 'failed',
-              stoppedAt: result.stoppedAt,
-              wanted: result.wanted,
-            };
+            return { status: 'failed', stoppedAt: result.stoppedAt, wanted: result.wanted, reason: result.reason };
           },
         });
-        commit((prev) => {
-          let next: Persisted = { ...prev, records: outcome.records, hold: outcome.hold };
+        commitShared((prev) => {
+          let next: Persisted = {
+            ...prev,
+            records: outcome.records,
+            hold: outcome.hold,
+            schedulePhase: outcome.schedulePhase,
+            catchupNote: outcome.catchupNote ?? prev.catchupNote,
+          };
           for (const line of outcome.log) {
             next = appendLog(next, line.kind, line.message, now.toISOString());
           }
           return next;
         });
+        if (outcome.catchupNote) {
+          showMessage({ source: 'schedule', text: outcome.catchupNote });
+        }
         const notable = outcome.log.find((line) => line.kind === 'failure' || line.kind === 'cancel');
         if (notable) {
-          setBanner(notable.message);
-        }
-        if (stateRef.current.virtualSetpoint !== before && outcome.log.some((line) => line.kind === 'schedule')) {
-          setClock(new Date());
+          showMessage({ source: 'schedule', text: notable.message });
         }
       } finally {
         tickLock.current = false;
       }
     },
-    [commit, runTarget],
+    [commitShared, pullShared, runTarget, showMessage],
   );
 
   tickImpl.current = tick;
@@ -414,20 +743,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return;
     }
     void tickImpl.current(new Date());
+    void refreshRef.current();
     const timer = setInterval(() => {
       void tickImpl.current(new Date());
     }, 5000);
     const onAppState = (status: AppStateStatus) => {
       if (status === 'active') {
-        retryArmed.current = true;
+        lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'foreground');
+        commit((prev) => (prev.schedulePhase === 'armed' ? prev : { ...prev, schedulePhase: 'armed' }));
         void tickImpl.current(new Date());
+        void refreshRef.current();
+        return;
+      }
+      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'background');
+      if (isRunning(sessionRef.current)) {
+        interruptRef.current = true;
+        lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'press-interrupted');
       }
     };
     const subscription = AppState.addEventListener('change', onAppState);
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
-        retryArmed.current = true;
+        lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'foreground');
+        commit((prev) => (prev.schedulePhase === 'armed' ? prev : { ...prev, schedulePhase: 'armed' }));
         void tickImpl.current(new Date());
+        void refreshRef.current();
+        return;
+      }
+      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'background');
+      if (isRunning(sessionRef.current)) {
+        interruptRef.current = true;
       }
     };
     if (Platform.OS === 'web') {
@@ -440,23 +785,43 @@ export function AppProvider({ children }: { children: ReactNode }) {
         document.removeEventListener('visibilitychange', onVisible);
       }
     };
-  }, [ready, state.virtualSetpoint]);
+  }, [commit, ready, state.virtualSetpoint]);
 
   useEffect(() => {
     return watchNotificationOpen(() => {
-      retryArmed.current = true;
+      commit((prev) => ({ ...prev, schedulePhase: 'armed' }));
       void tickImpl.current(new Date());
     });
-  }, []);
+  }, [commit]);
 
   useEffect(() => {
     if (!ready || state.virtualSetpoint === null) {
       return;
     }
     void syncReminders(state.events, new Date());
-  }, [ready, state.events, state.virtualSetpoint]);
+  }, [ready, state.events, state.virtualSetpoint === null]);
 
   const refreshDevices = useCallback(async (): Promise<string | null> => {
+    const config = readServerConfig();
+    if (config) {
+      try {
+        const listed = await fetchRemoteDevices(config);
+        setDevices(listed.devices);
+        if (listed.devices.length === 0) {
+          const note =
+            'No devices came back. Check the SwitchBot secret on the server, and that a hub with cloud service is near the bots and the meter.';
+          setDeviceMessage(note);
+          return note;
+        }
+        const notes = listed.devices.flatMap((device) => deviceNotes(device));
+        setDeviceMessage(notes[0] ?? null);
+        return null;
+      } catch (error) {
+        const note = explainError(error);
+        setDeviceMessage(note);
+        return note;
+      }
+    }
     const creds = await loadCredentials();
     if (!creds) {
       setDeviceMessage('Add a token and secret before loading devices.');
@@ -466,20 +831,109 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const list = await listDevices(creds);
       setDevices(list);
       if (list.length === 0) {
-        const message =
+        const note =
           'No devices came back. Check the token, and that a SwitchBot Hub with cloud service enabled is near the bots and the meter.';
-        setDeviceMessage(message);
-        return message;
+        setDeviceMessage(note);
+        return note;
       }
       const notes = list.flatMap((device) => deviceNotes(device));
       setDeviceMessage(notes[0] ?? null);
       return null;
     } catch (error) {
-      const message = explainError(error);
-      setDeviceMessage(message);
-      return message;
+      const note = explainError(error);
+      setDeviceMessage(note);
+      return note;
     }
   }, []);
+
+  const refreshClimate = useCallback(async () => {
+    if (refreshingRef.current) {
+      return;
+    }
+    refreshingRef.current = true;
+    setRefreshing(true);
+    try {
+      const snapshot = stateRef.current;
+      const nowIso = new Date().toISOString();
+      if (snapshot.mode === 'demo') {
+        commit((prev) => {
+          const climate = driftClimate(prev.demoClimate, nowIso);
+          return {
+            ...prev,
+            demoClimate: climate,
+            history: [
+              ...prev.history,
+              { at: nowIso, temperatureF: climate.temperatureF, humidity: climate.humidity, co2Ppm: climate.co2Ppm },
+            ].slice(-2000),
+          };
+        });
+        return;
+      }
+      const config = readServerConfig();
+      if (config) {
+        const meter = await requestRemoteMeter(config);
+        if (meter.sample) {
+          commit((prev) => ({
+            ...prev,
+            lastLive: {
+              temperatureF: meter.sample?.temperatureF ?? prev.lastLive?.temperatureF ?? 0,
+              humidity: meter.sample?.humidity ?? 0,
+              co2Ppm: meter.sample?.co2Ppm ?? 0,
+              updatedAt: meter.sample?.at ?? nowIso,
+              batteryUp: prev.lastLive?.batteryUp ?? null,
+              batteryDown: prev.lastLive?.batteryDown ?? null,
+              batteryMeter: prev.lastLive?.batteryMeter ?? null,
+            },
+            history: meter.sample ? [...prev.history, meter.sample].slice(-2000) : prev.history,
+          }));
+        }
+        return;
+      }
+      const creds = await loadCredentials();
+      if (!creds) {
+        showMessage({ source: 'link', text: 'Add a SwitchBot token and secret in Settings.' });
+        return;
+      }
+      if (!snapshot.deviceMap.meter) {
+        showMessage({ source: 'meter', text: 'Map the Meter in Settings to read the room.' });
+        return;
+      }
+      const meter = await readMeter(creds, snapshot.deviceMap.meter.id);
+      let batteryUp: number | null = null;
+      let batteryDown: number | null = null;
+      try {
+        batteryUp = snapshot.deviceMap.up ? await readBotBattery(creds, snapshot.deviceMap.up.id) : null;
+        batteryDown = snapshot.deviceMap.down ? await readBotBattery(creds, snapshot.deviceMap.down.id) : null;
+      } catch {
+        batteryUp = snapshot.lastLive?.batteryUp ?? null;
+        batteryDown = snapshot.lastLive?.batteryDown ?? null;
+      }
+      commit((prev) => ({
+        ...prev,
+        lastLive: {
+          temperatureF: meter.temperatureF,
+          humidity: meter.humidity,
+          co2Ppm: meter.co2Ppm,
+          updatedAt: nowIso,
+          batteryUp,
+          batteryDown,
+          batteryMeter: meter.battery,
+        },
+        history: [
+          ...prev.history,
+          { at: nowIso, temperatureF: meter.temperatureF, humidity: meter.humidity, co2Ppm: meter.co2Ppm },
+        ].slice(-2000),
+      }));
+    } catch (error) {
+      showMessage({ source: 'meter', text: explainError(error) });
+    } finally {
+      refreshingRef.current = false;
+      setRefreshing(false);
+    }
+  }, [commit, showMessage]);
+
+  const refreshRef = useRef(refreshClimate);
+  refreshRef.current = refreshClimate;
 
   const value = useMemo<AppContextValue>(() => {
     return {
@@ -487,22 +941,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
       state,
       clock,
       command,
-      banner,
+      banner: message?.text ?? null,
       refreshing,
       devices,
       deviceMessage,
       hasCredentials,
       tokenMask,
       secretMask,
-      clearBanner: () => setBanner(null),
+      serverConfigured,
+      clearBanner: () => showMessage(null),
       setMode: (mode) => {
+        if (isRunning(sessionRef.current)) {
+          showMessage({ source: 'press', text: 'Finish the press before changing mode.' });
+          return;
+        }
         commit((prev) => ({ ...prev, mode }));
+        if (mode === 'live') {
+          void pullShared();
+        }
       },
       setRoomLabel: (label) => {
-        commit((prev) => ({ ...prev, roomLabel: label }));
+        commitShared((prev) => ({ ...prev, roomLabel: label }));
       },
       updateSettings: (patch) => {
-        commit((prev) => {
+        commitShared((prev) => {
           const settings = { ...prev.settings, ...patch };
           if (settings.maxF <= settings.minF) {
             settings.maxF = settings.minF + 1;
@@ -513,6 +975,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
       saveAndLoadDevices: async (token, secret) => {
         const trimmedToken = token.trim();
         const trimmedSecret = secret.trim();
+        const config = readServerConfig();
+        if (config) {
+          if (trimmedToken || trimmedSecret) {
+            if (!trimmedToken || !trimmedSecret) {
+              return 'Enter both the token and the secret.';
+            }
+            try {
+              await saveRemoteCredentials(config, trimmedToken, trimmedSecret);
+              await saveCredentials(trimmedToken, trimmedSecret);
+              setHasCredentials(true);
+              setTokenMask(maskSecret(trimmedToken));
+              setSecretMask(maskSecret(trimmedSecret));
+            } catch (error) {
+              return explainError(error);
+            }
+          }
+          const error = await refreshDevices();
+          if (!error) {
+            commit((prev) => ({ ...prev, mode: 'live' }));
+          }
+          return error;
+        }
         if (!trimmedToken || !trimmedSecret) {
           return 'Enter both the token and the secret.';
         }
@@ -520,7 +1004,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setHasCredentials(true);
         setTokenMask(maskSecret(trimmedToken));
         setSecretMask(maskSecret(trimmedSecret));
-        return refreshDevices();
+        const error = await refreshDevices();
+        if (!error) {
+          commit((prev) => ({ ...prev, mode: 'live' }));
+        }
+        return error;
       },
       reloadDevices: () => refreshDevices(),
       forgetCredentials: async () => {
@@ -532,19 +1020,39 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setDeviceMessage(null);
       },
       mapRole: (role, device) => {
-        commit((prev) => ({
+        if (!device) {
+          commitShared((prev) => ({
+            ...prev,
+            deviceMap: { ...prev.deviceMap, [role]: null },
+          }));
+          return;
+        }
+        const rejection = mapRejection(role, device, stateRef.current.deviceMap);
+        if (rejection) {
+          setDeviceMessage(rejection);
+          return;
+        }
+        setDeviceMessage(null);
+        commitShared((prev) => ({
           ...prev,
-          deviceMap: {
-            ...prev.deviceMap,
-            [role]: device ? deviceFromApi(device) : null,
-          },
+          deviceMap: { ...prev.deviceMap, [role]: deviceFromApi(device) },
         }));
       },
       completeCalibration: (temp) => {
         const at = new Date().toISOString();
+        const seeded = seedDemoHistory(new Date());
         commit((prev) =>
           appendLog(
-            { ...prev, virtualSetpoint: temp, catchupFrom: at },
+            {
+              ...prev,
+              virtualSetpoint: temp,
+              catchupFrom: at,
+              history: prev.history.length > 0 ? prev.history : seeded.history,
+              changes:
+                prev.changes.length > 0
+                  ? prev.changes
+                  : [...seeded.changes, { at, setpoint: temp, source: 'manual', label: `Calibrated · ${temp}°` }],
+            },
             'calibration',
             `Calibrated the virtual setpoint to ${temp}°. No buttons were pressed.`,
             at,
@@ -552,15 +1060,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
         );
       },
       recalibrate: (temp) => {
+        const session = sessionRef.current;
+        const written = writeSetpoint(stateRef.current.virtualSetpoint, { degrees: temp, source: 'recalibrated' }, session);
+        if (!written.ok) {
+          showMessage({ source: 'press', text: written.reason });
+          return written.reason;
+        }
+        const range = stateRef.current.settings;
+        if (temp < range.minF || temp > range.maxF) {
+          const reason = `${temp}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
+          showMessage({ source: 'link', text: reason });
+          return reason;
+        }
         const at = new Date().toISOString();
-        commit((prev) =>
+        commitShared((prev) =>
           appendLog(
-            { ...prev, virtualSetpoint: temp },
+            {
+              ...prev,
+              virtualSetpoint: temp,
+              changes: [...prev.changes, { at, setpoint: temp, source: 'manual', label: `Recalibrated · ${temp}°` }].slice(-400),
+            },
             'calibration',
             `Recalibrated the virtual setpoint to ${temp}°. No buttons were pressed.`,
             at,
           ),
         );
+        return null;
       },
       bump: async (direction) => {
         const current = stateRef.current.virtualSetpoint;
@@ -575,51 +1100,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       cancelCommand: () => {
         cancelRef.current = true;
-      },
-      refreshClimate: async () => {
-        if (refreshing) {
-          return;
-        }
-        setRefreshing(true);
-        try {
-          const snapshot = stateRef.current;
-          if (snapshot.mode === 'demo') {
-            const nowIso = new Date().toISOString();
-            commit((prev) => ({ ...prev, demoClimate: driftClimate(prev.demoClimate, nowIso) }));
-            return;
-          }
-          const creds = await loadCredentials();
-          if (!creds) {
-            setBanner('Add a SwitchBot token and secret in Settings.');
-            return;
-          }
-          if (!snapshot.deviceMap.meter) {
-            setBanner('Map the Meter in Settings to read the room.');
-            return;
-          }
-          const meter = await readMeter(creds, snapshot.deviceMap.meter.id);
-          const batteryUp = snapshot.deviceMap.up ? await readBotBattery(creds, snapshot.deviceMap.up.id) : null;
-          const batteryDown = snapshot.deviceMap.down
-            ? await readBotBattery(creds, snapshot.deviceMap.down.id)
-            : null;
-          commit((prev) => ({
-            ...prev,
-            lastLive: {
-              temperatureF: meter.temperatureF,
-              humidity: meter.humidity,
-              co2Ppm: meter.co2Ppm,
-              updatedAt: new Date().toISOString(),
-              batteryUp,
-              batteryDown,
-              batteryMeter: meter.battery,
-            },
-          }));
-        } catch (error) {
-          setBanner(explainError(error));
-        } finally {
-          setRefreshing(false);
+        const config = readServerConfig();
+        if (config && stateRef.current.mode === 'live') {
+          void cancelRemotePress(config);
         }
       },
+      refreshClimate,
       setCo2Band: (tone) => {
         commit((prev) => ({
           ...prev,
@@ -637,6 +1123,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
           demoClimate: { ...prev.demoClimate, failNextPress: value },
         }));
       },
+      setLoseNext: (value) => {
+        commit((prev) => ({
+          ...prev,
+          demoClimate: { ...prev.demoClimate, loseNextResponse: value },
+        }));
+      },
       resetDemo: () => {
         const nowIso = new Date().toISOString();
         commit((prev) =>
@@ -649,20 +1141,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
         );
       },
       updatePreset: (id, patch) => {
-        commit((prev) => ({
+        commitShared((prev) => ({
           ...prev,
           presets: prev.presets.map((preset) => (preset.id === id ? { ...preset, ...patch } : preset)),
         }));
       },
       saveEvent: (event) => {
         const at = new Date().toISOString();
-        commit((prev) => {
-          const exists = prev.events.some((item) => item.id === event.id);
-          const events = exists
-            ? prev.events.map((item) => (item.id === event.id ? event : item))
-            : [...prev.events, event];
+        commitShared((prev) => {
+          const previous = prev.events.find((item) => item.id === event.id) ?? null;
+          const exists = Boolean(previous);
+          const events = exists ? prev.events.map((item) => (item.id === event.id ? event : item)) : [...prev.events, event];
+          const reset = previous ? scheduleEditResetsCursor(previous, event) : false;
           return appendLog(
-            { ...prev, events, catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : at },
+            {
+              ...prev,
+              events,
+              catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : reset ? at : prev.catchupFrom,
+            },
             'schedule',
             `Updated ${event.label} · ${formatClock(event.hour, event.minute)} · ${event.targetF}°.`,
             at,
@@ -681,13 +1177,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
           days: [1, 2, 3, 4, 5],
           enabled: true,
         };
-        commit((prev) =>
+        commitShared((prev) =>
           appendLog(
-            {
-              ...prev,
-              events: [...prev.events, event],
-              catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : at,
-            },
+            { ...prev, events: [...prev.events, event] },
             'schedule',
             'Added Custom.',
             at,
@@ -696,14 +1188,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       deleteEvent: (id) => {
         const at = new Date().toISOString();
-        commit((prev) => {
+        commitShared((prev) => {
           const event = prev.events.find((item) => item.id === id);
           return appendLog(
-            {
-              ...prev,
-              events: prev.events.filter((item) => item.id !== id),
-              catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : at,
-            },
+            { ...prev, events: prev.events.filter((item) => item.id !== id) },
             'schedule',
             `Removed ${event?.label ?? 'event'}.`,
             at,
@@ -712,13 +1200,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       restoreDefaults: () => {
         const at = new Date().toISOString();
-        commit((prev) =>
+        commitShared((prev) =>
           appendLog(
-            {
-              ...prev,
-              events: defaultEvents(),
-              catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : at,
-            },
+            { ...prev, events: defaultEvents(), catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : at },
             'schedule',
             'Restored the default schedule.',
             at,
@@ -726,22 +1210,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         );
       },
       resumeSchedule: async () => {
-        const before = stateRef.current.virtualSetpoint;
-        const at = new Date().toISOString();
-        commit((prev) => appendLog({ ...prev, hold: null }, 'schedule', 'Following the schedule.', at));
-        retryArmed.current = true;
-        await tick(new Date());
-        const after = stateRef.current;
-        const target = currentTarget(after.events, new Date());
-        if (
-          target &&
-          after.virtualSetpoint !== null &&
-          before !== null &&
-          target.targetF !== after.virtualSetpoint &&
-          after.virtualSetpoint === before
-        ) {
-          await runTarget(target.targetF, { kind: 'resume' });
+        if (isRunning(sessionRef.current)) {
+          resumeAfterRef.current = true;
+          showMessage({ source: 'schedule', text: 'Resume will apply when this press finishes.' });
+          return;
         }
+        await finishResume();
       },
       applyCancelled: async (key) => {
         const record = stateRef.current.records.find((item) => item.key === key);
@@ -750,21 +1224,188 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         const result = await runTarget(record.targetF, { kind: 'apply-now' });
         if (result.status === 'done' || result.status === 'already') {
-          commit((prev) => ({
+          const at = new Date().toISOString();
+          commitShared((prev) => ({
             ...prev,
-            records: upsertRecord(prev.records, {
-              ...record,
-              status: result.status === 'already' ? 'already' : 'ran',
-              message: `Applied ${record.label} at ${record.targetF}°.`,
-              recordedAt: new Date().toISOString(),
-            }),
+            records: prev.records.map((item) =>
+              item.key === key
+                ? {
+                    ...item,
+                    status: result.status === 'already' ? 'already' : 'done-late',
+                    via: 'apply-now',
+                    message: `Applied ${record.label} at ${record.targetF}°.`,
+                    recordedAt: at,
+                  }
+                : item,
+            ),
           }));
         }
       },
       allowReminders: async () => {
-        const message = await requestReminderPermission();
+        const note = await requestReminderPermission();
         await syncReminders(stateRef.current.events, new Date());
-        return message;
+        return note;
+      },
+      skipNext: (eventId) => {
+        const now = new Date();
+        const occurrence = nextSkippable(stateRef.current.events, stateRef.current.records, eventId, now);
+        if (!occurrence) {
+          showMessage({ source: 'schedule', text: 'Nothing coming up to skip.' });
+          return;
+        }
+        const applied = applyTransition(stateRef.current.records, occurrence, { type: 'skip' }, now.toISOString());
+        if ('error' in applied) {
+          showMessage({ source: 'schedule', text: applied.error });
+          return;
+        }
+        commitShared((prev) =>
+          appendLog(
+            { ...prev, records: applied.records },
+            'schedule',
+            `Skipped the next ${occurrence.label}.`,
+            now.toISOString(),
+          ),
+        );
+      },
+      skipOnDate: (eventId, day) => {
+        const occurrence = occurrenceOnDate(stateRef.current.events, eventId, day);
+        if (!occurrence) {
+          showMessage({ source: 'schedule', text: 'That event does not run on the chosen day.' });
+          return;
+        }
+        const applied = applyTransition(stateRef.current.records, occurrence, { type: 'skip' }, new Date().toISOString());
+        if ('error' in applied) {
+          showMessage({ source: 'schedule', text: applied.error });
+          return;
+        }
+        commitShared((prev) =>
+          appendLog({ ...prev, records: applied.records }, 'schedule', `Skipped ${occurrence.label} on ${day}.`, new Date().toISOString()),
+        );
+      },
+      undoOccurrence: async (key) => {
+        const record = stateRef.current.records.find((item) => item.key === key);
+        if (!record) {
+          return;
+        }
+        const occurrence = {
+          key: record.key,
+          eventId: record.eventId,
+          label: record.label,
+          targetF: record.targetF,
+          at: record.occurrenceAt,
+        };
+        if (record.status === 'skipped') {
+          const applied = applyTransition(stateRef.current.records, occurrence, { type: 'undo-skip' }, new Date().toISOString());
+          if ('error' in applied) {
+            showMessage({ source: 'schedule', text: applied.error });
+            return;
+          }
+          commitShared((prev) =>
+            appendLog({ ...prev, records: applied.records }, 'schedule', `Restored ${record.label}.`, new Date().toISOString()),
+          );
+          return;
+        }
+        if ((record.status === 'done-early' || record.status === 'done-late') && record.via === 'run-now') {
+          const back = record.previousSetpoint;
+          if (typeof back === 'number' && back !== stateRef.current.virtualSetpoint) {
+            const result = await runTarget(back, { kind: 'apply-now' });
+            if (result.status !== 'done' && result.status !== 'already') {
+              return;
+            }
+          }
+          const applied = applyTransition(stateRef.current.records, occurrence, { type: 'undo-run-now' }, new Date().toISOString());
+          if ('error' in applied) {
+            showMessage({ source: 'schedule', text: applied.error });
+            return;
+          }
+          commitShared((prev) =>
+            appendLog({ ...prev, records: applied.records }, 'schedule', `Undid ${record.label}.`, new Date().toISOString()),
+          );
+        }
+      },
+      runEventNow: async (eventId) => {
+        const now = new Date();
+        const occurrence = occurrenceForRunNow(stateRef.current.events, eventId, now);
+        if (!occurrence) {
+          showMessage({ source: 'schedule', text: 'That event has no occurrence to run.' });
+          return;
+        }
+        const previous = stateRef.current.virtualSetpoint;
+        const result = await runTarget(occurrence.targetF, {
+          kind: 'run-now',
+          eventId,
+          label: occurrence.label,
+          occurrenceKey: occurrence.key,
+        });
+        if (result.status !== 'done' && result.status !== 'already') {
+          return;
+        }
+        const when = now.getTime() < Date.parse(occurrence.at) ? 'early' : 'late';
+        const applied = applyTransition(
+          stateRef.current.records,
+          occurrence,
+          { type: 'run-now', when },
+          now.toISOString(),
+          {
+            via: 'run-now',
+            previousSetpoint: previous ?? undefined,
+            message:
+              when === 'early'
+                ? `${occurrence.label} ran early at ${occurrence.targetF}°.`
+                : `${occurrence.label} ran late at ${occurrence.targetF}°.`,
+          },
+        );
+        if ('error' in applied) {
+          return;
+        }
+        commitShared((prev) => ({ ...prev, records: applied.records, hold: null }));
+      },
+      retrySchedule: async () => {
+        const now = new Date();
+        const snapshot = stateRef.current;
+        if (snapshot.virtualSetpoint === null) {
+          return;
+        }
+        const chip = chipFor({
+          setpoint: snapshot.virtualSetpoint,
+          hold: snapshot.hold,
+          events: snapshot.events,
+          records: snapshot.records,
+          now,
+        });
+        if (chip.kind !== 'off-schedule') {
+          return;
+        }
+        const result = await runTarget(chip.targetF, { kind: 'retry' });
+        if (result.status !== 'done' && result.status !== 'already') {
+          return;
+        }
+        const intended = intendedTarget(snapshot.events, stateRef.current.records, now);
+        if (!intended) {
+          return;
+        }
+        const applied = applyTransition(
+          stateRef.current.records,
+          intended,
+          { type: 'retry', result: result.status === 'already' ? 'already' : 'done-late' },
+          now.toISOString(),
+          { via: 'retry', message: `Retried ${intended.label} at ${intended.targetF}°.` },
+        );
+        if (!('error' in applied)) {
+          commitShared((prev) => ({ ...prev, records: applied.records }));
+        }
+      },
+      loadHistory: async (span) => {
+        const config = readServerConfig();
+        if (!config || stateRef.current.mode !== 'live') {
+          return;
+        }
+        const history = await fetchHistory(config, span);
+        commit((prev) => ({
+          ...prev,
+          history: history.samples,
+          changes: history.changes,
+        }));
       },
     };
   }, [
@@ -772,32 +1413,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
     state,
     clock,
     command,
-    banner,
+    message,
     refreshing,
     devices,
     deviceMessage,
     hasCredentials,
     tokenMask,
     secretMask,
+    serverConfigured,
+    showMessage,
     commit,
+    commitShared,
+    pullShared,
     refreshDevices,
+    refreshClimate,
     runTarget,
-    tick,
+    finishResume,
   ]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 
-function holdOnto(prev: Persisted, now: Date): Persisted {
-  if (prev.virtualSetpoint === null) {
-    return prev;
+function sleepUnless(ms: number, isCancelled: () => boolean): Promise<boolean> {
+  if (ms <= 0) {
+    return Promise.resolve(isCancelled());
   }
-  const next = nextOccurrence(prev.events, now);
-  const hold = next ? { until: next.at, label: next.label } : { until: null, label: '' };
-  const message = hold.until
-    ? `Holding ${prev.virtualSetpoint}° until ${hold.label} · ${formatInstant(hold.until)}.`
-    : `Holding ${prev.virtualSetpoint}°. Nothing is scheduled next.`;
-  return appendLog({ ...prev, hold }, 'hold', message, now.toISOString());
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (isCancelled()) {
+        clearInterval(timer);
+        resolve(true);
+        return;
+      }
+      if (Date.now() - started >= ms) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 40);
+  });
 }
 
 export function useApp(): AppContextValue {

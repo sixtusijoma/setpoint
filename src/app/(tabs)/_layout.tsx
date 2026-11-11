@@ -42,6 +42,14 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="history"
+        options={{
+          title: 'History',
+          tabBarButtonTestID: 'tab-history',
+          tabBarIcon: ({ color }) => <TabGlyph kind="history" color={color} />,
+        }}
+      />
+      <Tabs.Screen
         name="activity"
         options={{
           title: 'Activity',
@@ -61,7 +69,7 @@ export default function TabLayout() {
   );
 }
 
-function TabGlyph({ kind, color }: { kind: 'home' | 'schedule' | 'activity' | 'settings'; color: ColorValue }) {
+function TabGlyph({ kind, color }: { kind: 'home' | 'schedule' | 'activity' | 'settings' | 'history'; color: ColorValue }) {
   if (kind === 'home') {
     return (
       <View style={styles.icon}>
@@ -74,6 +82,15 @@ function TabGlyph({ kind, color }: { kind: 'home' | 'schedule' | 'activity' | 's
     return (
       <View style={[styles.clock, { borderColor: color }]}>
         <View style={[styles.hand, { backgroundColor: color }]} />
+      </View>
+    );
+  }
+  if (kind === 'history') {
+    return (
+      <View style={styles.lines}>
+        <View style={[styles.line, { backgroundColor: color, height: 6 }]} />
+        <View style={[styles.line, styles.lineShort, { backgroundColor: color, height: 10 }]} />
+        <View style={[styles.line, { backgroundColor: color, height: 4 }]} />
       </View>
     );
   }

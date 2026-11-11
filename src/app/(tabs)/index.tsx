@@ -2,7 +2,7 @@ import { SetpointDial } from '@/components/dial';
 import { Banner, CircleButton, ConfirmDialog, PillButton, Sheet, Stepper } from '@/components/ui';
 import { co2Band } from '@/domain/co2';
 import { planSetTo } from '@/domain/planSetTo';
-import { currentTarget, holdCopy, nextOccurrence } from '@/domain/schedule';
+import { chipFor, currentTarget, nextOccurrence } from '@/domain/schedule';
 import { formatRoom, setpointAccent } from '@/domain/temperature';
 import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
@@ -118,7 +118,13 @@ export default function HomeScreen() {
   }
 
   const band = reading ? co2Band(reading.co2Ppm) : null;
-  const held = app.state.hold;
+  const chip = chipFor({
+    setpoint,
+    hold: app.state.hold,
+    events: app.state.events,
+    records: app.state.records,
+    now: app.clock,
+  });
 
   return (
     <ScrollView
@@ -153,14 +159,25 @@ export default function HomeScreen() {
             {app.state.mode === 'demo' ? 'Demo' : 'Live'} · {app.state.roomLabel}
           </Text>
         </View>
-        <Pressable testID="recalibrate" onPress={openRecalibrate} style={styles.recal} accessibilityRole="button">
+        <Pressable
+          testID="recalibrate"
+          disabled={busy}
+          onPress={openRecalibrate}
+          style={[styles.recal, busy && styles.dim]}
+          accessibilityRole="button"
+        >
           <Text style={styles.recalText}>Recalibrate</Text>
         </Pressable>
       </View>
 
-      <View testID="hold-chip" style={[styles.hold, held ? styles.holdActive : null]}>
-        <Text style={styles.holdText}>{holdCopy(setpoint, held)}</Text>
-        {held ? (
+      <View
+        testID="hold-chip"
+        style={[styles.hold, chip.kind === 'holding' ? styles.holdActive : null, chip.kind === 'off-schedule' ? styles.holdOff : null]}
+      >
+        <Text testID="hold-text" style={styles.holdText}>
+          {chip.text}
+        </Text>
+        {chip.kind === 'holding' ? (
           <Pressable
             testID="resume-schedule"
             onPress={() => {
@@ -174,7 +191,22 @@ export default function HomeScreen() {
             <Text style={styles.resume}>Resume</Text>
           </Pressable>
         ) : null}
+        {chip.kind === 'off-schedule' ? (
+          <Pressable
+            testID="retry-schedule"
+            onPress={() => {
+              void app.retrySchedule();
+            }}
+          >
+            <Text style={styles.resume}>Retry</Text>
+          </Pressable>
+        ) : null}
       </View>
+      {app.state.catchupNote ? (
+        <Text testID="catchup-note" style={styles.note}>
+          {app.state.catchupNote}
+        </Text>
+      ) : null}
 
       {app.banner ? <Banner message={app.banner} onDismiss={app.clearBanner} /> : null}
 
@@ -193,11 +225,11 @@ export default function HomeScreen() {
 
       <View style={styles.room}>
         <View style={styles.roomStats}>
-          <Stat label="Room" value={room === null ? '—' : `${formatRoom(room)}°`} testID="room-temp" />
-          <Stat label="Humidity" value={reading ? `${Math.round(reading.humidity)}%` : '—'} />
+          <Stat label="Room" value={room === null ? '-' : `${formatRoom(room)}°`} testID="room-temp" />
+          <Stat label="Humidity" value={reading ? `${Math.round(reading.humidity)}%` : '-'} />
           <Stat
             label="CO2"
-            value={reading ? `${Math.round(reading.co2Ppm)} ppm` : '—'}
+            value={reading ? `${Math.round(reading.co2Ppm)} ppm` : '-'}
             detail={band?.label}
             detailColor={band ? toneColor(band.tone) : colors.muted}
             testID="co2-label"
@@ -233,8 +265,10 @@ export default function HomeScreen() {
 
       {app.command ? (
         <View testID="command-progress" style={styles.progress}>
-          <Text style={styles.progressTitle}>
-            Press {app.command.index} of {app.command.total}
+          <Text testID="command-label" style={styles.progressTitle}>
+            {app.command.label === 'finishing'
+              ? 'Finishing the current press'
+              : `Press ${app.command.index} of ${app.command.total}`}
           </Text>
           <View style={styles.track}>
             <View
@@ -283,7 +317,7 @@ export default function HomeScreen() {
         Up bot {battery(reading?.batteryUp)} · Down bot {battery(reading?.batteryDown)} · Meter{' '}
         {battery(reading?.batteryMeter)}
         {'\n'}
-        Updated {reading ? formatStamp(reading.updatedAt) : '—'}
+        Updated {reading ? formatStamp(reading.updatedAt) : '-'}
       </Text>
 
       <Sheet visible={setToOpen} onClose={() => setSetToOpen(false)}>
@@ -324,15 +358,18 @@ export default function HomeScreen() {
         <Stepper
           testID="recalibrate-value"
           value={`${recal}°`}
-          onMinus={() => setRecal((value) => Math.max(40, value - 1))}
-          onPlus={() => setRecal((value) => Math.min(95, value + 1))}
+          onMinus={() => setRecal((value) => Math.max(app.state.settings.minF, value - 1))}
+          onPlus={() => setRecal((value) => Math.min(app.state.settings.maxF, value + 1))}
         />
         <PillButton
           label="Save setpoint"
           testID="recalibrate-save"
           onPress={() => {
+            const reason = app.recalibrate(recal);
+            if (reason) {
+              return;
+            }
             setRecalOpen(false);
-            app.recalibrate(recal);
           }}
         />
       </Sheet>
@@ -358,7 +395,7 @@ export default function HomeScreen() {
 
 function battery(value: number | null | undefined): string {
   if (typeof value !== 'number') {
-    return '—';
+    return '-';
   }
   return `${Math.round(value)}%`;
 }
@@ -431,6 +468,15 @@ const styles = StyleSheet.create({
   },
   holdActive: {
     backgroundColor: 'rgba(255,122,69,0.12)',
+  },
+  holdOff: {
+    backgroundColor: 'rgba(228,210,176,0.12)',
+  },
+  note: {
+    color: colors.neutral,
+    fontFamily: fonts.body,
+    fontSize: 14,
+    lineHeight: 20,
   },
   holdText: {
     color: colors.text,

@@ -58,6 +58,20 @@ export async function requestReminderPermission(): Promise<string> {
   return 'Reminders will ask you to open Setpoint when a change is due.';
 }
 
+export async function notifyCheckThermostat(body: string): Promise<void> {
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'Check the thermostat',
+        body,
+      },
+      trigger: null,
+    });
+  } catch {
+    return;
+  }
+}
+
 export function watchNotificationOpen(onOpen: () => void): () => void {
   const subscription = Notifications.addNotificationResponseReceivedListener(() => {
     onOpen();

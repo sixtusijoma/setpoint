@@ -56,7 +56,7 @@ describe('runDueSchedule', () => {
       },
     });
     expect(calls).toEqual([70]);
-    expect(outcome.records.find((record) => record.label === 'Wake')?.status).toBe('ran');
+    expect(outcome.records.find((record) => record.label === 'Wake')?.status).toBe('done-late');
   });
 
   it('keeps a failed run unrun and records a cancel', async () => {

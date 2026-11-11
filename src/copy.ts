@@ -14,3 +14,6 @@ export const ROOM_CAPTION = 'Room air, not the setpoint.';
 
 export const BROWSER_BLOCKED =
   'Cloud control from the browser is blocked. The phone app is the live path.';
+
+export const CHECK_THERMOSTAT =
+  'Check the thermostat. A press was sent and the response was lost, so that degree was not counted. Later schedules still run.';

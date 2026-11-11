@@ -37,6 +37,7 @@
     "react-native-worklets": "0.13.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
     "@types/luxon": "^3.7.6",
     "@types/react": "~19.3.0",
     "typescript": "~6.0.3",

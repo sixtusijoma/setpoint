@@ -1,8 +1,8 @@
 import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
-import { celsiusToFahrenheit } from '@/domain/temperature';
-import { redactSecrets } from '@/devices/redact';
+import { celsiusToFahrenheit } from '../domain/temperature';
+import { redactSecrets } from './redact';
 
 export const SWITCHBOT_BASE = 'https://api.switch-bot.com/v1.1';
 
@@ -45,10 +45,15 @@ export class SwitchBotError extends Error {
   }
 }
 
+export const SWITCHBOT_TIMEOUT_MS = 12000;
+
 export class TransportError extends Error {
-  constructor(message: string) {
+  readonly kind: 'ambiguous' | 'rejected';
+
+  constructor(message: string, kind: 'ambiguous' | 'rejected' = 'ambiguous') {
     super(message);
     this.name = 'TransportError';
+    this.kind = kind;
   }
 }
 
@@ -102,23 +107,34 @@ function authHeaders(creds: Credentials): Record<string, string> {
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+function combineSignals(parent?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(SWITCHBOT_TIMEOUT_MS);
+  if (!parent) {
+    return timeout;
+  }
+  return AbortSignal.any([parent, timeout]);
+}
+
 async function switchbotRequest(
   creds: Credentials,
   path: string,
-  init: { method: 'GET' | 'POST'; body?: unknown },
+  init: { method: 'GET' | 'POST'; body?: unknown; signal?: AbortSignal },
   fetchImpl: FetchLike,
 ): Promise<unknown> {
   const secrets = [creds.secret, creds.token];
+  const signal = combineSignals(init.signal);
   let response: Response;
   try {
     response = await fetchImpl(`${SWITCHBOT_BASE}${path}`, {
       method: init.method,
       headers: authHeaders(creds),
       body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      signal,
     });
   } catch (error) {
     const raw = error instanceof Error ? error.message : 'Network request failed';
-    throw new TransportError(redactSecrets(raw, secrets));
+    const timedOut = signal.aborted || (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'));
+    throw new TransportError(redactSecrets(raw, secrets), timedOut ? 'ambiguous' : 'ambiguous');
   }
   let text = '';
   try {
@@ -209,8 +225,12 @@ export function parseBotBattery(body: unknown): number | null {
   return battery;
 }
 
-export async function listDevices(creds: Credentials, fetchImpl: FetchLike = fetch): Promise<SwitchBotDevice[]> {
-  const body = await switchbotRequest(creds, '/devices', { method: 'GET' }, fetchImpl);
+export async function listDevices(
+  creds: Credentials,
+  fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal,
+): Promise<SwitchBotDevice[]> {
+  const body = await switchbotRequest(creds, '/devices', { method: 'GET', signal }, fetchImpl);
   return parseDeviceList(body);
 }
 
@@ -218,11 +238,12 @@ export async function pressBot(
   creds: Credentials,
   deviceId: string,
   fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal,
 ): Promise<void> {
   await switchbotRequest(
     creds,
     `/devices/${encodeURIComponent(deviceId)}/commands`,
-    { method: 'POST', body: PRESS_COMMAND },
+    { method: 'POST', body: PRESS_COMMAND, signal },
     fetchImpl,
   );
 }
@@ -231,11 +252,12 @@ export async function readMeter(
   creds: Credentials,
   deviceId: string,
   fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal,
 ): Promise<MeterReading> {
   const body = await switchbotRequest(
     creds,
     `/devices/${encodeURIComponent(deviceId)}/status`,
-    { method: 'GET' },
+    { method: 'GET', signal },
     fetchImpl,
   );
   return parseMeterStatus(body);
@@ -245,11 +267,12 @@ export async function readBotBattery(
   creds: Credentials,
   deviceId: string,
   fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal,
 ): Promise<number | null> {
   const body = await switchbotRequest(
     creds,
     `/devices/${encodeURIComponent(deviceId)}/status`,
-    { method: 'GET' },
+    { method: 'GET', signal },
     fetchImpl,
   );
   return parseBotBattery(body);

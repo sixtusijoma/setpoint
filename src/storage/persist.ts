@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { defaultEvents, type HoldState, type ScheduleEvent } from '@/domain/schedule';
+import type { HistorySample, SetpointChange } from '@/domain/history';
+import { defaultEvents, normalizeStatus, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import { initialClimate } from '@/devices/simulator';
 import {
   createDefaultState,
@@ -64,11 +65,20 @@ function sanitizeState(raw: unknown, nowIso: string): Persisted | null {
     },
     presets: cleanPresets(record.presets, defaultPresets()),
     events: cleanEvents(record.events),
-    records: Array.isArray(record.records) ? record.records.slice(-400) : [],
-    hold: cleanHold(record.hold),
+    records: cleanRecords(record.records),
+    hold: cleanHold(record.hold, cleanEvents(record.events)),
     log: Array.isArray(record.log) ? record.log.slice(0, 200) : [],
-    demoClimate: { ...initialClimate(nowIso), ...(record.demoClimate ?? {}) },
+    demoClimate: {
+      ...initialClimate(nowIso),
+      ...(record.demoClimate ?? {}),
+      loseNextResponse: Boolean(record.demoClimate?.loseNextResponse),
+      failNextPress: Boolean(record.demoClimate?.failNextPress),
+    },
     lastLive: record.lastLive && typeof record.lastLive.temperatureF === 'number' ? record.lastLive : null,
+    catchupNote: typeof record.catchupNote === 'string' ? record.catchupNote : null,
+    schedulePhase: record.schedulePhase === 'paused-after-failure' ? 'paused-after-failure' : 'armed',
+    history: cleanHistory(record.history),
+    changes: cleanChanges(record.changes),
   };
 }
 
@@ -121,12 +131,73 @@ function cleanEvents(value: ScheduleEvent[] | undefined): ScheduleEvent[] {
   return value.filter((event) => event && typeof event.id === 'string' && Array.isArray(event.days));
 }
 
-function cleanHold(value: HoldState | undefined): HoldState {
-  if (!value) {
+function cleanHold(value: unknown, events: ScheduleEvent[]): HoldState {
+  if (!value || typeof value !== 'object') {
     return null;
   }
-  return {
-    until: typeof value.until === 'string' ? value.until : null,
-    label: value.label || '',
+  const record = value as {
+    kind?: unknown;
+    eventId?: unknown;
+    label?: unknown;
+    occurrenceAt?: unknown;
+    until?: unknown;
   };
+  if (record.kind === 'until-resume') {
+    return { kind: 'until-resume' };
+  }
+  if (record.kind === 'until-event' && typeof record.eventId === 'string' && typeof record.occurrenceAt === 'string') {
+    return {
+      kind: 'until-event',
+      eventId: record.eventId,
+      label: typeof record.label === 'string' ? record.label : '',
+      occurrenceAt: record.occurrenceAt,
+    };
+  }
+  const label = typeof record.label === 'string' ? record.label : '';
+  const until = typeof record.until === 'string' ? record.until : '';
+  if (!until) {
+    return label ? { kind: 'until-resume' } : null;
+  }
+  const match = events.find((event) => event.label === label);
+  if (!match) {
+    return { kind: 'until-resume' };
+  }
+  return { kind: 'until-event', eventId: match.id, label: match.label, occurrenceAt: until };
+}
+
+function cleanRecords(value: unknown): RunRecord[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const records: RunRecord[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const record = item as RunRecord;
+    const status = typeof record.status === 'string' ? normalizeStatus(record.status) : null;
+    if (!status || typeof record.key !== 'string') {
+      continue;
+    }
+    records.push({ ...record, status });
+  }
+  return records.slice(-400);
+}
+
+function cleanHistory(value: unknown): HistorySample[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item) => item && typeof item.at === 'string' && typeof item.temperatureF === 'number')
+    .slice(-2000) as HistorySample[];
+}
+
+function cleanChanges(value: unknown): SetpointChange[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item) => item && typeof item.at === 'string' && typeof item.setpoint === 'number')
+    .slice(-400) as SetpointChange[];
 }

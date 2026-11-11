@@ -66,6 +66,16 @@ export default function SettingsScreen() {
               thumbColor={colors.text}
             />
           </View>
+          <View style={styles.row}>
+            <Text style={styles.body}>Lose the next response</Text>
+            <Switch
+              testID="lose-next"
+              value={app.state.demoClimate.loseNextResponse}
+              onValueChange={app.setLoseNext}
+              trackColor={{ false: colors.raised, true: colors.poor }}
+              thumbColor={colors.text}
+            />
+          </View>
           <PillButton label="Reset demo" tone="ghost" testID="reset-demo" onPress={app.resetDemo} />
         </View>
       ) : null}
@@ -229,14 +239,14 @@ export default function SettingsScreen() {
           <View style={styles.presetTemp}>
             <Pressable
               style={styles.tiny}
-              onPress={() => app.updatePreset(preset.id, { tempF: Math.max(settings.minF, preset.tempF - 1) })}
+              onPress={() => app.updatePreset(preset.id, { tempF: Math.max(settings.minF, preset.tempF - settings.step) })}
             >
               <Text style={styles.tinyText}>−</Text>
             </Pressable>
             <Text style={styles.presetValue}>{preset.tempF}°</Text>
             <Pressable
               style={styles.tiny}
-              onPress={() => app.updatePreset(preset.id, { tempF: Math.min(settings.maxF, preset.tempF + 1) })}
+              onPress={() => app.updatePreset(preset.id, { tempF: Math.min(settings.maxF, preset.tempF + settings.step) })}
             >
               <Text style={styles.tinyText}>+</Text>
             </Pressable>
@@ -268,15 +278,18 @@ export default function SettingsScreen() {
         </Text>
         <Stepper
           value={`${recal}°`}
-          onMinus={() => setRecal((value) => Math.max(40, value - 1))}
-          onPlus={() => setRecal((value) => Math.min(95, value + 1))}
+          onMinus={() => setRecal((value) => Math.max(settings.minF, value - 1))}
+          onPlus={() => setRecal((value) => Math.min(settings.maxF, value + 1))}
         />
         <PillButton
           label="Save setpoint"
           testID="settings-recalibrate-save"
           onPress={() => {
+            const reason = app.recalibrate(recal);
+            if (reason) {
+              return;
+            }
             setRecalOpen(false);
-            app.recalibrate(recal);
           }}
         />
       </Sheet>
