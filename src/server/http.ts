@@ -2,8 +2,7 @@ import { listDevices, pressBot, readMeter } from '../devices/switchbot';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
 import { deviceIds, executeSharedPress, runSchedulerTick } from './engine';
-import type { ServerEnv } from './env';
-import { sameSecret } from './env';
+import { appKeyMatches, sameSecret, type ServerEnv } from './env';
 import { handleMcp } from './mcp';
 import type { SetpointDb } from './sqlDb';
 import type { SharedSnapshot } from './types';
@@ -17,30 +16,56 @@ export type HandlerOptions = {
   listRemoteDevices?: () => Promise<{ deviceId: string; deviceName: string; deviceType: string; enableCloudService: boolean | null; hubDeviceId: string }[]>;
 };
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-setpoint-cron-secret',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-};
+export const APP_KEY_HEADER = 'x-setpoint-app-key';
 
-function json(body: unknown, status = 200): Response {
+function corsHeaders(request: Request, env: ServerEnv): Record<string, string> {
+  const allowed = env.webOrigin?.trim() ?? '';
+  const origin = request.headers.get('origin') ?? '';
+  if (!allowed || origin !== allowed) {
+    return {};
+  }
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-setpoint-app-key, x-setpoint-cron-secret',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+    Vary: 'Origin',
+  };
+}
+
+function json(request: Request, env: ServerEnv, body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...CORS },
+    headers: { 'Content-Type': 'application/json', ...corsHeaders(request, env) },
   });
 }
 
-function empty(): Response {
-  return new Response(null, { status: 204, headers: CORS });
+function empty(request: Request, env: ServerEnv): Response {
+  return new Response(null, { status: 204, headers: corsHeaders(request, env) });
 }
 
-export function authorizeApp(request: Request, env: ServerEnv): boolean {
-  if (!env.anonKey) {
-    return false;
+export async function authorizeApp(request: Request, env: ServerEnv): Promise<boolean> {
+  const provided = request.headers.get(APP_KEY_HEADER) ?? '';
+  return appKeyMatches(provided, env.appKeyHash);
+}
+
+export async function requireApp(request: Request, env: ServerEnv): Promise<Response | null> {
+  if (request.method === 'OPTIONS') {
+    return empty(request, env);
   }
-  const apikey = request.headers.get('apikey') ?? '';
-  const bearer = (request.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '');
-  return sameSecret(apikey, env.anonKey) || sameSecret(bearer, env.anonKey);
+  if (!(await authorizeApp(request, env))) {
+    return json(request, env, { error: 'Unauthorized.' }, 401);
+  }
+  return null;
+}
+
+async function requireAppOrCron(request: Request, env: ServerEnv): Promise<Response | null> {
+  if (request.method === 'OPTIONS') {
+    return empty(request, env);
+  }
+  if ((await authorizeApp(request, env)) || authorizeCron(request, env)) {
+    return null;
+  }
+  return json(request, env, { error: 'Unauthorized.' }, 401);
 }
 
 export function authorizeCron(request: Request, env: ServerEnv): boolean {
@@ -101,14 +126,12 @@ async function pressWith(options: HandlerOptions, state: SharedSnapshot) {
 }
 
 export async function handleState(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   if (request.method === 'GET') {
-    return json(await options.db.readState());
+    return json(request, options.env, await options.db.readState());
   }
   if (request.method === 'PUT') {
     const body = (await request.json()) as Partial<SharedSnapshot> & { version?: number };
@@ -146,31 +169,29 @@ export async function handleState(request: Request, options: HandlerOptions): Pr
     }
     const saved = await options.db.patchState(version, patch);
     if (!saved) {
-      return json({ error: 'Shared state changed. Pull and retry.' }, 409);
+      return json(request, options.env, { error: 'Shared state changed. Pull and retry.' }, 409);
     }
-    return json(saved);
+    return json(request, options.env, saved);
   }
-  return json({ error: 'Method not allowed.' }, 405);
+  return json(request, options.env, { error: 'Method not allowed.' }, 405);
 }
 
 export async function handlePress(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   if (request.method !== 'POST') {
-    return json({ error: 'Method not allowed.' }, 405);
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
   }
   const body = (await request.json()) as { target?: number; source?: CommandSource };
   if (typeof body.target !== 'number' || !body.source) {
-    return json({ error: 'Say which temperature to reach.' }, 400);
+    return json(request, options.env, { error: 'Say which temperature to reach.' }, 400);
   }
   const state = await options.db.readState();
   const blocked = cloudReason(state);
   if (blocked) {
-    return json({
+    return json(request, options.env, {
       status: 'refused',
       stoppedAt: state.virtualSetpoint ?? body.target,
       wanted: body.target,
@@ -186,53 +207,49 @@ export async function handlePress(request: Request, options: HandlerOptions): Pr
     armMs: 400,
     press: await pressWith(options, state),
   });
-  return json(result);
+  return json(request, options.env, result);
 }
 
 export async function handleSession(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   if (request.method === 'POST') {
     await options.db.requestCancel();
-    return json({ ok: true });
+    return json(request, options.env, { ok: true });
   }
   const lease = await options.db.readLease();
-  return json({ progress: lease.phase === 'running' ? lease.progress : null });
+  return json(request, options.env, { progress: lease.phase === 'running' ? lease.progress : null });
 }
 
 export async function handleTick(request: Request, options: HandlerOptions): Promise<Response> {
   if (request.method === 'OPTIONS') {
-    return empty();
+    return empty(request, options.env);
   }
   if (!authorizeCron(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+    return json(request, options.env, { error: 'Unauthorized.' }, 401);
   }
   const state = await options.db.readState();
   const result = await runSchedulerTick(options.db, {
     now: options.now,
     press: await pressWith(options, state),
   });
-  return json(result);
+  return json(request, options.env, result);
 }
 
 export async function handleMeter(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeCron(request, options.env) && !authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireAppOrCron(request, options.env);
+  if (denied) {
+    return denied;
   }
   const state = await options.db.readState();
   const meter = state.deviceMap.meter;
   if (state.mode !== 'live' || !meter) {
-    return json({ sample: null });
+    return json(request, options.env, { sample: null });
   }
   if (meter.enableCloudService === false) {
-    return json({ error: 'The meter has cloud service turned off.' }, 409);
+    return json(request, options.env, { error: 'The meter has cloud service turned off.' }, 409);
   }
   const now = options.now ?? (() => new Date());
   let reading: { temperatureF: number; humidity: number; co2Ppm: number };
@@ -241,22 +258,20 @@ export async function handleMeter(request: Request, options: HandlerOptions): Pr
   } else {
     const creds = await credentials(options.db, options.env);
     if (!creds) {
-      return json({ error: 'SwitchBot credentials are not on the server.' }, 409);
+      return json(request, options.env, { error: 'SwitchBot credentials are not on the server.' }, 409);
     }
     const live = await readMeter(creds, meter.id);
     reading = { temperatureF: live.temperatureF, humidity: live.humidity, co2Ppm: live.co2Ppm };
   }
   const sample = { at: now().toISOString(), ...reading };
   await options.db.insertRead(sample);
-  return json({ sample });
+  return json(request, options.env, { sample });
 }
 
 export async function handleHistory(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   const url = new URL(request.url);
   const span = url.searchParams.get('span') === 'week' ? 7 : 1;
@@ -264,64 +279,60 @@ export async function handleHistory(request: Request, options: HandlerOptions): 
   const since = new Date(now().getTime() - span * 24 * 60 * 60 * 1000).toISOString();
   const samples = await options.db.listReads(since);
   const changes = await options.db.listChanges(since);
-  return json({ samples, changes });
+  return json(request, options.env, { samples, changes });
 }
 
 export async function handleCredentials(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   if (request.method !== 'POST') {
-    return json({ error: 'Method not allowed.' }, 405);
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
   }
   const body = (await request.json()) as { token?: string; secret?: string };
   const token = body.token?.trim() ?? '';
   const secret = body.secret?.trim() ?? '';
   if (!token || !secret) {
-    return json({ error: 'Enter both the token and the secret.' }, 400);
+    return json(request, options.env, { error: 'Enter both the token and the secret.' }, 400);
   }
   await options.db.saveCredentials(token, secret);
-  return json({ ok: true });
+  return json(request, options.env, { ok: true });
 }
 
 export async function handleDevices(request: Request, options: HandlerOptions): Promise<Response> {
-  if (request.method === 'OPTIONS') {
-    return empty();
-  }
-  if (!authorizeApp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
   }
   if (options.listRemoteDevices) {
     const devices = await options.listRemoteDevices();
-    return json({ devices });
+    return json(request, options.env, { devices });
   }
   const creds = await credentials(options.db, options.env);
   if (!creds) {
-    return json({ error: 'SwitchBot credentials are not on the server.' }, 409);
+    return json(request, options.env, { error: 'SwitchBot credentials are not on the server.' }, 409);
   }
   const devices = await listDevices(creds);
-  return json({ devices });
+  return json(request, options.env, { devices });
 }
 
 export async function handlePrune(request: Request, options: HandlerOptions): Promise<Response> {
   if (request.method === 'OPTIONS') {
-    return empty();
+    return empty(request, options.env);
   }
   if (!authorizeCron(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+    return json(request, options.env, { error: 'Unauthorized.' }, 401);
   }
-  return json(await options.db.pruneReads());
+  return json(request, options.env, await options.db.pruneReads());
 }
 
 export async function handleMcpRequest(request: Request, options: HandlerOptions): Promise<Response> {
   if (request.method === 'OPTIONS') {
-    return empty();
+    return empty(request, options.env);
   }
   if (!authorizeMcp(request, options.env)) {
-    return json({ error: 'Unauthorized.' }, 401);
+    return json(request, options.env, { error: 'Unauthorized.' }, 401);
   }
   const body = request.method === 'POST' ? await request.json() : { method: 'ping', id: null };
   const state = await options.db.readState();
@@ -338,5 +349,5 @@ export async function handleMcpRequest(request: Request, options: HandlerOptions
         }
       : undefined,
   });
-  return json(result);
+  return json(request, options.env, result);
 }

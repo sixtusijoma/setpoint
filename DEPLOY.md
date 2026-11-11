@@ -23,24 +23,30 @@ Set these names in the function secret store. Do not put the values in the repo.
 
 - `SWITCHBOT_TOKEN`
 - `SWITCHBOT_SECRET`
+- `SETPOINT_APP_KEY`
 - `SETPOINT_MCP_KEY`
 - `CRON_SECRET`
 
 `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` are injected by the platform. The service role key stays on the server. The app never sees it.
 
+`SETPOINT_APP_KEY` is the private key the phone sends. The function hashes it with SHA-256 at startup and keeps that hash for comparisons. The raw value is not copied onto the request environment object. Do not put this key in `EXPO_PUBLIC_*`, the app bundle, or a log.
+
+Optional: `SETPOINT_WEB_ORIGIN`, an exact browser origin such as `http://127.0.0.1:43117`. Leave it unset for the native app. The functions do not send `Access-Control-Allow-Origin: *`.
+
 ```bash
-supabase secrets set SWITCHBOT_TOKEN SWITCHBOT_SECRET SETPOINT_MCP_KEY CRON_SECRET
+supabase secrets set SWITCHBOT_TOKEN SWITCHBOT_SECRET SETPOINT_APP_KEY SETPOINT_MCP_KEY CRON_SECRET
 ```
 
-The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be omitted when the phone will upload them through Settings. The scheduler still needs one of the two sources before it can press.
+The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be omitted when the phone will upload them through Settings. The scheduler still needs one of the two sources before it can press. Generate `SETPOINT_APP_KEY` yourself and enter the same value once in the app. It is stored in the device secure store, not in the Expo project.
 
 ## 3. Deploy the functions
 
-`supabase/config.toml` sets `verify_jwt = false` for every function. Each function checks its own credential:
+`supabase/config.toml` sets `verify_jwt = false` for every function. Each function checks its own credential in one helper:
 
-- App functions (`state`, `press`, `session`, `history`, `credentials`, `devices`, and `meter` when the phone calls it) require the `apikey` header or `Authorization: Bearer` to match `SUPABASE_ANON_KEY`.
-- Cron functions (`tick`, `meter`, `prune`) require the header `x-setpoint-cron-secret` to match `CRON_SECRET`.
-- `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`.
+- App functions (`state`, `press`, `session`, `history`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
+- `meter` also accepts `x-setpoint-cron-secret` so the ten-minute job can keep running. A phone call still needs the app key.
+- `tick` and `prune` accept only `x-setpoint-cron-secret` matching `CRON_SECRET`.
+- `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`. The app key does not open it.
 
 ```bash
 supabase functions deploy state
@@ -88,7 +94,7 @@ EXPO_PUBLIC_SUPABASE_URL=https://rdyjczebydnmfvbgylya.supabase.co
 EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<the public anon key>
 ```
 
-Use the public anon key, the same value the edge runtime sees as `SUPABASE_ANON_KEY`. It is a public client key, not the service role key. Open Settings, enter the SwitchBot token and secret, and save. That uploads them to the private table and switches the app to live mode only if the device list loads.
+Use the public anon key, the same value the edge runtime sees as `SUPABASE_ANON_KEY`. It is a public client key, not the service role key, and it does not authorize the functions. The first launch asks for `SETPOINT_APP_KEY` and stores it in the secure store. Settings can change or clear that key. Then enter the SwitchBot token and secret. That uploads them to the private table and switches the app to live mode only if the device list loads.
 
 ## 6. Connect an MCP client
 

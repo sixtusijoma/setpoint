@@ -51,9 +51,11 @@ import {
   runRemotePress,
   saveRemoteCredentials,
   saveState,
+  ServerAuthError,
   type ServerConfig,
   type SharedSnapshot,
 } from '@/server/appClient';
+import { deleteAppKey, loadAppKey, saveAppKey } from '@/storage/appKey';
 import { clearCredentials, loadCredentials, maskSecret, saveCredentials } from '@/storage/credentials';
 import { loadPersisted, savePersisted } from '@/storage/persist';
 import {
@@ -61,6 +63,9 @@ import {
   createDefaultState,
   createId,
   deviceFromApi,
+  reduceAppAccess,
+  type AppAccess,
+  type AppAccessEvent,
   type Persisted,
   type Preset,
 } from '@/state/model';
@@ -97,6 +102,11 @@ type AppContextValue = {
   tokenMask: string | null;
   secretMask: string | null;
   serverConfigured: boolean;
+  access: AppAccess;
+  gateNote: string | null;
+  submitAppKey: (value: string) => Promise<void>;
+  clearAppKey: () => Promise<void>;
+  changeAppKey: () => void;
   clearBanner: () => void;
   setMode: (mode: Persisted['mode']) => void;
   setRoomLabel: (label: string) => void;
@@ -134,14 +144,19 @@ type AppContextValue = {
 
 const AppContext = createContext<AppContextValue | null>(null);
 
-function explainError(error: unknown): string {
-  if (Platform.OS === 'web' && (error instanceof TransportError || isFetchFailure(error))) {
-    return BROWSER_BLOCKED;
+function explainError(error: unknown, secret = ''): string {
+  let text = 'Something went wrong.';
+  if (error instanceof ServerAuthError) {
+    text = error.message;
+  } else if (Platform.OS === 'web' && (error instanceof TransportError || isFetchFailure(error))) {
+    text = BROWSER_BLOCKED;
+  } else if (error instanceof Error && error.message) {
+    text = error.message;
   }
-  if (error instanceof Error && error.message) {
-    return error.message;
+  if (secret && text.includes(secret)) {
+    return 'Something went wrong.';
   }
-  return 'Something went wrong.';
+  return text;
 }
 
 function isFetchFailure(error: unknown): boolean {
@@ -219,7 +234,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [tokenMask, setTokenMask] = useState<string | null>(null);
   const [secretMask, setSecretMask] = useState<string | null>(null);
   const [serverConfigured] = useState(() => readServerConfig() !== null);
+  const [access, setAccess] = useState<AppAccess>({ status: 'unused' });
+  const [gateNote, setGateNote] = useState<string | null>(null);
   const stateRef = useRef(state);
+  const appKeyRef = useRef('');
+  const accessRef = useRef<AppAccess>({ status: 'unused' });
   const messageRef = useRef<AppMessage>(null);
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
@@ -241,6 +260,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setMessage(merged);
   }, []);
 
+  const applyAccess = useCallback((event: AppAccessEvent) => {
+    const next = reduceAppAccess(accessRef.current, event);
+    accessRef.current = next;
+    setAccess(next);
+  }, []);
+
+  const sessionAuth = useCallback((): { config: ServerConfig; appKey: string } | null => {
+    const config = readServerConfig();
+    if (!config || accessRef.current.status !== 'unlocked' || appKeyRef.current.length === 0) {
+      return null;
+    }
+    return { config, appKey: appKeyRef.current };
+  }, []);
+
+  const noteAuth = useCallback(
+    (error: unknown): boolean => {
+      if (error instanceof ServerAuthError) {
+        applyAccess({ type: 'rejected' });
+        return true;
+      }
+      return false;
+    },
+    [applyAccess],
+  );
+
   const commit = useCallback((recipe: (prev: Persisted) => Persisted) => {
     const next = recipe(stateRef.current);
     stateRef.current = next;
@@ -248,15 +292,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const pushShared = useCallback((next: Persisted) => {
-    const config = readServerConfig();
-    if (!config || next.mode !== 'live') {
+    const auth = sessionAuth();
+    if (!auth || next.mode !== 'live') {
       return;
     }
     if (pushTimer.current) {
       clearTimeout(pushTimer.current);
     }
     pushTimer.current = setTimeout(() => {
-      void saveState(config, snapshotFrom(stateRef.current, serverVersion.current))
+      void saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, serverVersion.current))
         .then((saved) => {
           serverVersion.current = saved.version;
           if (saved.virtualSetpoint !== stateRef.current.virtualSetpoint) {
@@ -264,7 +308,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
         })
         .catch((error) => {
-          const text = explainError(error);
+          if (noteAuth(error)) {
+            return;
+          }
+          const text = explainError(error, appKeyRef.current);
           if (text.includes('Pull and retry')) {
             void pullSharedRef.current();
             return;
@@ -272,7 +319,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           showMessage({ source: 'link', text });
         });
     }, 250);
-  }, [showMessage]);
+  }, [commit, noteAuth, sessionAuth, showMessage]);
 
   const commitShared = useCallback(
     (recipe: (prev: Persisted) => Persisted) => {
@@ -289,6 +336,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     void (async () => {
       const stored = await loadPersisted(new Date().toISOString());
       const creds = await loadCredentials();
+      const config = readServerConfig();
+      const key = config ? await loadAppKey() : null;
       if (cancelled) {
         return;
       }
@@ -305,13 +354,48 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setTokenMask(maskSecret(creds.token));
         setSecretMask(maskSecret(creds.secret));
       }
+      if (!config) {
+        applyAccess({ type: 'server-off' });
+      } else if (!key) {
+        applyAccess({ type: 'no-key' });
+      } else {
+        appKeyRef.current = key;
+        applyAccess({ type: 'no-key' });
+        applyAccess({ type: 'submit' });
+        try {
+          const snap = await fetchState(config, key);
+          if (cancelled) {
+            return;
+          }
+          serverVersion.current = snap.version;
+          applyAccess({ type: 'accepted' });
+          if (stateRef.current.mode === 'live') {
+            if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+              const saved = await saveState(config, key, snapshotFrom(stateRef.current, serverVersion.current));
+              serverVersion.current = saved.version;
+            } else {
+              commit((prev) => applySnapshot(prev, snap));
+            }
+          }
+        } catch (error) {
+          if (cancelled) {
+            return;
+          }
+          if (error instanceof ServerAuthError) {
+            applyAccess({ type: 'rejected' });
+          } else {
+            applyAccess({ type: 'unreachable' });
+            setGateNote("Couldn't reach the shared server. Try the key again.");
+          }
+        }
+      }
       lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'booted');
       setReady(true);
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyAccess, commit]);
 
   useEffect(() => {
     if (!ready) {
@@ -337,23 +421,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const pullShared = useCallback(async () => {
-    const config = readServerConfig();
-    if (!config || stateRef.current.mode !== 'live' || isRunning(sessionRef.current)) {
+    const auth = sessionAuth();
+    if (!auth || stateRef.current.mode !== 'live' || isRunning(sessionRef.current)) {
       return;
     }
     try {
-      const snap = await fetchState(config);
+      const snap = await fetchState(auth.config, auth.appKey);
       serverVersion.current = snap.version;
       if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
-        const saved = await saveState(config, snapshotFrom(stateRef.current, serverVersion.current));
+        const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, serverVersion.current));
         serverVersion.current = saved.version;
         return;
       }
       commit((prev) => applySnapshot(prev, snap));
     } catch (error) {
-      showMessage({ source: 'link', text: explainError(error) });
+      if (noteAuth(error)) {
+        return;
+      }
+      showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
     }
-  }, [commit, showMessage]);
+  }, [commit, noteAuth, sessionAuth, showMessage]);
 
   pullSharedRef.current = pullShared;
 
@@ -503,9 +590,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         return { status: 'already', stoppedAt: current, wanted: target };
       }
-      const config = readServerConfig();
-      if (snapshot.mode === 'live' && config) {
-        return runOnServer(config, target, source);
+      const auth = sessionAuth();
+      if (snapshot.mode === 'live' && readServerConfig()) {
+        if (!auth) {
+          const reason = 'Enter the app key before sending a press.';
+          if (source.kind !== 'schedule') {
+            showMessage({ source: 'link', text: reason });
+          }
+          return { status: 'refused', stoppedAt: current, wanted: target, reason };
+        }
+        return runOnServer(auth, target, source);
       }
       cancelRef.current = false;
       interruptRef.current = false;
@@ -615,10 +709,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
         reason: settled.reason,
       };
     },
-    [commit, commitShared, finishResume, hasCredentials, pressRole, serverConfigured, showMessage],
+    [commit, commitShared, finishResume, hasCredentials, pressRole, serverConfigured, sessionAuth, showMessage],
   );
 
-  async function runOnServer(config: ServerConfig, target: number, source: CommandSource): Promise<CommandResult> {
+  async function runOnServer(
+    auth: { config: ServerConfig; appKey: string },
+    target: number,
+    source: CommandSource,
+  ): Promise<CommandResult> {
     sessionRef.current = {
       phase: 'armed',
       target,
@@ -632,7 +730,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       cancelRequested: false,
     };
     const poll = setInterval(() => {
-      void fetchRemoteSession(config)
+      void fetchRemoteSession(auth.config, auth.appKey)
         .then((remote) => {
           if (remote.progress) {
             setCommand(remote.progress);
@@ -641,7 +739,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         .catch(() => undefined);
     }, 400);
     try {
-      const result = await runRemotePress(config, { target, source });
+      const result = await runRemotePress(auth.config, auth.appKey, { target, source });
       if (result.notifyCheck || result.status === 'ambiguous') {
         showMessage({ source: 'press', text: CHECK_THERMOSTAT });
         void notifyCheckThermostat(CHECK_THERMOSTAT);
@@ -656,7 +754,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         reason: result.reason,
       };
     } catch (error) {
-      const reason = explainError(error);
+      noteAuth(error);
+      const reason = explainError(error, appKeyRef.current);
       showMessage({ source: 'press', text: reason });
       return {
         status: 'failed',
@@ -722,9 +821,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
           return next;
         });
-        if (outcome.catchupNote) {
-          showMessage({ source: 'schedule', text: outcome.catchupNote });
-        }
         const notable = outcome.log.find((line) => line.kind === 'failure' || line.kind === 'cancel');
         if (notable) {
           showMessage({ source: 'schedule', text: notable.message });
@@ -802,10 +898,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [ready, state.events, state.virtualSetpoint === null]);
 
   const refreshDevices = useCallback(async (): Promise<string | null> => {
-    const config = readServerConfig();
-    if (config) {
+    const auth = sessionAuth();
+    if (readServerConfig()) {
+      if (!auth) {
+        const note = 'Enter the app key before loading devices.';
+        setDeviceMessage(note);
+        return note;
+      }
       try {
-        const listed = await fetchRemoteDevices(config);
+        const listed = await fetchRemoteDevices(auth.config, auth.appKey);
         setDevices(listed.devices);
         if (listed.devices.length === 0) {
           const note =
@@ -817,7 +918,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setDeviceMessage(notes[0] ?? null);
         return null;
       } catch (error) {
-        const note = explainError(error);
+        noteAuth(error);
+        const note = explainError(error, appKeyRef.current);
         setDeviceMessage(note);
         return note;
       }
@@ -840,11 +942,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setDeviceMessage(notes[0] ?? null);
       return null;
     } catch (error) {
-      const note = explainError(error);
+      const note = explainError(error, appKeyRef.current);
       setDeviceMessage(note);
       return note;
     }
-  }, []);
+  }, [noteAuth, sessionAuth]);
 
   const refreshClimate = useCallback(async () => {
     if (refreshingRef.current) {
@@ -869,9 +971,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         });
         return;
       }
-      const config = readServerConfig();
-      if (config) {
-        const meter = await requestRemoteMeter(config);
+      const auth = sessionAuth();
+      if (readServerConfig()) {
+        if (!auth) {
+          return;
+        }
+        const meter = await requestRemoteMeter(auth.config, auth.appKey);
         if (meter.sample) {
           commit((prev) => ({
             ...prev,
@@ -925,12 +1030,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
         ].slice(-2000),
       }));
     } catch (error) {
-      showMessage({ source: 'meter', text: explainError(error) });
+      if (!noteAuth(error)) {
+        showMessage({ source: 'meter', text: explainError(error, appKeyRef.current) });
+      }
     } finally {
       refreshingRef.current = false;
       setRefreshing(false);
     }
-  }, [commit, showMessage]);
+  }, [commit, noteAuth, sessionAuth, showMessage]);
 
   const refreshRef = useRef(refreshClimate);
   refreshRef.current = refreshClimate;
@@ -949,6 +1056,47 @@ export function AppProvider({ children }: { children: ReactNode }) {
       tokenMask,
       secretMask,
       serverConfigured,
+      access,
+      gateNote,
+      submitAppKey: async (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          return;
+        }
+        const config = readServerConfig();
+        if (!config) {
+          return;
+        }
+        setGateNote(null);
+        applyAccess({ type: 'submit' });
+        try {
+          const snap = await fetchState(config, trimmed);
+          await saveAppKey(trimmed);
+          appKeyRef.current = trimmed;
+          serverVersion.current = snap.version;
+          applyAccess({ type: 'accepted' });
+          if (stateRef.current.mode === 'live') {
+            commit((prev) => applySnapshot(prev, snap));
+          }
+        } catch (error) {
+          if (error instanceof ServerAuthError) {
+            applyAccess({ type: 'rejected' });
+            return;
+          }
+          applyAccess({ type: 'unreachable' });
+          setGateNote("Couldn't reach the shared server. Try the key again.");
+        }
+      },
+      clearAppKey: async () => {
+        await deleteAppKey();
+        appKeyRef.current = '';
+        setGateNote(null);
+        applyAccess({ type: 'clear' });
+      },
+      changeAppKey: () => {
+        setGateNote(null);
+        applyAccess({ type: 'change' });
+      },
       clearBanner: () => showMessage(null),
       setMode: (mode) => {
         if (isRunning(sessionRef.current)) {
@@ -975,20 +1123,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
       saveAndLoadDevices: async (token, secret) => {
         const trimmedToken = token.trim();
         const trimmedSecret = secret.trim();
-        const config = readServerConfig();
-        if (config) {
+        const auth = sessionAuth();
+        if (readServerConfig()) {
+          if (!auth) {
+            return 'Enter the app key before saving credentials.';
+          }
           if (trimmedToken || trimmedSecret) {
             if (!trimmedToken || !trimmedSecret) {
               return 'Enter both the token and the secret.';
             }
             try {
-              await saveRemoteCredentials(config, trimmedToken, trimmedSecret);
+              await saveRemoteCredentials(auth.config, auth.appKey, trimmedToken, trimmedSecret);
               await saveCredentials(trimmedToken, trimmedSecret);
               setHasCredentials(true);
               setTokenMask(maskSecret(trimmedToken));
               setSecretMask(maskSecret(trimmedSecret));
             } catch (error) {
-              return explainError(error);
+              noteAuth(error);
+              return explainError(error, appKeyRef.current);
             }
           }
           const error = await refreshDevices();
@@ -1100,9 +1252,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       cancelCommand: () => {
         cancelRef.current = true;
-        const config = readServerConfig();
-        if (config && stateRef.current.mode === 'live') {
-          void cancelRemotePress(config);
+        const auth = sessionAuth();
+        if (auth && stateRef.current.mode === 'live') {
+          void cancelRemotePress(auth.config, auth.appKey).catch((error) => {
+            noteAuth(error);
+          });
         }
       },
       refreshClimate,
@@ -1396,16 +1550,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       },
       loadHistory: async (span) => {
-        const config = readServerConfig();
-        if (!config || stateRef.current.mode !== 'live') {
+        const auth = sessionAuth();
+        if (!auth || stateRef.current.mode !== 'live') {
           return;
         }
-        const history = await fetchHistory(config, span);
-        commit((prev) => ({
-          ...prev,
-          history: history.samples,
-          changes: history.changes,
-        }));
+        try {
+          const history = await fetchHistory(auth.config, auth.appKey, span);
+          commit((prev) => ({
+            ...prev,
+            history: history.samples,
+            changes: history.changes,
+          }));
+        } catch (error) {
+          if (!noteAuth(error)) {
+            showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
+          }
+        }
       },
     };
   }, [
@@ -1421,6 +1581,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     tokenMask,
     secretMask,
     serverConfigured,
+    access,
+    gateNote,
+    applyAccess,
+    sessionAuth,
+    noteAuth,
     showMessage,
     commit,
     commitShared,

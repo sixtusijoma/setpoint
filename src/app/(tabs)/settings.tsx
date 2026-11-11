@@ -47,6 +47,17 @@ export default function SettingsScreen() {
         </Pressable>
       </View>
 
+      {app.serverConfigured ? (
+        <View style={styles.block}>
+          <Text style={styles.section}>App key</Text>
+          <Text style={styles.body}>
+            The key stays in the secure store on this phone. It is not part of the app build. Change it here, or clear it and enter a new one.
+          </Text>
+          <PillButton label="Change key" testID="app-key-change" onPress={app.changeAppKey} />
+          <PillButton label="Clear key" tone="ghost" testID="app-key-clear" onPress={() => void app.clearAppKey()} />
+        </View>
+      ) : null}
+
       {app.state.mode === 'demo' ? (
         <View style={styles.block}>
           <Text style={styles.section}>Simulated room</Text>

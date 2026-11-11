@@ -1,3 +1,4 @@
+import { AppKeyScreen } from '@/components/app-key-screen';
 import { AppProvider, useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
 import {
@@ -40,18 +41,23 @@ export default function RootLayout() {
 }
 
 function Frame({ fontsReady }: { fontsReady: boolean }) {
-  const { ready, state } = useApp();
+  const { ready, state, access, serverConfigured } = useApp();
   const open = ready && fontsReady;
+  const needsKey = serverConfigured && access.status !== 'unlocked';
   useEffect(() => {
     if (open) {
       void SplashScreen.hideAsync();
     }
   }, [open]);
+  let body = <Boot fontsReady={fontsReady} />;
+  if (open && needsKey) {
+    body = <AppKeyScreen />;
+  } else if (open) {
+    body = <RootStack hasSetpoint={state.virtualSetpoint !== null} />;
+  }
   return (
     <View style={styles.outer}>
-      <View style={styles.column}>
-        {open ? <RootStack hasSetpoint={state.virtualSetpoint !== null} /> : <Boot fontsReady={fontsReady} />}
-      </View>
+      <View style={styles.column}>{body}</View>
     </View>
   );
 }

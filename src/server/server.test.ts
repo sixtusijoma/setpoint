@@ -1,11 +1,24 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PressOutcomeError } from '../domain/pressSession';
+import { hashAppKey, type ServerEnv } from './env';
 import { editScheduleEvent, executeSharedPress, runSchedulerTick } from './engine';
-import { handleCredentials, handleMcpRequest, handleMeter, handleState, handleTick } from './http';
+import {
+  APP_KEY_HEADER,
+  handleCredentials,
+  handleDevices,
+  handleHistory,
+  handleMcpRequest,
+  handleMeter,
+  handlePress,
+  handlePrune,
+  handleSession,
+  handleState,
+  handleTick,
+} from './http';
 import { handleMcp } from './mcp';
 import { createRestDb } from './restDb';
 import { createSqlDb, type SetpointDb } from './sqlDb';
@@ -29,14 +42,31 @@ const wednesdayMorning = new Date('2026-11-11T15:00:00.000Z');
 describe('shared server', () => {
   const pg = new PGlite();
   let db: SetpointDb;
+  let appKey = '';
+  let appKeyHash: Uint8Array<ArrayBufferLike> = new Uint8Array();
 
   beforeAll(async () => {
+    appKey = `k-${crypto.randomUUID()}`;
+    appKeyHash = await hashAppKey(appKey);
     await pg.exec(migration);
     db = createSqlDb(async <T>(sql: string, params: unknown[] = []) => {
       const result = await pg.query<T>(sql, params);
       return result.rows;
     });
   });
+
+  function appEnv(extra: Partial<ServerEnv> = {}): ServerEnv {
+    return {
+      appKeyHash,
+      cronSecret: 'cron-placeholder',
+      mcpKey: 'mcp-placeholder',
+      ...extra,
+    };
+  }
+
+  function appHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    return { [APP_KEY_HEADER]: appKey, 'Content-Type': 'application/json', ...extra };
+  }
 
   afterAll(async () => {
     await pg.close();
@@ -344,7 +374,7 @@ describe('shared server', () => {
     const reads = await pg.query<{ n: number }>(`select count(*)::int as n from public.meter_reads`);
     expect(reads.rows[0]?.n).toBe(1);
 
-    const env = { anonKey: 'anon-placeholder', cronSecret: 'cron-placeholder', mcpKey: 'mcp-placeholder' };
+    const env = appEnv();
     const denied = await handleMcpRequest(new Request('http://local/mcp', { method: 'POST', body: '{}' }), { db, env });
     expect(denied.status).toBe(401);
     const allowed = await handleMcpRequest(
@@ -359,8 +389,8 @@ describe('shared server', () => {
   });
 
   it('ignores an unversioned setpoint write and accepts a matching version', async () => {
-    const env = { anonKey: 'anon-placeholder', mcpKey: 'mcp-placeholder', cronSecret: 'cron-placeholder' };
-    const headers = { apikey: 'anon-placeholder', 'Content-Type': 'application/json' };
+    const env = appEnv();
+    const headers = appHeaders();
     const stale = await handleState(
       new Request('http://local/state', { method: 'PUT', headers, body: JSON.stringify({ version: 0, virtualSetpoint: 60 }) }),
       { db, env },
@@ -391,8 +421,8 @@ describe('shared server', () => {
   });
 
   it('stores credentials without echoing them and runs the meter and tick gates', async () => {
-    const env = { anonKey: 'anon-placeholder', cronSecret: 'cron-placeholder', mcpKey: 'mcp-placeholder' };
-    const headers = { apikey: 'anon-placeholder', 'Content-Type': 'application/json' };
+    const env = appEnv();
+    const headers = appHeaders();
     const saved = await handleCredentials(
       new Request('http://local/credentials', {
         method: 'POST',
@@ -425,6 +455,101 @@ describe('shared server', () => {
     expect(body.note).toBe('Sleep was missed, applied Wake.');
     const denied = await handleTick(new Request('http://local/tick', { method: 'POST' }), { db, env });
     expect(denied.status).toBe(401);
+  });
+
+  it('requires the app key on app functions and keeps cron and mcp on their own secrets', async () => {
+    const env = appEnv();
+    const missing = await handleState(new Request('http://local/state'), { db, env });
+    expect(missing.status).toBe(401);
+    expect(await missing.text()).toBe('{"error":"Unauthorized."}');
+    const wrong = await handlePress(
+      new Request('http://local/press', {
+        method: 'POST',
+        headers: { [APP_KEY_HEADER]: 'not-the-key', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: 71, source: { kind: 'manual' } }),
+      }),
+      { db, env, pressDevice: async () => undefined },
+    );
+    expect(wrong.status).toBe(401);
+
+    const lines: string[] = [];
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
+        lines.push(args.map((item) => String(item)).join(' '));
+      }),
+    );
+    const state = await handleState(new Request('http://local/state', { headers: appHeaders() }), { db, env });
+    expect(state.status).toBe(200);
+    const stateText = await state.text();
+    expect(stateText.includes(appKey)).toBe(false);
+    expect(lines.some((line) => line.includes(appKey))).toBe(false);
+    for (const spy of spies) {
+      spy.mockRestore();
+    }
+
+    const pressed = await handlePress(
+      new Request('http://local/press', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ target: 71, source: { kind: 'manual' } }),
+      }),
+      { db, env, pressDevice: async () => undefined },
+    );
+    expect(pressed.status).toBe(200);
+    const session = await handleSession(new Request('http://local/session', { headers: appHeaders() }), { db, env });
+    expect(session.status).toBe(200);
+    const history = await handleHistory(new Request('http://local/history', { headers: appHeaders() }), { db, env });
+    expect(history.status).toBe(200);
+    const devices = await handleDevices(new Request('http://local/devices', { method: 'POST', headers: appHeaders() }), {
+      db,
+      env,
+      listRemoteDevices: async () => [],
+    });
+    expect(devices.status).toBe(200);
+
+    const meterByApp = await handleMeter(
+      new Request('http://local/meter', { method: 'POST', headers: appHeaders() }),
+      { db, env, readMeterDevice: async () => ({ temperatureF: 66, humidity: 40, co2Ppm: 610 }) },
+    );
+    expect(meterByApp.status).toBe(200);
+    const meterDenied = await handleMeter(new Request('http://local/meter', { method: 'POST' }), { db, env });
+    expect(meterDenied.status).toBe(401);
+
+    const tickWithAppKey = await handleTick(
+      new Request('http://local/tick', { method: 'POST', headers: appHeaders() }),
+      { db, env },
+    );
+    expect(tickWithAppKey.status).toBe(401);
+    const pruneWithAppKey = await handlePrune(
+      new Request('http://local/prune', { method: 'POST', headers: appHeaders() }),
+      { db, env },
+    );
+    expect(pruneWithAppKey.status).toBe(401);
+    const mcpWithAppKey = await handleMcpRequest(
+      new Request('http://local/mcp', { method: 'POST', headers: appHeaders(), body: '{}' }),
+      { db, env },
+    );
+    expect(mcpWithAppKey.status).toBe(401);
+  });
+
+  it('does not emit a wildcard CORS header', async () => {
+    const open = await handleState(
+      new Request('http://local/state', { headers: { ...appHeaders(), origin: 'https://evil.example' } }),
+      { db, env: appEnv() },
+    );
+    expect(open.headers.get('access-control-allow-origin')).toBeNull();
+    const allowed = await handleState(
+      new Request('http://local/state', { headers: { ...appHeaders(), origin: 'http://127.0.0.1:43117' } }),
+      { db, env: appEnv({ webOrigin: 'http://127.0.0.1:43117' }) },
+    );
+    expect(allowed.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:43117');
+    const preflight = await handleState(
+      new Request('http://local/state', { method: 'OPTIONS', headers: { origin: 'http://127.0.0.1:43117' } }),
+      { db, env: appEnv({ webOrigin: 'http://127.0.0.1:43117' }) },
+    );
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('access-control-allow-origin')).toBe('http://127.0.0.1:43117');
+    expect(preflight.headers.get('access-control-allow-headers')).toContain(APP_KEY_HEADER);
   });
 });
 

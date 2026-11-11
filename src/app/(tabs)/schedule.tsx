@@ -37,12 +37,14 @@ export default function ScheduleScreen() {
           value={missed ? `${missed.label} · ${formatInstant(missed.occurrenceAt, true)}` : 'None'}
         />
       </View>
-      <Text style={styles.body}>
+      <Text testID="schedule-status" style={styles.body}>
         {app.state.hold
           ? 'A temporary hold is on. When it ends, Setpoint applies only the latest due change and marks earlier ones missed. Resume from Home.'
           : app.serverConfigured && app.state.mode === 'live'
-            ? 'The shared server runs due changes even when the phone is asleep.'
-            : 'Following the schedule. Due changes run while Setpoint is open, and when you bring it back.'}
+            ? 'Schedules run on the shared server, including while the phone is asleep.'
+            : app.serverConfigured
+              ? 'Switch to live and schedules run on the shared server, including while the phone is asleep. Demo changes run while Setpoint is open.'
+              : 'Schedules run on the shared server once this phone is connected, including while the phone is asleep. In this demo they run while Setpoint is open.'}
       </Text>
       {app.state.catchupNote ? (
         <Text testID="catchup-note" style={styles.note}>
@@ -122,10 +124,12 @@ export default function ScheduleScreen() {
       })}
       <PillButton label="Add event" onPress={app.addEvent} />
       <Text style={styles.section}>Reminders</Text>
-      <Text style={styles.body}>
+      <Text testID="schedule-reminders" style={styles.body}>
         {app.serverConfigured && app.state.mode === 'live'
-          ? 'The server runs each change on its timer. These reminders are a backup if you also want a nudge.'
-          : 'Open Setpoint to run each one. A suspended phone will not press the bots on its own.'}
+          ? 'Schedules run on the shared server, including while the phone is asleep. These reminders are only a nudge.'
+          : app.serverConfigured
+            ? 'Switch to live and the shared server runs each change, including while the phone is asleep. In demo, changes run while Setpoint is open.'
+            : 'Schedules run on the shared server once this phone is connected, including while the phone is asleep. In this demo they run while Setpoint is open.'}
       </Text>
       {reminders.map((item) => (
         <Text key={item.key} style={styles.reminder}>

@@ -137,6 +137,69 @@ export function appendLog(state: Persisted, kind: LogKind, message: string, at: 
   return { ...state, log: [entry, ...state.log].slice(0, 200) };
 }
 
+export type AppAccess =
+  | { status: 'unused' }
+  | { status: 'locked' }
+  | { status: 'checking' }
+  | { status: 'unlocked' }
+  | { status: 'wrong-key' };
+
+export type AppAccessEvent =
+  | { type: 'server-off' }
+  | { type: 'no-key' }
+  | { type: 'submit' }
+  | { type: 'accepted' }
+  | { type: 'rejected' }
+  | { type: 'change' }
+  | { type: 'clear' }
+  | { type: 'unreachable' };
+
+export function reduceAppAccess(access: AppAccess, event: AppAccessEvent): AppAccess {
+  if (event.type === 'server-off') {
+    return { status: 'unused' };
+  }
+  if (event.type === 'no-key') {
+    return { status: 'locked' };
+  }
+  if (event.type === 'submit') {
+    if (access.status === 'unused') {
+      return access;
+    }
+    return { status: 'checking' };
+  }
+  if (event.type === 'accepted') {
+    if (access.status === 'checking') {
+      return { status: 'unlocked' };
+    }
+    return access;
+  }
+  if (event.type === 'rejected') {
+    if (access.status === 'checking' || access.status === 'unlocked') {
+      return { status: 'wrong-key' };
+    }
+    return access;
+  }
+  if (event.type === 'change') {
+    if (access.status === 'unlocked' || access.status === 'wrong-key') {
+      return { status: 'locked' };
+    }
+    return access;
+  }
+  if (event.type === 'clear') {
+    if (access.status === 'unused') {
+      return access;
+    }
+    return { status: 'locked' };
+  }
+  if (event.type === 'unreachable') {
+    if (access.status === 'checking') {
+      return { status: 'locked' };
+    }
+    return access;
+  }
+  return access;
+}
+
 export function deviceFromApi(device: {
   deviceId: string;
   deviceName: string;

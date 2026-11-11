@@ -22,7 +22,9 @@ EXPO_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
 EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<the public anon key>
 ```
 
-Do not put the service role key, the SwitchBot token, or the MCP key in these variables. Demo mode ignores them.
+Do not put the service role key, the SwitchBot token, the MCP key, or the app key in these variables. Demo mode ignores them.
+
+The private app key is not an environment variable. When the two variables above are set, the app asks for it once and stores it with `expo-secure-store` on iOS and Android. Do not put that key in `EXPO_PUBLIC_*` or in the app bundle. On the web demo, secure storage is unavailable, so the key stays in `sessionStorage` for that tab only.
 
 On a phone, use Expo Go:
 

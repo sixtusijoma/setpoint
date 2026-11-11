@@ -41,6 +41,15 @@ export type RemoteCommandResult = {
   notifyCheck?: boolean;
 };
 
+export class ServerAuthError extends Error {
+  constructor() {
+    super('The app key was rejected.');
+    this.name = 'ServerAuthError';
+  }
+}
+
+const APP_KEY_HEADER = 'x-setpoint-app-key';
+
 export function readServerConfig(): ServerConfig | null {
   const url = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim();
   const publishableKey = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim();
@@ -50,17 +59,30 @@ export function readServerConfig(): ServerConfig | null {
   return { url: url.replace(/\/$/, ''), publishableKey };
 }
 
-async function call<T>(config: ServerConfig, path: string, init?: RequestInit): Promise<T> {
+function safeMessage(message: string, appKey: string): string {
+  if (appKey && message.includes(appKey)) {
+    return 'Server request failed.';
+  }
+  return message;
+}
+
+async function call<T>(config: ServerConfig, appKey: string, path: string, init?: RequestInit): Promise<T> {
+  if (!appKey) {
+    throw new ServerAuthError();
+  }
+  const headers = new Headers(init?.headers);
+  headers.set('Content-Type', 'application/json');
+  headers.set('apikey', config.publishableKey);
+  headers.set('Authorization', `Bearer ${config.publishableKey}`);
+  headers.set(APP_KEY_HEADER, appKey);
   const response = await fetch(`${config.url}/functions/v1/${path}`, {
     ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: config.publishableKey,
-      Authorization: `Bearer ${config.publishableKey}`,
-      ...(init?.headers ?? {}),
-    },
+    headers,
   });
   const text = await response.text();
+  if (response.status === 401) {
+    throw new ServerAuthError();
+  }
   let payload: unknown = null;
   if (text) {
     try {
@@ -74,53 +96,60 @@ async function call<T>(config: ServerConfig, path: string, init?: RequestInit): 
       payload && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string'
         ? payload.error
         : `Server request failed (${response.status}).`;
-    throw new Error(message);
+    throw new Error(safeMessage(message, appKey));
   }
   return payload as T;
 }
 
-export function fetchState(config: ServerConfig): Promise<SharedSnapshot> {
-  return call(config, 'state');
+export function fetchState(config: ServerConfig, appKey: string): Promise<SharedSnapshot> {
+  return call(config, appKey, 'state');
 }
 
-export function saveState(config: ServerConfig, patch: Partial<SharedSnapshot> & { version?: number }): Promise<SharedSnapshot> {
-  return call(config, 'state', { method: 'PUT', body: JSON.stringify(patch) });
+export function saveState(
+  config: ServerConfig,
+  appKey: string,
+  patch: Partial<SharedSnapshot> & { version?: number },
+): Promise<SharedSnapshot> {
+  return call(config, appKey, 'state', { method: 'PUT', body: JSON.stringify(patch) });
 }
 
 export function runRemotePress(
   config: ServerConfig,
+  appKey: string,
   body: { target: number; source: CommandSource },
 ): Promise<RemoteCommandResult> {
-  return call(config, 'press', { method: 'POST', body: JSON.stringify(body) });
+  return call(config, appKey, 'press', { method: 'POST', body: JSON.stringify(body) });
 }
 
-export function cancelRemotePress(config: ServerConfig): Promise<{ ok: true }> {
-  return call(config, 'session', { method: 'POST', body: JSON.stringify({ cancel: true }) });
+export function cancelRemotePress(config: ServerConfig, appKey: string): Promise<{ ok: true }> {
+  return call(config, appKey, 'session', { method: 'POST', body: JSON.stringify({ cancel: true }) });
 }
 
-export function fetchRemoteSession(config: ServerConfig): Promise<{ progress: RemoteProgress | null }> {
-  return call(config, 'session');
+export function fetchRemoteSession(config: ServerConfig, appKey: string): Promise<{ progress: RemoteProgress | null }> {
+  return call(config, appKey, 'session');
 }
 
 export function fetchHistory(
   config: ServerConfig,
+  appKey: string,
   span: 'day' | 'week',
 ): Promise<{ samples: HistorySample[]; changes: SetpointChange[] }> {
-  return call(config, `history?span=${span}`);
+  return call(config, appKey, `history?span=${span}`);
 }
 
 export function saveRemoteCredentials(
   config: ServerConfig,
+  appKey: string,
   token: string,
   secret: string,
 ): Promise<{ ok: true }> {
-  return call(config, 'credentials', { method: 'POST', body: JSON.stringify({ token, secret }) });
+  return call(config, appKey, 'credentials', { method: 'POST', body: JSON.stringify({ token, secret }) });
 }
 
-export function fetchRemoteDevices(config: ServerConfig): Promise<{ devices: SwitchBotDevice[] }> {
-  return call(config, 'devices', { method: 'POST', body: '{}' });
+export function fetchRemoteDevices(config: ServerConfig, appKey: string): Promise<{ devices: SwitchBotDevice[] }> {
+  return call(config, appKey, 'devices', { method: 'POST', body: '{}' });
 }
 
-export function requestRemoteMeter(config: ServerConfig): Promise<{ sample: HistorySample | null }> {
-  return call(config, 'meter', { method: 'POST', body: '{}' });
+export function requestRemoteMeter(config: ServerConfig, appKey: string): Promise<{ sample: HistorySample | null }> {
+  return call(config, appKey, 'meter', { method: 'POST', body: '{}' });
 }
