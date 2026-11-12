@@ -1,6 +1,8 @@
+import { historyQuery } from '../domain/history';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
 import type { Occurrence } from '../domain/schedule';
 import { deviceIds, editScheduleEvent, executeSharedPress, recalibrateShared, storeMeterRead, type PressTiming } from './engine';
+import { importMeterCsv } from './importMeter';
 import type { SetpointDb } from './sqlDb';
 import type { CommandSource } from './types';
 
@@ -22,8 +24,26 @@ export const MCP_TOOLS = [
   },
   {
     name: 'room_history',
-    description: 'Return stored temperature, humidity, and CO2 for a day or a week.',
-    inputSchema: { type: 'object', properties: { span: { type: 'string', enum: ['day', 'week'] } } },
+    description: 'Return stored temperature, humidity, and CO2. Use span day, week, or month, or pass since and until as ISO timestamps.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        span: { type: 'string', enum: ['day', 'week', 'month'] },
+        since: { type: 'string', description: 'Range start, ISO timestamp. Requires until.' },
+        until: { type: 'string', description: 'Range end, ISO timestamp. Requires since.' },
+      },
+    },
+  },
+  {
+    name: 'import_meter_csv',
+    description: 'Import a SwitchBot Meter Pro CO2 CSV export into stored room readings. Sending the same file again does not duplicate rows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        csv: { type: 'string', description: 'CSV text from SwitchBot app, Meter Pro, Export Data.' },
+      },
+      required: ['csv'],
+    },
   },
   {
     name: 'show_schedule',
@@ -129,11 +149,18 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     return JSON.stringify({ events: state.events, records: state.records.slice(-12), note: state.catchupNote });
   }
   if (name === 'room_history') {
-    const span = args.span === 'week' ? 7 : 1;
-    const since = new Date(now().getTime() - span * 24 * 60 * 60 * 1000).toISOString();
-    const reads = await db.listReads(since);
-    const changes = await db.listChanges(since);
+    const range = historyQuery({ span: args.span, since: args.since, until: args.until }, now());
+    const reads = await db.listReads(range.since, range.until, range.bucketSeconds);
+    const changes = await db.listChanges(range.since, range.until);
     return JSON.stringify({ reads, changes });
+  }
+  if (name === 'import_meter_csv') {
+    const csv = typeof args.csv === 'string' ? args.csv : '';
+    if (!csv.trim()) {
+      throw new Error('Pass the CSV text in csv.');
+    }
+    const summary = await importMeterCsv(db, csv);
+    return JSON.stringify(summary);
   }
   if (name === 'read_room') {
     if (!deps.readMeter) {

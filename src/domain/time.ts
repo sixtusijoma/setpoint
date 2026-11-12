@@ -46,6 +46,14 @@ export function formatInstant(iso: string, withWeekday = false): string {
   return instant.toFormat('h:mm a');
 }
 
+export function formatDayTime(iso: string): string {
+  const instant = DateTime.fromISO(iso, { setZone: true }).setZone(TIME_ZONE);
+  if (!instant.isValid) {
+    return '';
+  }
+  return instant.toFormat('LLL d, yyyy, h:mm a');
+}
+
 export function formatStamp(iso: string): string {
   const instant = DateTime.fromISO(iso, { setZone: true }).setZone(TIME_ZONE);
   if (!instant.isValid) {

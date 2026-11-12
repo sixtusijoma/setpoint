@@ -1,4 +1,5 @@
 import type { HistorySample, SetpointChange } from '@/domain/history';
+import type { MeterImportSummary } from '@/domain/meterCsv';
 import type { CommandSource } from '@/domain/pressSession';
 import { defaultEvents, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
@@ -198,6 +199,65 @@ export function reduceAppAccess(access: AppAccess, event: AppAccessEvent): AppAc
     return access;
   }
   return access;
+}
+
+export type MeterImportState =
+  | { status: 'idle' }
+  | { status: 'picking' }
+  | { status: 'uploading' }
+  | { status: 'done'; summary: MeterImportSummary }
+  | { status: 'error'; message: string };
+
+export type MeterImportEvent =
+  | { type: 'pick' }
+  | { type: 'cancel' }
+  | { type: 'chosen' }
+  | { type: 'succeed'; summary: MeterImportSummary }
+  | { type: 'fail'; message: string }
+  | { type: 'dismiss' };
+
+export function idleMeterImport(): MeterImportState {
+  return { status: 'idle' };
+}
+
+export function reduceMeterImport(state: MeterImportState, event: MeterImportEvent): MeterImportState {
+  if (event.type === 'pick') {
+    if (state.status === 'idle' || state.status === 'done' || state.status === 'error') {
+      return { status: 'picking' };
+    }
+    return state;
+  }
+  if (event.type === 'cancel') {
+    if (state.status === 'picking') {
+      return { status: 'idle' };
+    }
+    return state;
+  }
+  if (event.type === 'chosen') {
+    if (state.status === 'picking') {
+      return { status: 'uploading' };
+    }
+    return state;
+  }
+  if (event.type === 'succeed') {
+    if (state.status === 'uploading') {
+      return { status: 'done', summary: event.summary };
+    }
+    return state;
+  }
+  if (event.type === 'fail') {
+    if (state.status === 'picking' || state.status === 'uploading') {
+      return { status: 'error', message: event.message };
+    }
+    return state;
+  }
+  if (event.type === 'dismiss') {
+    if (state.status === 'done' || state.status === 'error') {
+      return { status: 'idle' };
+    }
+    return state;
+  }
+  return state;
 }
 
 export function deviceFromApi(device: {

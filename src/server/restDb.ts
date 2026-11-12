@@ -13,6 +13,7 @@ const RPC: Record<string, string> = {
   request_press_cancel: 'request_press_cancel',
   release_press_lease: 'release_press_lease',
   insert_meter_read: 'insert_meter_read',
+  import_meter_reads: 'import_meter_reads',
   insert_setpoint_change: 'insert_setpoint_change',
   list_meter_reads: 'list_meter_reads',
   list_setpoint_changes: 'list_setpoint_changes',
@@ -76,11 +77,17 @@ function argsFor(name: string, params: unknown[]): Record<string, unknown> {
   if (name === 'insert_meter_read') {
     return { p_at: params[0], p_temp: params[1], p_humidity: params[2], p_co2: params[3] };
   }
+  if (name === 'import_meter_reads') {
+    return { p_rows: typeof params[0] === 'string' ? JSON.parse(params[0]) : params[0] };
+  }
   if (name === 'insert_setpoint_change') {
     return { p_at: params[0], p_setpoint: params[1], p_source: params[2], p_label: params[3] };
   }
-  if (name === 'list_meter_reads' || name === 'list_setpoint_changes') {
-    return { p_since: params[0] };
+  if (name === 'list_meter_reads') {
+    return { p_since: params[0], p_until: params[1] ?? null, p_bucket_seconds: params[2] ?? 0 };
+  }
+  if (name === 'list_setpoint_changes') {
+    return { p_since: params[0], p_until: params[1] ?? null };
   }
   if (name === 'save_switchbot_credentials') {
     return { p_token: params[0], p_secret: params[1] };

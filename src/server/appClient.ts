@@ -2,7 +2,9 @@ import type { CommandSource } from '@/domain/pressSession';
 import type { HoldState, RunRecord, ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
 import type { SwitchBotDevice } from '@/devices/switchbot';
+import type { HistorySpan } from '@/domain/history';
 import type { HistorySample, SetpointChange } from '@/domain/history';
+import { chunkMeterCsv, combineSummaries, emptySummary, type MeterImportSummary } from '@/domain/meterCsv';
 import type { DeviceMap, Preset, Settings } from '@/state/model';
 
 export type ServerConfig = {
@@ -140,9 +142,26 @@ export function fetchRemoteSession(config: ServerConfig, appKey: string): Promis
 export function fetchHistory(
   config: ServerConfig,
   appKey: string,
-  span: 'day' | 'week',
+  span: HistorySpan,
 ): Promise<{ samples: HistorySample[]; changes: SetpointChange[] }> {
   return call(config, appKey, `history?span=${span}`);
+}
+
+export async function importMeterCsvRemote(
+  config: ServerConfig,
+  appKey: string,
+  csv: string,
+): Promise<MeterImportSummary> {
+  const chunks = chunkMeterCsv(csv, 2000);
+  let summary = emptySummary();
+  for (const chunk of chunks) {
+    const part = await call<MeterImportSummary>(config, appKey, 'import-meter', {
+      method: 'POST',
+      body: JSON.stringify({ csv: chunk }),
+    });
+    summary = combineSummaries(summary, part);
+  }
+  return summary;
 }
 
 export function saveRemoteCredentials(

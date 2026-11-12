@@ -15,7 +15,7 @@ supabase link --project-ref rdyjczebydnmfvbgylya
 supabase db push
 ```
 
-That applies `supabase/migrations/20261111120000_setpoint.sql`. It creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
+That applies `supabase/migrations/20261111120000_setpoint.sql` and `supabase/migrations/20261112120000_meter_import.sql`. The first creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. The second adds an `origin` column (`live` or `import`) on meter reads, the `import_meter_reads` function, and `since` / `until` arguments on the history functions. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
 
 ## 2. Set function secrets
 
@@ -43,7 +43,8 @@ The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be 
 
 `supabase/config.toml` sets `verify_jwt = false` for every function. Each function checks its own credential in one helper:
 
-- App functions (`state`, `press`, `recalibrate`, `session`, `history`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
+- App functions (`state`, `press`, `recalibrate`, `session`, `history`, `import-meter`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
+- `import-meter` is `POST`. Send JSON `{ "csv": "<file text>" }` or a raw `text/csv` body. It returns `{ "inserted", "duplicates", "skipped", "firstAt", "lastAt" }`. It uses the existing `SETPOINT_APP_KEY`. It does not add a secret. `tick` and `prune` stay on `CRON_SECRET`. `mcp` stays on `SETPOINT_MCP_KEY`.
 - `meter` also accepts `x-setpoint-cron-secret` so the ten-minute job can keep running. A phone call still needs the app key.
 - `tick` and `prune` accept only `x-setpoint-cron-secret` matching `CRON_SECRET`.
 - `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`. The app key does not open it.
@@ -56,6 +57,7 @@ supabase functions deploy session
 supabase functions deploy tick
 supabase functions deploy meter
 supabase functions deploy history
+supabase functions deploy import-meter
 supabase functions deploy credentials
 supabase functions deploy devices
 supabase functions deploy prune
@@ -84,7 +86,7 @@ Then run the contents of `supabase/cron.sql`. It enables `pg_cron` and `pg_net` 
 | `setpoint-meter-read` | every 10 minutes | `POST /meter` |
 | `setpoint-prune-reads` | 04:15 UTC daily | `POST /prune` |
 
-The tick honors skips, run-now done marks, catch-up (latest due target only), and holds. It presses only when shared mode is `live`. The meter job stores temperature, humidity, and CO2. The prune job keeps raw reads for 30 days, then rolls them into hourly averages. Hourly rows older than 400 days are deleted.
+The tick honors skips, run-now done marks, catch-up (latest due target only), and holds. It presses only when shared mode is `live`. The meter job stores temperature, humidity, and CO2. The prune job keeps live raw reads for 30 days, then rolls those into hourly averages. Live hourly rows older than 400 days are deleted. Rows imported from a meter CSV stay as raw readings and are not rolled or deleted.
 
 The phone also requests a meter read when the app opens.
 
@@ -113,10 +115,10 @@ Authorization: Bearer <SETPOINT_MCP_KEY>
 
 Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The function also accepts `Accept: application/json`. If the gateway asks for an `apikey` header, send the public anon key there. The function does not treat that header as the MCP secret.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history`, `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, or `month`, or both `since` and `until` as ISO timestamps, 800 days at most), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), `status`.
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 
 ## Local tests
 
-Docker was not available in the environment that added this server, so the suite does not boot the Supabase CLI stack. `npm test` loads the migration into PGlite and runs the press lease, the scheduler, skips, run-now, meter prune, and the MCP tools against those rows. The edge entrypoints are thin wrappers around the same handlers.
+Docker was not available in the environment that added this server, so the suite does not boot the Supabase CLI stack. `npm test` loads both migrations into PGlite and runs the press lease, the scheduler, skips, run-now, meter prune, CSV import, history ranges, and the MCP tools against those rows. The edge entrypoints are thin wrappers around the same handlers.

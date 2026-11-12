@@ -1,7 +1,9 @@
 import { listDevices, pressBot, readMeter } from '../devices/switchbot';
+import { historyQuery } from '../domain/history';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
 import { deviceIds, executeSharedPress, RecalibrateError, recalibrateShared, runSchedulerTick, type PressTiming } from './engine';
+import { importMeterCsv, MeterImportError } from './importMeter';
 import { appKeyMatches, sameSecret, type ServerEnv } from './env';
 import { handleMcp } from './mcp';
 import type { SetpointDb } from './sqlDb';
@@ -297,12 +299,51 @@ export async function handleHistory(request: Request, options: HandlerOptions): 
     return denied;
   }
   const url = new URL(request.url);
-  const span = url.searchParams.get('span') === 'week' ? 7 : 1;
   const now = options.now ?? (() => new Date());
-  const since = new Date(now().getTime() - span * 24 * 60 * 60 * 1000).toISOString();
-  const samples = await options.db.listReads(since);
-  const changes = await options.db.listChanges(since);
+  const range = historyQuery({ span: url.searchParams.get('span') }, now());
+  const samples = await options.db.listReads(range.since, range.until, range.bucketSeconds);
+  const changes = await options.db.listChanges(range.since, range.until);
   return json(request, options.env, { samples, changes });
+}
+
+export async function handleImportMeter(request: Request, options: HandlerOptions): Promise<Response> {
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
+  }
+  if (request.method !== 'POST') {
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
+  }
+  let csv = '';
+  try {
+    csv = await csvText(request);
+  } catch {
+    return json(request, options.env, { error: 'Send the CSV text.' }, 400);
+  }
+  if (!csv.trim()) {
+    return json(request, options.env, { error: 'Send the CSV text.' }, 400);
+  }
+  try {
+    const summary = await importMeterCsv(options.db, csv);
+    return json(request, options.env, summary);
+  } catch (error) {
+    if (error instanceof MeterImportError) {
+      return json(request, options.env, { error: error.message }, 400);
+    }
+    throw error;
+  }
+}
+
+async function csvText(request: Request): Promise<string> {
+  const type = request.headers.get('content-type') ?? '';
+  if (type.includes('json')) {
+    const body = (await request.json()) as { csv?: unknown };
+    if (typeof body.csv !== 'string') {
+      return '';
+    }
+    return body.csv;
+  }
+  return request.text();
 }
 
 export async function handleCredentials(request: Request, options: HandlerOptions): Promise<Response> {

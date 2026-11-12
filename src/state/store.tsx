@@ -27,7 +27,8 @@ import {
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
 import { formatClock } from '@/domain/time';
-import { seedDemoHistory } from '@/domain/history';
+import { LOCAL_HISTORY_CAP, seedDemoHistory, type HistorySpan } from '@/domain/history';
+import { mergeMeterHistory, parseMeterCsv } from '@/domain/meterCsv';
 import { driftClimate, initialClimate } from '@/devices/simulator';
 import {
   deviceNotes,
@@ -43,6 +44,7 @@ import { notifyCheckThermostat, requestReminderPermission, syncReminders, watchN
 import {
   cancelRemotePress,
   fetchHistory,
+  importMeterCsvRemote,
   fetchRemoteDevices,
   fetchRemoteSession,
   fetchState,
@@ -63,9 +65,12 @@ import {
   createDefaultState,
   createId,
   deviceFromApi,
+  idleMeterImport,
   reduceAppAccess,
+  reduceMeterImport,
   type AppAccess,
   type AppAccessEvent,
+  type MeterImportState,
   type Persisted,
   type Preset,
 } from '@/state/model';
@@ -153,7 +158,13 @@ type AppContextValue = {
   undoOccurrence: (key: string) => Promise<void>;
   runEventNow: (eventId: string) => Promise<void>;
   retrySchedule: () => Promise<void>;
-  loadHistory: (span: 'day' | 'week') => Promise<void>;
+  loadHistory: (span: HistorySpan) => Promise<void>;
+  meterImport: MeterImportState;
+  openMeterImport: () => void;
+  cancelMeterImport: () => void;
+  dismissMeterImport: () => void;
+  failMeterImport: (message: string) => void;
+  submitMeterCsv: (csv: string) => Promise<void>;
 };
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -213,10 +224,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [secretMask, setSecretMask] = useState<string | null>(null);
   const [serverConfigured] = useState(() => readServerConfig() !== null);
   const [access, setAccess] = useState<AppAccess>({ status: 'unused' });
+  const [meterImport, setMeterImport] = useState<MeterImportState>(idleMeterImport);
   const [gateNote, setGateNote] = useState<string | null>(null);
   const stateRef = useRef(state);
   const appKeyRef = useRef('');
   const accessRef = useRef<AppAccess>({ status: 'unused' });
+  const meterImportRef = useRef<MeterImportState>(idleMeterImport());
   const messageRef = useRef<AppMessage>(null);
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
@@ -243,6 +256,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const next = reduceAppAccess(accessRef.current, event);
     accessRef.current = next;
     setAccess(next);
+  }, []);
+
+  const applyMeterImport = useCallback((event: Parameters<typeof reduceMeterImport>[1]) => {
+    const next = reduceMeterImport(meterImportRef.current, event);
+    meterImportRef.current = next;
+    setMeterImport(next);
+    return next;
   }, []);
 
   const sessionAuth = useCallback((): { config: ServerConfig; appKey: string } | null => {
@@ -973,7 +993,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             history: [
               ...prev.history,
               { at: nowIso, temperatureF: climate.temperatureF, humidity: climate.humidity, co2Ppm: climate.co2Ppm },
-            ].slice(-2000),
+            ].slice(-LOCAL_HISTORY_CAP),
           };
         });
         return;
@@ -996,7 +1016,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               batteryDown: prev.lastLive?.batteryDown ?? null,
               batteryMeter: prev.lastLive?.batteryMeter ?? null,
             },
-            history: meter.sample ? [...prev.history, meter.sample].slice(-2000) : prev.history,
+            history: meter.sample ? [...prev.history, meter.sample].slice(-LOCAL_HISTORY_CAP) : prev.history,
           }));
         }
         return;
@@ -1034,7 +1054,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         history: [
           ...prev.history,
           { at: nowIso, temperatureF: meter.temperatureF, humidity: meter.humidity, co2Ppm: meter.co2Ppm },
-        ].slice(-2000),
+        ].slice(-LOCAL_HISTORY_CAP),
       }));
     } catch (error) {
       if (!noteAuth(error)) {
@@ -1591,6 +1611,48 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
         }
       },
+      meterImport,
+      openMeterImport: () => {
+        applyMeterImport({ type: 'pick' });
+      },
+      cancelMeterImport: () => {
+        applyMeterImport({ type: 'cancel' });
+      },
+      dismissMeterImport: () => {
+        applyMeterImport({ type: 'dismiss' });
+      },
+      failMeterImport: (message) => {
+        applyMeterImport({ type: 'fail', message });
+      },
+      submitMeterCsv: async (csv) => {
+        const next = applyMeterImport({ type: 'chosen' });
+        if (next.status !== 'uploading') {
+          return;
+        }
+        try {
+          const parsed = parseMeterCsv(csv);
+          if (!parsed.ok) {
+            applyMeterImport({ type: 'fail', message: parsed.error });
+            return;
+          }
+          const auth = sessionAuth();
+          if (auth && stateRef.current.mode === 'live') {
+            const summary = await importMeterCsvRemote(auth.config, auth.appKey, csv);
+            applyMeterImport({ type: 'succeed', summary });
+            return;
+          }
+          const merged = mergeMeterHistory(stateRef.current.history, parsed.rows, parsed.skipped);
+          const history =
+            merged.history.length > LOCAL_HISTORY_CAP
+              ? merged.history.slice(merged.history.length - LOCAL_HISTORY_CAP)
+              : merged.history;
+          commit((prev) => ({ ...prev, history }));
+          applyMeterImport({ type: 'succeed', summary: merged.summary });
+        } catch (error) {
+          const message = noteAuth(error) ? 'The app key was rejected.' : explainError(error, appKeyRef.current);
+          applyMeterImport({ type: 'fail', message });
+        }
+      },
     };
   }, [
     ready,
@@ -1607,7 +1669,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     serverConfigured,
     access,
     gateNote,
+    meterImport,
     applyAccess,
+    applyMeterImport,
     sessionAuth,
     noteAuth,
     showMessage,

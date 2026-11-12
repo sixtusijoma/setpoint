@@ -38,7 +38,7 @@ export function HistoryChart({
   };
   const points = samples.map((sample) => `${xFor(sample.at)},${yFor(sample[metric])}`).join(' ');
   return (
-    <View onLayout={onLayout}>
+    <View testID="history-chart" onLayout={onLayout}>
       <Svg width={width} height={height}>
         <Line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} stroke={colors.line} strokeWidth={1} />
         <Polyline points={points} fill="none" stroke={colors.neutral} strokeWidth={2} />

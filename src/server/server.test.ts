@@ -12,6 +12,7 @@ import {
   handleCredentials,
   handleDevices,
   handleHistory,
+  handleImportMeter,
   handleMcpRequest,
   handleMeter,
   handlePress,
@@ -26,10 +27,12 @@ import { createRestDb } from './restDb';
 import { defaultEvents } from '../domain/schedule';
 import { createSqlDb, type SetpointDb } from './sqlDb';
 
-const migration = readFileSync(
-  path.join(process.cwd(), 'supabase/migrations/20261111120000_setpoint.sql'),
-  'utf8',
-);
+const migration = [
+  'supabase/migrations/20261111120000_setpoint.sql',
+  'supabase/migrations/20261112120000_meter_import.sql',
+]
+  .map((file) => readFileSync(path.join(process.cwd(), file), 'utf8'))
+  .join('\n');
 
 const bot = (id: string) => ({
   id,
@@ -557,6 +560,7 @@ describe('shared server', () => {
       'nudge',
       'read_room',
       'room_history',
+      'import_meter_csv',
       'show_schedule',
       'edit_schedule',
       'skip_wake',
@@ -807,6 +811,143 @@ describe('shared server', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('imports a meter CSV once, skips bad rows, and keeps imported history through prune', async () => {
+    const overlap = '2026-11-11T23:51:00.000Z';
+    await db.insertRead({ at: overlap, temperatureF: 70, humidity: 47, co2Ppm: 740 });
+    const lines = [
+      'Timestamp,Temperature_Celsius(°C),Relative_Humidity(%),CO2(ppm)',
+      '2026-11-11 18:51:00,21.1,47,740',
+      'not-a-time,20,40,600',
+    ];
+    const start = Date.parse('2026-01-01T05:00:00.000Z');
+    for (let index = 0; index < 900; index += 1) {
+      lines.push(`${new Date(start + index * 60 * 1000).toISOString()},20,40,${600 + (index % 50)}`);
+    }
+    const csv = lines.join('\n');
+    const env = appEnv();
+    const first = await handleImportMeter(
+      new Request('http://local/import-meter', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ csv }),
+      }),
+      { db, env },
+    );
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ inserted: 900, duplicates: 1, skipped: 1 });
+
+    const again = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'import_meter_csv', arguments: { csv } },
+    });
+    expect(JSON.parse(textOf(again))).toMatchObject({ inserted: 0, duplicates: 901, skipped: 1 });
+
+    const emptyTool = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: { name: 'import_meter_csv', arguments: { csv: ' ' } },
+    });
+    expect(emptyTool.result).toMatchObject({ isError: true });
+
+    const oldImport = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+    const oldLive = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000 + 60_000).toISOString();
+    await db.importReads([{ at: oldImport, temperatureF: 60, humidity: 30, co2Ppm: 500 }]);
+    await db.insertRead({ at: oldLive, temperatureF: 61, humidity: 31, co2Ppm: 501 });
+    const pruned = await db.pruneReads();
+    expect(pruned.deleted).toBe(1);
+    const kept = await pg.query<{ origin: string; granularity: string }>(
+      `select origin, granularity from public.meter_reads where read_at = $1`,
+      [oldImport],
+    );
+    expect(kept.rows[0]).toEqual({ origin: 'import', granularity: 'raw' });
+  });
+
+  it('answers day, month, and custom history ranges', async () => {
+    const now = new Date('2026-11-12T16:00:00.000Z');
+    const points = [
+      { at: '2026-11-12T14:00:00.000Z', co2Ppm: 111 },
+      { at: '2026-11-09T16:00:00.000Z', co2Ppm: 222 },
+      { at: '2026-10-23T16:00:00.000Z', co2Ppm: 333 },
+      { at: '2026-10-03T16:00:00.000Z', co2Ppm: 444 },
+    ];
+    for (const point of points) {
+      await db.insertRead({ at: point.at, temperatureF: 70, humidity: 40, co2Ppm: point.co2Ppm });
+    }
+    const env = appEnv();
+    const month = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'tools/call',
+      params: { name: 'room_history', arguments: { span: 'month' } },
+    }, { now: () => now });
+    expect(JSON.parse(textOf(month)).reads.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([333, 222, 111]);
+
+    const custom = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'tools/call',
+      params: {
+        name: 'room_history',
+        arguments: { since: '2026-10-01T00:00:00.000Z', until: '2026-10-10T00:00:00.000Z' },
+      },
+    }, { now: () => now });
+    expect(JSON.parse(textOf(custom)).reads.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([444]);
+
+    const day = await handleHistory(
+      new Request('http://local/history?span=day', { headers: appHeaders() }),
+      { db, env, now: () => now },
+    );
+    expect((await day.json()).samples.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([111]);
+
+    const monthHttp = await handleHistory(
+      new Request('http://local/history?span=month', { headers: appHeaders() }),
+      { db, env, now: () => now },
+    );
+    expect((await monthHttp.json()).samples.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([333, 222, 111]);
+  });
+
+  it('keeps import-meter on the app key', async () => {
+    const env = appEnv();
+    const csv = 'Timestamp,Temperature(°F),Humidity(%),CO2\n2026-11-11 6:51 PM,70,47,740\n';
+    const missing = await handleImportMeter(
+      new Request('http://local/import-meter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv' },
+        body: csv,
+      }),
+      { db, env },
+    );
+    expect(missing.status).toBe(401);
+    const cron = await handleImportMeter(
+      new Request('http://local/import-meter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv', 'x-setpoint-cron-secret': 'cron-placeholder' },
+        body: csv,
+      }),
+      { db, env },
+    );
+    expect(cron.status).toBe(401);
+    const imported = await handleImportMeter(
+      new Request('http://local/import-meter', {
+        method: 'POST',
+        headers: { [APP_KEY_HEADER]: appKey, 'Content-Type': 'text/csv' },
+        body: csv,
+      }),
+      { db, env },
+    );
+    expect(imported.status).toBe(200);
+    expect(await imported.json()).toMatchObject({
+      inserted: 1,
+      duplicates: 0,
+      skipped: 0,
+      firstAt: '2026-11-11T23:51:00.000Z',
+      lastAt: '2026-11-11T23:51:00.000Z',
+    });
+  });
 });
 
 describe('rest client', () => {
@@ -839,6 +980,12 @@ describe('rest client', () => {
             roomLabel: 'Home',
           }));
         }
+        if (String(input).endsWith('/import_meter_reads')) {
+          return new Response(JSON.stringify({ inserted: 1 }));
+        }
+        if (String(input).endsWith('/list_meter_reads') || String(input).endsWith('/list_setpoint_changes')) {
+          return new Response('[]');
+        }
         return new Response('true');
       },
     });
@@ -849,6 +996,21 @@ describe('rest client', () => {
     await db.acquireLease('scheduler', 180);
     expect(calls[1]?.url).toContain('/acquire_press_lease');
     expect(JSON.parse(calls[1]?.body ?? '{}')).toEqual({ p_owner: 'scheduler', p_ttl_seconds: 180 });
+    const inserted = await db.importReads([
+      { at: '2026-04-21T17:39:04.000Z', temperatureF: 78.6, humidity: 44, co2Ppm: 677 },
+    ]);
+    expect(inserted).toBe(1);
+    const importCall = calls.find((call) => call.url.endsWith('/import_meter_reads'));
+    expect(JSON.parse(importCall?.body ?? '{}').p_rows).toEqual([
+      { at: '2026-04-21T17:39:04.000Z', temperatureF: 78.6, humidity: 44, co2Ppm: 677 },
+    ]);
+    await db.listReads('2026-04-01T00:00:00.000Z', '2026-05-01T00:00:00.000Z', 7200);
+    const listCall = calls.find((call) => call.url.endsWith('/list_meter_reads'));
+    expect(JSON.parse(listCall?.body ?? '{}')).toEqual({
+      p_since: '2026-04-01T00:00:00.000Z',
+      p_until: '2026-05-01T00:00:00.000Z',
+      p_bucket_seconds: 7200,
+    });
   });
 });
 

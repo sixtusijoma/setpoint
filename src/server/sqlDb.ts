@@ -20,9 +20,10 @@ export type SetpointDb = {
   requestCancel: () => Promise<void>;
   releaseLease: (owner: string) => Promise<void>;
   insertRead: (sample: HistorySample) => Promise<void>;
+  importReads: (samples: HistorySample[]) => Promise<number>;
   insertChange: (change: SetpointChange) => Promise<void>;
-  listReads: (sinceIso: string) => Promise<HistorySample[]>;
-  listChanges: (sinceIso: string) => Promise<SetpointChange[]>;
+  listReads: (sinceIso: string, untilIso?: string | null, bucketSeconds?: number) => Promise<HistorySample[]>;
+  listChanges: (sinceIso: string, untilIso?: string | null) => Promise<SetpointChange[]>;
   pruneReads: () => Promise<{ rolled: number; deleted: number }>;
   saveCredentials: (token: string, secret: string) => Promise<void>;
   readCredentials: () => Promise<{ token: string; secret: string } | null>;
@@ -76,6 +77,24 @@ export function createSqlDb(query: Query): SetpointDb {
         sample.co2Ppm,
       ]);
     },
+    async importReads(samples) {
+      const payload = samples.map((sample) => ({
+        at: sample.at,
+        temperatureF: sample.temperatureF,
+        humidity: sample.humidity,
+        co2Ppm: sample.co2Ppm,
+      }));
+      const rows = await query<{ import_meter_reads: unknown }>(
+        'select public.import_meter_reads($1::jsonb) as import_meter_reads',
+        [JSON.stringify(payload)],
+      );
+      const value = asJson<{ inserted?: number }>(rows[0]?.import_meter_reads ?? { inserted: 0 });
+      const inserted = Number(value?.inserted ?? 0);
+      if (!Number.isFinite(inserted)) {
+        return 0;
+      }
+      return inserted;
+    },
     async insertChange(change) {
       await query('select public.insert_setpoint_change($1::timestamptz, $2::int, $3::text, $4::text)', [
         change.at,
@@ -84,16 +103,17 @@ export function createSqlDb(query: Query): SetpointDb {
         change.label,
       ]);
     },
-    async listReads(sinceIso) {
-      const rows = await query<{ list_meter_reads: unknown }>('select public.list_meter_reads($1::timestamptz) as list_meter_reads', [
-        sinceIso,
-      ]);
+    async listReads(sinceIso, untilIso = null, bucketSeconds = 0) {
+      const rows = await query<{ list_meter_reads: unknown }>(
+        'select public.list_meter_reads($1::timestamptz, $2::timestamptz, $3::int) as list_meter_reads',
+        [sinceIso, untilIso, bucketSeconds],
+      );
       return asJson<HistorySample[]>(rows[0]?.list_meter_reads ?? []);
     },
-    async listChanges(sinceIso) {
+    async listChanges(sinceIso, untilIso = null) {
       const rows = await query<{ list_setpoint_changes: unknown }>(
-        'select public.list_setpoint_changes($1::timestamptz) as list_setpoint_changes',
-        [sinceIso],
+        'select public.list_setpoint_changes($1::timestamptz, $2::timestamptz) as list_setpoint_changes',
+        [sinceIso, untilIso],
       );
       return asJson<SetpointChange[]>(rows[0]?.list_setpoint_changes ?? []);
     },

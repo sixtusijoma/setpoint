@@ -1,13 +1,23 @@
 import { HistoryChart } from '@/components/history-chart';
-import { changesInWindow, sliceWindow, type SetpointChange } from '@/domain/history';
+import { MeterImportSheet } from '@/components/meter-import-sheet';
+import { PillButton } from '@/components/ui';
+import {
+  aggregateSamples,
+  bucketSecondsForRange,
+  changesInWindow,
+  sliceWindow,
+  spanWindowMs,
+  type HistorySpan,
+  type SetpointChange,
+} from '@/domain/history';
 import { formatInstant } from '@/domain/time';
+import { pickCsvText } from '@/storage/pickCsv';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
 import { useEffect, useRef, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-type Span = 'day' | 'week';
 type Metric = 'temperatureF' | 'humidity' | 'co2Ppm';
 
 const METRICS: { id: Metric; label: string }[] = [
@@ -19,7 +29,7 @@ const METRICS: { id: Metric; label: string }[] = [
 export default function HistoryScreen() {
   const app = useApp();
   const insets = useSafeAreaInsets();
-  const [span, setSpan] = useState<Span>('day');
+  const [span, setSpan] = useState<HistorySpan>('day');
   const [metric, setMetric] = useState<Metric>('temperatureF');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -52,9 +62,44 @@ export default function HistoryScreen() {
     };
   }, [liveServer, span]);
 
-  const samples = sliceWindow(app.state.history, app.clock, span);
+  useEffect(() => {
+    if (!liveServer || app.meterImport.status !== 'done') {
+      return;
+    }
+    void loadHistory.current(span);
+  }, [liveServer, app.meterImport, span]);
+
+  const samples = aggregateSamples(
+    sliceWindow(app.state.history, app.clock, span),
+    bucketSecondsForRange(spanWindowMs(span)),
+  );
   const changes = changesInWindow(app.state.changes, app.clock, span);
   const latest = samples[samples.length - 1];
+
+  async function chooseCsv() {
+    if (app.meterImport.status !== 'picking') {
+      app.openMeterImport();
+    }
+    try {
+      const csv = await pickCsvText();
+      if (csv === null) {
+        return;
+      }
+      await app.submitMeterCsv(csv);
+    } catch (reason: unknown) {
+      app.failMeterImport(reason instanceof Error ? reason.message : 'Could not read that file.');
+    }
+  }
+
+  function closeImport() {
+    if (app.meterImport.status === 'picking') {
+      app.cancelMeterImport();
+      return;
+    }
+    if (app.meterImport.status === 'done' || app.meterImport.status === 'error') {
+      app.dismissMeterImport();
+    }
+  }
 
   return (
     <ScrollView
@@ -70,7 +115,10 @@ export default function HistoryScreen() {
       <View style={styles.segment}>
         <Segment label="Day" testID="history-day" on={span === 'day'} onPress={() => setSpan('day')} />
         <Segment label="Week" testID="history-week" on={span === 'week'} onPress={() => setSpan('week')} />
+        <Segment label="Month" testID="history-month" on={span === 'month'} onPress={() => setSpan('month')} />
       </View>
+      <Text style={styles.body}>{spanCaption(span)}</Text>
+      <PillButton label="Import CSV" testID="history-import" onPress={app.openMeterImport} />
       <View style={styles.segment}>
         {METRICS.map((item) => (
           <Segment
@@ -106,8 +154,19 @@ export default function HistoryScreen() {
           </Text>
         </View>
       ))}
+      <MeterImportSheet state={app.meterImport} onChoose={() => void chooseCsv()} onClose={closeImport} />
     </ScrollView>
   );
+}
+
+function spanCaption(span: HistorySpan): string {
+  if (span === 'day') {
+    return 'Last 24 hours.';
+  }
+  if (span === 'week') {
+    return 'Last 7 days.';
+  }
+  return 'Last 30 days.';
 }
 
 function formatMetric(metric: Metric, value: number): string {

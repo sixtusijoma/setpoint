@@ -16,9 +16,10 @@ I wanted to turn my regular thermostat into a smart one. I wanted to be able to 
 - Sleep now and Wake now apply that target immediately, then mark that run done early or late. They are not a hold, and the next regular run still happens.
 - A temporary hold can pause the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
 - Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
-- History charts room temperature, humidity, and CO2 for a day or a week, with marks where the setpoint changed.
+- History charts room temperature, humidity, and CO2 for a day, a week, or a month, with marks where the setpoint changed. Longer windows are averaged so the chart stays small.
+- Import older room readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
 - An activity log of presses, calibrations, and schedule runs.
-- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, and more.
+- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, import meter history, and more.
 - A Siri shortcut can send a spoken request to a Thermostat bot, which then uses that MCP server.
 
 The Home chip says Following schedule, a hold, or Off schedule. Off schedule means the tracked setpoint does not match the current scheduled target. Tap it to retry. That chip does not use the meter.
@@ -119,7 +120,7 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    supabase db push
    ```
 
-   That applies `supabase/migrations/20261111120000_setpoint.sql`.
+   That applies `supabase/migrations/20261111120000_setpoint.sql` and `supabase/migrations/20261112120000_meter_import.sql`.
 
 2. Set these function secret names in the project. The CLI prompts for the values. Do not put the values in the repo, in `EXPO_PUBLIC_*` variables, or in the app bundle.
 
@@ -139,6 +140,7 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    supabase functions deploy tick
    supabase functions deploy meter
    supabase functions deploy history
+   supabase functions deploy import-meter
    supabase functions deploy credentials
    supabase functions deploy devices
    supabase functions deploy prune
@@ -157,6 +159,23 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    Use the public anon key, not the service role key. The service role key stays on the server. Do not put the SwitchBot token, the MCP key, or the app key in these variables. Demo mode ignores them.
 
 6. Start the app with `npm start` or `npm run ios`. When those two variables are set, the app asks for `SETPOINT_APP_KEY` once and stores it with `expo-secure-store` on iOS and Android. On the web demo, secure storage is unavailable, so the key stays in `sessionStorage` for that tab only. Then enter the SwitchBot token and secret if the server does not already have them, map the devices, and enter the number on the thermostat display.
+
+## Import meter history
+
+The SwitchBot Open API returns only the current meter reading. Older readings come from a CSV the SwitchBot app exports.
+
+1. Open the SwitchBot app and the Meter Pro (CO2).
+2. Scroll below the graphs to Export Data.
+3. Pick an interval and a start and end time, then export. The file is a CSV for Excel.
+4. In Setpoint, open History and tap Import CSV, then Choose CSV. The sheet reports how many rows were inserted, how many were already stored, and how many were skipped.
+
+You can also send the file to a Thermostat bot that is connected to Setpoint's MCP server. The bot calls `import_meter_csv` with the CSV text.
+
+Celsius and Fahrenheit exports both work. The SwitchBot app writes whichever temperature unit is selected in its settings. Times without a timezone are read as America/New_York. Importing the same file again does not add duplicate rows. If a live reading is already stored at the same instant, that live reading is kept.
+
+The CSV must be comma-separated, with a period as the decimal mark. Semicolon-separated files and decimal commas are not supported. The file needs a timestamp, temperature, humidity, and CO2 column, so an export from a meter that does not report CO2 will be rejected.
+
+Demo and local mode store the import on the phone, keeping the latest 20,000 readings. Live mode sends the file to the server in chunks, and the server keeps every imported row. See [DEPLOY.md](DEPLOY.md).
 
 ## Control it with Siri
 
@@ -182,7 +201,7 @@ Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The functi
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history`, `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, or `month`, or both `since` and `until` as ISO timestamps, 800 days at most), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
 
 See [DEPLOY.md](DEPLOY.md) for the rest of the server notes.
 
@@ -196,7 +215,7 @@ src/devices/       SwitchBot API client and the demo room simulator
 src/server/        Shared server handlers and the MCP tools
 src/state/         App state and sync with the shared server
 src/storage/       Local persistence and credential storage
-supabase/          Database migration, edge functions, and cron SQL
+supabase/          Database migrations, edge functions, and cron SQL
 docs/images/       Photos used in this README
 ```
 
@@ -207,4 +226,4 @@ npm test
 npm run typecheck
 ```
 
-`npm test` runs Vitest. The suite loads the database migration into PGlite and covers the press lease, the scheduler, skips, run-now, meter prune, and the MCP tools. `npm run lint` is also available.
+`npm test` runs Vitest. The suite loads the database migrations into PGlite and covers the press lease, the scheduler, skips, run-now, meter import, meter prune, and the MCP tools. `npm run lint` is also available.

@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import type { HistorySample, SetpointChange } from '@/domain/history';
+import { LOCAL_HISTORY_CAP, type HistorySample, type SetpointChange } from '@/domain/history';
 import { defaultEvents, normalizeStatus, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import { initialClimate } from '@/devices/simulator';
 import {
@@ -190,7 +190,7 @@ function cleanHistory(value: unknown): HistorySample[] {
   }
   return value
     .filter((item) => item && typeof item.at === 'string' && typeof item.temperatureF === 'number')
-    .slice(-2000) as HistorySample[];
+    .slice(-LOCAL_HISTORY_CAP) as HistorySample[];
 }
 
 function cleanChanges(value: unknown): SetpointChange[] {
