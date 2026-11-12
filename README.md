@@ -4,6 +4,18 @@ Setpoint is a phone-first thermostat remote. It keeps a virtual setpoint (the nu
 
 Demo mode is the default. It runs with simulated devices and needs no SwitchBot account and no server. Live control can run on the phone, or through the shared server described in [DEPLOY.md](DEPLOY.md).
 
+<img src="docs/images/thermostat.jpg" width="800" alt="Emerson thermostat with SwitchBot Bots on the up and down buttons. The display reads Set To 71 and Room Temperature 66.">
+
+<img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to 61 F.">
+
+## Why I made this
+
+I wanted to turn my regular thermostat into a smart one. I wanted to be able to adjust it from my phone and add the ability for custom complex requests even most smart thermostats can't handle.
+
+## Control it with Siri
+
+I use an iOS Shortcut named Thermostat. It runs Dictate Text, then sends that text with the Grok Bot app's Send Message action to my Thermostat bot. The bot controls Setpoint through its MCP server, so a phrase like "Going to bed early tonight set sleep now" can run Sleep now, the same command the app uses. I trigger the shortcut with Siri, or with Back Tap.
+
 ## Run it
 
 ```bash
