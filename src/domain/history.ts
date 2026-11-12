@@ -1,3 +1,7 @@
+import { DateTime } from 'luxon';
+
+import { TIME_ZONE } from './time';
+
 export type HistorySample = {
   at: string;
   temperatureF: number;
@@ -17,7 +21,9 @@ const DAY_MS = 24 * HOUR_MS;
 
 export const LOCAL_HISTORY_CAP = 20000;
 
-export type HistorySpan = 'day' | 'week' | 'month';
+export type HistorySpan = 'day' | 'week' | 'month' | 'year';
+
+export const DAY_BUCKET_SECONDS = 24 * 60 * 60;
 
 export type HistoryQuery = {
   since: string;
@@ -32,23 +38,37 @@ export function spanWindowMs(span: HistorySpan): number {
   if (span === 'week') {
     return 7 * DAY_MS;
   }
-  return 30 * DAY_MS;
+  if (span === 'month') {
+    return 30 * DAY_MS;
+  }
+  return 365 * DAY_MS;
 }
 
+// The extra hour keeps a 25-hour day (or a week or month that contains one) on the same bucket
+// size as its neighbors when daylight saving time ends.
 export function bucketSecondsForRange(windowMs: number): number {
-  if (windowMs <= DAY_MS) {
+  if (windowMs <= DAY_MS + HOUR_MS) {
     return 5 * 60;
   }
-  if (windowMs <= 7 * DAY_MS) {
+  if (windowMs <= 7 * DAY_MS + HOUR_MS) {
     return 30 * 60;
   }
-  if (windowMs <= 31 * DAY_MS) {
+  if (windowMs <= 31 * DAY_MS + HOUR_MS) {
     return 2 * 60 * 60;
   }
   if (windowMs <= 120 * DAY_MS) {
     return 6 * 60 * 60;
   }
-  return 24 * 60 * 60;
+  return DAY_BUCKET_SECONDS;
+}
+
+// Matches list_meter_reads: daily buckets start at midnight Eastern Time, shorter ones on the epoch grid.
+export function bucketStartMs(time: number, bucketSeconds: number): number {
+  if (bucketSeconds === DAY_BUCKET_SECONDS) {
+    return DateTime.fromMillis(time, { zone: TIME_ZONE }).startOf('day').toMillis();
+  }
+  const bucketMs = bucketSeconds * 1000;
+  return Math.floor(time / bucketMs) * bucketMs;
 }
 
 export function historyQuery(input: { span?: unknown; since?: unknown; until?: unknown }, now: Date): HistoryQuery {
@@ -74,7 +94,8 @@ export function historyQuery(input: { span?: unknown; since?: unknown; until?: u
       bucketSeconds: bucketSecondsForRange(windowMs),
     };
   }
-  const span: HistorySpan = input.span === 'week' ? 'week' : input.span === 'month' ? 'month' : 'day';
+  const span: HistorySpan =
+    input.span === 'week' || input.span === 'month' || input.span === 'year' ? input.span : 'day';
   const windowMs = spanWindowMs(span);
   return {
     since: new Date(now.getTime() - windowMs).toISOString(),
@@ -184,22 +205,13 @@ export function changeKey(change: SetpointChange): string {
   return `${change.at}|${change.setpoint}|${change.source}|${change.label}`;
 }
 
-export function sliceWindow(samples: HistorySample[], now: Date, span: HistorySpan): HistorySample[] {
-  const start = now.getTime() - spanWindowMs(span);
-  return samples
-    .filter((sample) => {
-      const time = Date.parse(sample.at);
-      return Number.isFinite(time) && time >= start && time <= now.getTime() + 1000;
-    })
-    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-}
-
-export function changesInWindow(changes: SetpointChange[], now: Date, span: HistorySpan): SetpointChange[] {
-  const start = now.getTime() - spanWindowMs(span);
-  return changes
-    .filter((change) => {
-      const time = Date.parse(change.at);
-      return Number.isFinite(time) && time >= start && time <= now.getTime() + 1000;
+export function withinRange<T extends { at: string }>(items: T[], sinceIso: string, untilIso: string): T[] {
+  const start = Date.parse(sinceIso);
+  const end = Date.parse(untilIso);
+  return items
+    .filter((item) => {
+      const time = Date.parse(item.at);
+      return Number.isFinite(time) && time >= start && time <= end;
     })
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 }
@@ -248,14 +260,13 @@ export function aggregateSamples(samples: HistorySample[], bucketSeconds: number
   if (bucketSeconds <= 0) {
     return samples;
   }
-  const bucketMs = bucketSeconds * 1000;
   const groups = new Map<number, HistorySample[]>();
   for (const sample of samples) {
     const time = Date.parse(sample.at);
     if (!Number.isFinite(time)) {
       continue;
     }
-    const bucket = Math.floor(time / bucketMs) * bucketMs;
+    const bucket = bucketStartMs(time, bucketSeconds);
     const list = groups.get(bucket);
     if (list) {
       list.push(sample);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { aggregateSamples, bucketSecondsForRange, historyQuery, sliceWindow } from './history';
+import { aggregateSamples, bucketSecondsForRange, historyQuery, withinRange } from './history';
 import { combineSummaries, emptySummary, mergeMeterHistory, parseMeterCsv, parseMeterTimestamp } from './meterCsv';
 
 const CELSIUS = [
@@ -205,10 +205,11 @@ describe('history ranges', () => {
     { at: '2026-10-03T16:00:00.000Z', temperatureF: 73, humidity: 43, co2Ppm: 444 },
   ];
 
-  it('keeps a day, a week, and a month', () => {
-    expect(sliceWindow(samples, now, 'day').map((sample) => sample.co2Ppm)).toEqual([111]);
-    expect(sliceWindow(samples, now, 'week').map((sample) => sample.co2Ppm)).toEqual([222, 111]);
-    expect(sliceWindow(samples, now, 'month').map((sample) => sample.co2Ppm)).toEqual([333, 222, 111]);
+  it('keeps the samples inside a range, oldest first', () => {
+    const since = '2026-10-20T00:00:00.000Z';
+    const until = '2026-11-12T15:00:00.000Z';
+    expect(withinRange(samples, since, until).map((sample) => sample.co2Ppm)).toEqual([333, 222, 111]);
+    expect(withinRange(samples, '2026-11-10T00:00:00.000Z', until).map((sample) => sample.co2Ppm)).toEqual([111]);
   });
 
   it('builds a custom range and buckets long windows', () => {
@@ -222,6 +223,12 @@ describe('history ranges', () => {
     expect(() => historyQuery({ since: '2026-10-01T00:00:00.000Z' }, now)).toThrow(/both/);
     const month = historyQuery({ span: 'month' }, now);
     expect(Date.parse(month.until) - Date.parse(month.since)).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
+    const year = historyQuery({ span: 'year' }, now);
+    expect(year.bucketSeconds).toBe(86400);
+    expect(bucketSecondsForRange(25 * 60 * 60 * 1000)).toBe(300);
+    expect(bucketSecondsForRange(23 * 60 * 60 * 1000)).toBe(300);
+    expect(bucketSecondsForRange((7 * 24 + 1) * 60 * 60 * 1000)).toBe(1800);
+    expect(bucketSecondsForRange((31 * 24 + 1) * 60 * 60 * 1000)).toBe(7200);
   });
 
   it('averages samples that fall in one bucket', () => {
@@ -234,5 +241,22 @@ describe('history ranges', () => {
     );
     expect(bucket).toHaveLength(1);
     expect(bucket[0]).toMatchObject({ temperatureF: 71, humidity: 45, co2Ppm: 650 });
+  });
+
+  it('starts daily buckets at midnight Eastern Time', () => {
+    const daily = aggregateSamples(
+      [
+        { at: '2026-11-12T04:30:00.000Z', temperatureF: 60, humidity: 40, co2Ppm: 600 },
+        { at: '2026-11-12T05:30:00.000Z', temperatureF: 70, humidity: 40, co2Ppm: 600 },
+        { at: '2026-11-13T04:59:00.000Z', temperatureF: 72, humidity: 40, co2Ppm: 600 },
+        { at: '2026-07-04T03:59:00.000Z', temperatureF: 80, humidity: 40, co2Ppm: 600 },
+      ],
+      86400,
+    );
+    expect(daily.map((item) => [item.at, item.temperatureF])).toEqual([
+      ['2026-07-03T04:00:00.000Z', 80],
+      ['2026-11-11T05:00:00.000Z', 60],
+      ['2026-11-12T05:00:00.000Z', 71],
+    ]);
   });
 });

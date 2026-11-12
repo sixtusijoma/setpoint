@@ -18,6 +18,7 @@ const RPC: Record<string, string> = {
   list_meter_reads: 'list_meter_reads',
   list_setpoint_changes: 'list_setpoint_changes',
   list_setpoint_changes_page: 'list_setpoint_changes_page',
+  meter_read_bounds: 'meter_read_bounds',
   prune_meter_reads: 'prune_meter_reads',
   save_switchbot_credentials: 'save_switchbot_credentials',
   service_switchbot_credentials: 'service_switchbot_credentials',

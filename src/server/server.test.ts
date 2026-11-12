@@ -31,6 +31,7 @@ const migration = [
   'supabase/migrations/20261111120000_setpoint.sql',
   'supabase/migrations/20261112120000_meter_import.sql',
   'supabase/migrations/20261112180000_setpoint_change_pages.sql',
+  'supabase/migrations/20261113090000_history_windows.sql',
 ]
   .map((file) => readFileSync(path.join(process.cwd(), file), 'utf8'))
   .join('\n');
@@ -911,6 +912,68 @@ describe('shared server', () => {
     expect((await monthHttp.json()).samples.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([333, 222, 111]);
   });
 
+  it('answers since and until windows with bounds and daily Eastern Time buckets', async () => {
+    const env = appEnv();
+    const history = (query: string) =>
+      handleHistory(new Request(`http://local/history?${query}`, { headers: appHeaders() }), {
+        db,
+        env,
+        now: () => new Date('2026-11-12T16:00:00.000Z'),
+      });
+    const empty = await (await history('since=2026-11-12T05:00:00.000Z&until=2026-11-13T04:59:59.999Z')).json();
+    expect(empty).toMatchObject({ samples: [], changes: [], bucketSeconds: 300, firstAt: null, lastAt: null });
+
+    const reads = [
+      { at: '2025-11-22T14:05:00.000Z', temperatureF: 64 },
+      { at: '2026-07-03T03:30:00.000Z', temperatureF: 90 },
+      { at: '2026-07-03T04:30:00.000Z', temperatureF: 70 },
+      { at: '2026-07-03T22:00:00.000Z', temperatureF: 72 },
+      { at: '2026-11-01T05:30:00.000Z', temperatureF: 66 },
+      { at: '2026-11-02T04:30:00.000Z', temperatureF: 68 },
+      { at: '2026-11-02T05:30:00.000Z', temperatureF: 99 },
+    ];
+    for (const read of reads) {
+      await db.insertRead({ at: read.at, temperatureF: read.temperatureF, humidity: 40, co2Ppm: 700 });
+    }
+    await db.insertChange({ at: '2026-11-01T12:00:00.000Z', setpoint: 66, source: 'schedule', label: 'Sleep · 66°' });
+    await db.insertChange({ at: '2026-11-02T12:00:00.000Z', setpoint: 70, source: 'manual', label: 'Manual · 70°' });
+
+    const fallBack = await history('since=2026-11-01T04:00:00.000Z&until=2026-11-02T04:59:59.999Z');
+    expect(fallBack.status).toBe(200);
+    const day = await fallBack.json();
+    expect(Object.keys(day).sort()).toEqual(['bucketSeconds', 'changes', 'firstAt', 'lastAt', 'samples', 'since', 'until']);
+    expect(day).toMatchObject({
+      since: '2026-11-01T04:00:00.000Z',
+      until: '2026-11-02T04:59:59.999Z',
+      bucketSeconds: 300,
+    });
+    expect(Date.parse(day.firstAt)).toBe(Date.parse('2025-11-22T14:05:00.000Z'));
+    expect(Date.parse(day.lastAt)).toBe(Date.parse('2026-11-02T05:30:00.000Z'));
+    expect(day.samples.map((row: { temperatureF: number }) => row.temperatureF)).toEqual([66, 68]);
+    expect(day.changes.map((row: { label: string }) => row.label)).toEqual(['Sleep · 66°']);
+
+    const year = await (await history('since=2025-11-13T05:00:00.000Z&until=2026-11-13T04:59:59.999Z')).json();
+    expect(year.bucketSeconds).toBe(86400);
+    expect(
+      year.samples.map((row: { at: string; temperatureF: number }) => [new Date(row.at).toISOString(), row.temperatureF]),
+    ).toEqual([
+      ['2025-11-22T05:00:00.000Z', 64],
+      ['2026-07-02T04:00:00.000Z', 90],
+      ['2026-07-03T04:00:00.000Z', 71],
+      ['2026-11-01T04:00:00.000Z', 67],
+      ['2026-11-02T05:00:00.000Z', 99],
+    ]);
+
+    const half = await history('since=2026-11-01T04:00:00.000Z');
+    expect(half.status).toBe(400);
+    expect((await half.json()).error).toContain('since and until');
+    const backwards = await history('since=2026-11-02T00:00:00.000Z&until=2026-11-01T00:00:00.000Z');
+    expect(backwards.status).toBe(400);
+    const legacy = await (await history('span=month')).json();
+    expect(Object.keys(legacy).sort()).toEqual(['changes', 'samples']);
+    expect(legacy.changes).toHaveLength(2);
+  });
+
   it('pages setpoint changes newest first with a cursor and keeps the span response', async () => {
     const env = appEnv();
     const start = Date.parse('2026-01-05T12:00:00.000Z');
@@ -1058,6 +1121,9 @@ describe('rest client', () => {
         if (String(input).endsWith('/import_meter_reads')) {
           return new Response(JSON.stringify({ inserted: 1 }));
         }
+        if (String(input).endsWith('/meter_read_bounds')) {
+          return new Response(JSON.stringify({ firstAt: '2025-11-22T14:05:00+00:00', lastAt: null }));
+        }
         if (
           String(input).endsWith('/list_meter_reads') ||
           String(input).endsWith('/list_setpoint_changes') ||
@@ -1098,6 +1164,8 @@ describe('rest client', () => {
       { p_before_at: null, p_before_id: null, p_limit: 16 },
       { p_before_at: '2026-04-21T17:39:04+00:00', p_before_id: 42, p_limit: 16 },
     ]);
+    expect(await db.readBounds()).toEqual({ firstAt: '2025-11-22T14:05:00+00:00', lastAt: null });
+    expect(JSON.parse(calls.find((call) => call.url.endsWith('/meter_read_bounds'))?.body ?? 'null')).toEqual({});
   });
 });
 
