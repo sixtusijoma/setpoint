@@ -27,6 +27,7 @@ export type SetpointDb = {
   listReads: (sinceIso: string, untilIso?: string | null, bucketSeconds?: number) => Promise<HistorySample[]>;
   listChanges: (sinceIso: string, untilIso?: string | null) => Promise<SetpointChange[]>;
   listChangesPage: (before: ChangeCursor | null, limit: number) => Promise<{ changes: StoredChange[]; more: boolean }>;
+  readBounds: () => Promise<{ firstAt: string | null; lastAt: string | null }>;
   pruneReads: () => Promise<{ rolled: number; deleted: number }>;
   saveCredentials: (token: string, secret: string) => Promise<void>;
   readCredentials: () => Promise<{ token: string; secret: string } | null>;
@@ -130,6 +131,11 @@ export function createSqlDb(query: Query): SetpointDb {
         id: Number(row.id),
       }));
       return { changes: listed.slice(0, limit), more: listed.length > limit };
+    },
+    async readBounds() {
+      const rows = await query<{ meter_read_bounds: unknown }>('select public.meter_read_bounds() as meter_read_bounds');
+      const value = asJson<{ firstAt?: string | null; lastAt?: string | null } | null>(rows[0]?.meter_read_bounds ?? null);
+      return { firstAt: value?.firstAt ?? null, lastAt: value?.lastAt ?? null };
     },
     async pruneReads() {
       const rows = await query<{ prune_meter_reads: unknown }>('select public.prune_meter_reads() as prune_meter_reads');

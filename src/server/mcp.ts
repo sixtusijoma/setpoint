@@ -24,11 +24,12 @@ export const MCP_TOOLS = [
   },
   {
     name: 'room_history',
-    description: 'Return stored temperature, humidity, and CO2. Use span day, week, or month, or pass since and until as ISO timestamps.',
+    description:
+      'Return stored temperature, humidity, and CO2. Use span day, week, month, or year, or pass since and until as ISO timestamps. Ranges over 120 days come back as daily averages for Eastern Time days.',
     inputSchema: {
       type: 'object',
       properties: {
-        span: { type: 'string', enum: ['day', 'week', 'month'] },
+        span: { type: 'string', enum: ['day', 'week', 'month', 'year'] },
         since: { type: 'string', description: 'Range start, ISO timestamp. Requires until.' },
         until: { type: 'string', description: 'Range end, ISO timestamp. Requires since.' },
       },

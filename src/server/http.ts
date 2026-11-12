@@ -1,5 +1,11 @@
 import { listDevices, pressBot, readMeter } from '../devices/switchbot';
-import { changePageQuery, encodeChangeCursor, historyQuery, type ChangePageQuery } from '../domain/history';
+import {
+  changePageQuery,
+  encodeChangeCursor,
+  historyQuery,
+  type ChangePageQuery,
+  type HistoryQuery,
+} from '../domain/history';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
 import { deviceIds, executeSharedPress, RecalibrateError, recalibrateShared, runSchedulerTick, type PressTiming } from './engine';
@@ -314,10 +320,26 @@ export async function handleHistory(request: Request, options: HandlerOptions): 
     });
   }
   const now = options.now ?? (() => new Date());
-  const range = historyQuery({ span: url.searchParams.get('span') }, now());
-  const samples = await options.db.listReads(range.since, range.until, range.bucketSeconds);
-  const changes = await options.db.listChanges(range.since, range.until);
-  return json(request, options.env, { samples, changes });
+  const since = url.searchParams.get('since');
+  const until = url.searchParams.get('until');
+  if (since === null && until === null) {
+    const range = historyQuery({ span: url.searchParams.get('span') }, now());
+    const samples = await options.db.listReads(range.since, range.until, range.bucketSeconds);
+    const changes = await options.db.listChanges(range.since, range.until);
+    return json(request, options.env, { samples, changes });
+  }
+  let range: HistoryQuery;
+  try {
+    range = historyQuery({ since: since ?? undefined, until: until ?? undefined }, now());
+  } catch (error) {
+    return json(request, options.env, { error: error instanceof Error ? error.message : 'Bad history range.' }, 400);
+  }
+  const [samples, changes, bounds] = await Promise.all([
+    options.db.listReads(range.since, range.until, range.bucketSeconds),
+    options.db.listChanges(range.since, range.until),
+    options.db.readBounds(),
+  ]);
+  return json(request, options.env, { ...range, samples, changes, firstAt: bounds.firstAt, lastAt: bounds.lastAt });
 }
 
 export async function handleImportMeter(request: Request, options: HandlerOptions): Promise<Response> {
