@@ -1,4 +1,6 @@
 import { PillButton, Sheet } from '@/components/ui';
+import { importSheetWarning, titleFor } from '@/components/meter-import-copy';
+import type { MeterImportSummary } from '@/domain/meterCsv';
 import { formatDayTime } from '@/domain/time';
 import type { MeterImportState } from '@/state/model';
 import { colors, fonts } from '@/theme';
@@ -47,32 +49,30 @@ export function MeterImportSheet({
   );
 }
 
-function Summary({ summary }: { summary: Extract<MeterImportState, { status: 'done' }>['summary'] }) {
+function Summary({ summary }: { summary: MeterImportSummary }) {
+  const warning = importSheetWarning(summary);
   const range =
     summary.firstAt && summary.lastAt
       ? `From ${formatDayTime(summary.firstAt)} to ${formatDayTime(summary.lastAt)}.`
       : 'No readings were imported.';
   return (
     <View testID="meter-import-summary" style={styles.block}>
+      {warning ? (
+        <Text testID="meter-import-warning" style={styles.error}>
+          {warning}
+        </Text>
+      ) : null}
       <Text style={styles.body}>Inserted {summary.inserted}.</Text>
-      <Text style={styles.body}>Duplicates {summary.duplicates}.</Text>
+      <Text style={styles.body}>Already stored {summary.duplicates}.</Text>
       <Text style={styles.body}>Skipped {summary.skipped}.</Text>
+      {(summary.skipReasons ?? []).map((reason) => (
+        <Text key={reason} style={styles.body}>
+          {reason}
+        </Text>
+      ))}
       <Text style={styles.body}>{range}</Text>
     </View>
   );
-}
-
-function titleFor(state: MeterImportState): string {
-  if (state.status === 'uploading') {
-    return 'Importing';
-  }
-  if (state.status === 'done') {
-    return 'Import finished';
-  }
-  if (state.status === 'error') {
-    return 'Import failed';
-  }
-  return 'Import meter CSV';
 }
 
 const styles = StyleSheet.create({

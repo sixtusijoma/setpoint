@@ -9,10 +9,11 @@ export type MeterImportSummary = {
   skipped: number;
   firstAt: string | null;
   lastAt: string | null;
+  skipReasons: string[];
 };
 
 export type ParsedMeterCsv =
-  | { ok: true; rows: HistorySample[]; skipped: number }
+  | { ok: true; rows: HistorySample[]; skipped: number; skipReasons: string[] }
   | { ok: false; error: string };
 
 type TempUnit = 'C' | 'F';
@@ -34,7 +35,17 @@ const FORMATS = [
   'yyyy-MM-dd h:mm a',
   'yyyy/M/d h:mm:ss a',
   'yyyy/M/d h:mm a',
+  'MMM d, yyyy h:mm:ss a',
+  'MMM d, yyyy h:mm a',
+  'MMM d, yyyy H:mm:ss',
+  'MMM d, yyyy H:mm',
+  'MMMM d, yyyy h:mm:ss a',
+  'MMMM d, yyyy h:mm a',
+  'MMMM d, yyyy H:mm:ss',
+  'MMMM d, yyyy H:mm',
 ];
+
+const NAIVE_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 
 export function parseMeterCsv(csv: string, zone = TIME_ZONE): ParsedMeterCsv {
   const table = parseCsv(csv);
@@ -46,38 +57,57 @@ export function parseMeterCsv(csv: string, zone = TIME_ZONE): ParsedMeterCsv {
     return { ok: false, error: 'This CSV needs a timestamp, temperature, humidity, and CO2 column.' };
   }
   const rows: HistorySample[] = [];
+  const skipReasons: string[] = [];
   let skipped = 0;
   for (let index = 1; index < table.length; index += 1) {
     const sample = rowToSample(table[index], columns, zone);
-    if (!sample) {
+    if ('skip' in sample) {
       skipped += 1;
+      addSkipReason(skipReasons, sample.skip);
       continue;
     }
-    rows.push(sample);
+    rows.push(sample.row);
   }
-  return { ok: true, rows, skipped };
+  return { ok: true, rows, skipped, skipReasons };
 }
 
 export function parseMeterTimestamp(value: string, zone = TIME_ZONE): string | null {
+  const parsed = interpretMeterTimestamp(value, zone);
+  return parsed.ok ? parsed.at : null;
+}
+
+export function interpretMeterTimestamp(
+  value: string,
+  zone = TIME_ZONE,
+): { ok: true; at: string } | { ok: false; reason: string } {
   const trimmed = value.trim();
   if (!trimmed) {
-    return null;
+    return { ok: false, reason: 'Could not read the timestamp.' };
   }
   if (/[zZ]$/.test(trimmed) || /[+-]\d{2}:?\d{2}$/.test(trimmed)) {
     const iso = DateTime.fromISO(trimmed, { setZone: true });
     if (iso.isValid) {
       const utc = iso.toUTC().toISO();
-      return utc;
+      if (utc) {
+        return { ok: true, at: utc };
+      }
     }
+    return { ok: false, reason: 'Could not read the timestamp.' };
   }
   const local = withMeridian(trimmed);
-  for (const format of FORMATS) {
-    const parsed = DateTime.fromFormat(local, format, { zone });
-    if (parsed.isValid) {
-      return parsed.toUTC().toISO();
+  if (NAIVE_ISO.test(local)) {
+    const iso = DateTime.fromISO(local, { zone: 'utc' });
+    if (iso.isValid) {
+      return finishLocalClock(iso, zone);
     }
   }
-  return null;
+  for (const format of FORMATS) {
+    const parsed = DateTime.fromFormat(local, format, { zone: 'utc', locale: 'en' });
+    if (parsed.isValid) {
+      return finishLocalClock(parsed, zone);
+    }
+  }
+  return { ok: false, reason: 'Could not read the timestamp.' };
 }
 
 export function planMeterImport(rows: HistorySample[]): {
@@ -124,6 +154,7 @@ export function mergeMeterHistory(
   existing: HistorySample[],
   rows: HistorySample[],
   skipped: number,
+  skipReasons: string[] = [],
 ): { history: HistorySample[]; summary: MeterImportSummary } {
   const planned = planMeterImport(rows);
   const have = new Set<number>();
@@ -153,6 +184,7 @@ export function mergeMeterHistory(
       skipped,
       firstAt: planned.firstAt,
       lastAt: planned.lastAt,
+      skipReasons: skipReasons.slice(0, 3),
     },
   };
 }
@@ -164,6 +196,7 @@ export function combineSummaries(left: MeterImportSummary, right: MeterImportSum
     skipped: left.skipped + right.skipped,
     firstAt: earlierIso(left.firstAt, right.firstAt),
     lastAt: laterIso(left.lastAt, right.lastAt),
+    skipReasons: mergeSkipReasons(left.skipReasons, right.skipReasons),
   };
 }
 
@@ -195,7 +228,7 @@ export function chunkMeterCsv(csv: string, rowsPerChunk: number): string[] {
 }
 
 export function emptySummary(): MeterImportSummary {
-  return { inserted: 0, duplicates: 0, skipped: 0, firstAt: null, lastAt: null };
+  return { inserted: 0, duplicates: 0, skipped: 0, firstAt: null, lastAt: null, skipReasons: [] };
 }
 
 function earlierIso(left: string | null, right: string | null): string | null {
@@ -216,6 +249,95 @@ function laterIso(left: string | null, right: string | null): string | null {
     return left;
   }
   return Date.parse(left) >= Date.parse(right) ? left : right;
+}
+
+function finishLocalClock(
+  clock: DateTime,
+  zone: string,
+): { ok: true; at: string } | { ok: false; reason: string } {
+  const at = resolveLocalClock(clock, zone);
+  if (!at) {
+    const label = zone === TIME_ZONE ? 'Eastern Time' : zone;
+    return { ok: false, reason: `That time does not exist in ${label}.` };
+  }
+  return { ok: true, at };
+}
+
+function resolveLocalClock(clock: DateTime, zone: string): string | null {
+  const instants = instantsForLocal(
+    {
+      year: clock.year,
+      month: clock.month,
+      day: clock.day,
+      hour: clock.hour,
+      minute: clock.minute,
+      second: clock.second,
+      millisecond: clock.millisecond,
+    },
+    zone,
+  );
+  if (instants.length === 0) {
+    return null;
+  }
+  return DateTime.fromMillis(instants[0], { zone: 'utc' }).toUTC().toISO();
+}
+
+function instantsForLocal(
+  parts: {
+    year: number;
+    month: number;
+    day: number;
+    hour: number;
+    minute: number;
+    second: number;
+    millisecond: number;
+  },
+  zone: string,
+): number[] {
+  const naiveUtc = DateTime.utc(
+    parts.year,
+    parts.month,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+    parts.millisecond,
+  );
+  if (!naiveUtc.isValid) {
+    return [];
+  }
+  const seen = new Set<number>();
+  for (const deltaHours of [-24, 0, 24]) {
+    const offsetMin = naiveUtc.plus({ hours: deltaHours }).setZone(zone).offset;
+    const instant = naiveUtc.minus({ minutes: offsetMin });
+    const local = instant.setZone(zone);
+    if (
+      local.year === parts.year &&
+      local.month === parts.month &&
+      local.day === parts.day &&
+      local.hour === parts.hour &&
+      local.minute === parts.minute &&
+      local.second === parts.second &&
+      local.millisecond === parts.millisecond
+    ) {
+      seen.add(instant.toMillis());
+    }
+  }
+  return [...seen].sort((a, b) => a - b);
+}
+
+function addSkipReason(reasons: string[], reason: string): void {
+  if (reasons.length < 3 && !reasons.includes(reason)) {
+    reasons.push(reason);
+  }
+}
+
+function mergeSkipReasons(left?: string[], right?: string[]): string[] {
+  const reasons: string[] = [];
+  for (const reason of [...(left ?? []), ...(right ?? [])]) {
+    addSkipReason(reasons, reason);
+  }
+  return reasons;
 }
 
 function withMeridian(value: string): string {
@@ -311,32 +433,47 @@ function headerKind(
   return 'ignore';
 }
 
-function rowToSample(row: string[], columns: Columns, zone: string): HistorySample | null {
-  const at = parseMeterTimestamp(row[columns.time] ?? '', zone);
+function rowToSample(
+  row: string[],
+  columns: Columns,
+  zone: string,
+): { row: HistorySample } | { skip: string } {
+  const time = interpretMeterTimestamp(row[columns.time] ?? '', zone);
+  if (!time.ok) {
+    return { skip: time.reason };
+  }
   const temperature = parseNumber(row[columns.temp] ?? '');
+  if (temperature === null) {
+    return { skip: 'Could not read the temperature.' };
+  }
   const humidity = parseNumber(row[columns.humidity] ?? '');
+  if (humidity === null) {
+    return { skip: 'Could not read the humidity.' };
+  }
   const co2 = parseNumber(row[columns.co2] ?? '');
-  if (!at || temperature === null || humidity === null || co2 === null) {
-    return null;
+  if (co2 === null) {
+    return { skip: 'Could not read the CO2.' };
   }
   if (humidity < 0 || humidity > 100) {
-    return null;
+    return { skip: 'Humidity is outside 0-100.' };
   }
   if (co2 < 0 || co2 > 9999) {
-    return null;
+    return { skip: 'CO2 is outside 0-9999.' };
   }
   if (columns.unit === 'C' && (temperature < -30 || temperature > 85)) {
-    return null;
+    return { skip: 'Temperature is outside the allowed range.' };
   }
   if (columns.unit === 'F' && (temperature < -22 || temperature > 185)) {
-    return null;
+    return { skip: 'Temperature is outside the allowed range.' };
   }
   const temperatureF = columns.unit === 'C' ? celsiusToFahrenheit(temperature) : temperature;
   return {
-    at,
-    temperatureF: Math.round(temperatureF * 10) / 10,
-    humidity: Math.round(humidity * 10) / 10,
-    co2Ppm: Math.round(co2),
+    row: {
+      at: time.at,
+      temperatureF: Math.round(temperatureF * 10) / 10,
+      humidity: Math.round(humidity * 10) / 10,
+      co2Ppm: Math.round(co2),
+    },
   };
 }
 

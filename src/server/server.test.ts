@@ -835,7 +835,7 @@ describe('shared server', () => {
       { db, env },
     );
     expect(first.status).toBe(200);
-    expect(await first.json()).toMatchObject({ inserted: 900, duplicates: 1, skipped: 1 });
+    expect(await first.json()).toMatchObject({ inserted: 900, duplicates: 1, skipped: 1, skipReasons: ['Could not read the timestamp.'] });
 
     const again = await handleMcp(db, {
       jsonrpc: '2.0',
@@ -843,7 +843,7 @@ describe('shared server', () => {
       method: 'tools/call',
       params: { name: 'import_meter_csv', arguments: { csv } },
     });
-    expect(JSON.parse(textOf(again))).toMatchObject({ inserted: 0, duplicates: 901, skipped: 1 });
+    expect(JSON.parse(textOf(again))).toMatchObject({ inserted: 0, duplicates: 901, skipped: 1, skipReasons: ['Could not read the timestamp.'] });
 
     const emptyTool = await handleMcp(db, {
       jsonrpc: '2.0',

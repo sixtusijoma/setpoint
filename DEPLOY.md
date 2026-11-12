@@ -44,7 +44,7 @@ The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be 
 `supabase/config.toml` sets `verify_jwt = false` for every function. Each function checks its own credential in one helper:
 
 - App functions (`state`, `press`, `recalibrate`, `session`, `history`, `import-meter`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
-- `import-meter` is `POST`. Send JSON `{ "csv": "<file text>" }` or a raw `text/csv` body. It returns `{ "inserted", "duplicates", "skipped", "firstAt", "lastAt" }`. It uses the existing `SETPOINT_APP_KEY`. It does not add a secret. `tick` and `prune` stay on `CRON_SECRET`. `mcp` stays on `SETPOINT_MCP_KEY`.
+- `import-meter` is `POST`. Send JSON `{ "csv": "<file text>" }` or a raw `text/csv` body. It returns `{ "inserted", "duplicates", "skipped", "firstAt", "lastAt", "skipReasons" }`. `skipReasons` lists up to three sample reasons when `skipped` is greater than 0. It uses the existing `SETPOINT_APP_KEY`. It does not add a secret. `tick` and `prune` stay on `CRON_SECRET`. `mcp` stays on `SETPOINT_MCP_KEY`.
 - `meter` also accepts `x-setpoint-cron-secret` so the ten-minute job can keep running. A phone call still needs the app key.
 - `tick` and `prune` accept only `x-setpoint-cron-secret` matching `CRON_SECRET`.
 - `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`. The app key does not open it.

@@ -27,5 +27,6 @@ export async function importMeterCsv(db: SetpointDb, csv: string): Promise<Meter
     skipped: parsed.skipped,
     firstAt: planned.firstAt,
     lastAt: planned.lastAt,
+    skipReasons: parsed.skipReasons,
   };
 }

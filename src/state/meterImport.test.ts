@@ -8,6 +8,7 @@ const summary = {
   skipped: 1,
   firstAt: '2026-04-21T17:39:04.000Z',
   lastAt: '2026-11-11T23:51:00.000Z',
+  skipReasons: ['Could not read the timestamp.'],
 };
 
 describe('meter import state', () => {
