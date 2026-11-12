@@ -208,3 +208,65 @@ describe('cancelled inbox', () => {
     expect(openCancelled([early, later])).toEqual([]);
   });
 });
+
+const sleep2 = {
+  id: 'sleep-2',
+  label: 'Sleep 2',
+  hour: 0,
+  minute: 0,
+  targetF: 61,
+  days: [6, 7],
+  enabled: true,
+};
+
+describe('midnight events', () => {
+  it('places a 00:00 event on Saturday and Sunday, not Friday', () => {
+    const friday = DateTime.fromObject({ year: 2026, month: 11, day: 13 }, { zone: TIME_ZONE });
+    const saturday = DateTime.fromObject({ year: 2026, month: 11, day: 14 }, { zone: TIME_ZONE });
+    const sunday = DateTime.fromObject({ year: 2026, month: 11, day: 15 }, { zone: TIME_ZONE });
+    expect(listOccurrences([sleep2], friday.startOf('day'), friday.endOf('day'))).toEqual([]);
+    const sat = listOccurrences([sleep2], saturday.startOf('day'), saturday.endOf('day'));
+    const sun = listOccurrences([sleep2], sunday.startOf('day'), sunday.endOf('day'));
+    expect(sat).toHaveLength(1);
+    expect(sun).toHaveLength(1);
+    expect(sat[0]?.at).toBe('2026-11-14T05:00:00.000Z');
+    expect(sun[0]?.at).toBe('2026-11-15T05:00:00.000Z');
+    expect(DateTime.fromISO(sat[0]?.at ?? '', { setZone: true }).setZone(TIME_ZONE).weekday).toBe(6);
+    expect(DateTime.fromISO(sun[0]?.at ?? '', { setZone: true }).setZone(TIME_ZONE).hour).toBe(0);
+  });
+
+  it('fires the next midnight occurrence just after Friday night', () => {
+    const next = nextOccurrence([sleep2], at({ year: 2026, month: 11, day: 13, hour: 23, minute: 50 }));
+    expect(next?.label).toBe('Sleep 2');
+    expect(next?.at).toBe('2026-11-14T05:00:00.000Z');
+    const after = nextOccurrence([sleep2], at({ year: 2026, month: 11, day: 14, hour: 0, minute: 0 }));
+    expect(after?.at).toBe('2026-11-15T05:00:00.000Z');
+  });
+
+  it('applies a due midnight event and records it like any other run', () => {
+    const plan = planDue({
+      events: [sleep2],
+      records: [],
+      now: at({ year: 2026, month: 11, day: 14, hour: 0, minute: 0 }),
+      hold: null,
+      catchupFrom: iso({ year: 2026, month: 11, day: 13, hour: 12, minute: 0 }),
+      retryFailed: true,
+    });
+    expect(plan.apply?.label).toBe('Sleep 2');
+    expect(plan.apply?.at).toBe('2026-11-14T05:00:00.000Z');
+    expect(plan.missed).toEqual([]);
+  });
+
+  it('does not catch up a newly added midnight event from before the cursor', () => {
+    const plan = planDue({
+      events: [sleep2],
+      records: [],
+      now: at({ year: 2026, month: 11, day: 11, hour: 19, minute: 30 }),
+      hold: null,
+      catchupFrom: iso({ year: 2026, month: 11, day: 11, hour: 18, minute: 51 }),
+      retryFailed: true,
+    });
+    expect(plan.apply).toBeNull();
+    expect(plan.missed).toEqual([]);
+  });
+});

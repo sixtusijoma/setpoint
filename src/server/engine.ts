@@ -257,6 +257,43 @@ export async function storeMeterRead(db: SetpointDb, sample: HistorySample): Pro
   await db.insertRead(sample);
 }
 
+function normalizeDays(days: number[] | undefined): number[] | undefined {
+  if (days === undefined) {
+    return undefined;
+  }
+  const next = [...new Set(days.map((day) => Number(day)))].sort((a, b) => a - b);
+  if (next.length === 0 || next.some((day) => !Number.isInteger(day) || day < 1 || day > 7)) {
+    throw new Error('Days must be Monday=1 through Sunday=7.');
+  }
+  return next;
+}
+
+function createdEvent(
+  eventId: string,
+  patch: Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>>,
+): ScheduleEvent {
+  if (
+    !eventId ||
+    typeof patch.label !== 'string' ||
+    !patch.label.trim() ||
+    typeof patch.hour !== 'number' ||
+    typeof patch.minute !== 'number' ||
+    typeof patch.targetF !== 'number' ||
+    !patch.days
+  ) {
+    throw new Error('To add an event, provide label, hour, minute, targetF, and days.');
+  }
+  return {
+    id: eventId,
+    label: patch.label.trim(),
+    hour: patch.hour,
+    minute: patch.minute,
+    targetF: patch.targetF,
+    days: patch.days,
+    enabled: patch.enabled ?? true,
+  };
+}
+
 export async function editScheduleEvent(
   db: SetpointDb,
   eventId: string,
@@ -264,11 +301,35 @@ export async function editScheduleEvent(
   now = new Date(),
 ): Promise<SharedSnapshot> {
   const state = await db.readState();
+  const days = normalizeDays(patch.days);
+  const clean: Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>> = {};
+  if (typeof patch.label === 'string') {
+    clean.label = patch.label;
+  }
+  if (typeof patch.hour === 'number') {
+    clean.hour = patch.hour;
+  }
+  if (typeof patch.minute === 'number') {
+    clean.minute = patch.minute;
+  }
+  if (typeof patch.targetF === 'number') {
+    clean.targetF = patch.targetF;
+  }
+  if (days) {
+    clean.days = days;
+  }
+  if (typeof patch.enabled === 'boolean') {
+    clean.enabled = patch.enabled;
+  }
   const current = state.events.find((event) => event.id === eventId);
   if (!current) {
-    throw new Error('No schedule event with that id.');
+    const created = createdEvent(eventId, clean);
+    return patchRetry(db, {
+      events: [...state.events, created],
+      catchupFrom: state.catchupFrom,
+    });
   }
-  const next: ScheduleEvent = { ...current, ...patch, id: current.id };
+  const next: ScheduleEvent = { ...current, ...clean, id: current.id };
   const events = state.events.map((event) => (event.id === eventId ? next : event));
   const reset = scheduleEditResetsCursor(current, next);
   return patchRetry(db, {

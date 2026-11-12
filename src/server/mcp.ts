@@ -32,7 +32,7 @@ export const MCP_TOOLS = [
   },
   {
     name: 'edit_schedule',
-    description: 'Edit one schedule event. Time or temperature edits reset the catch-up cursor. Renames and reorders do not.',
+    description: 'Edit one schedule event, or create it when the id is new. Time or temperature edits reset the catch-up cursor. Days, renames, and new events do not.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -41,6 +41,7 @@ export const MCP_TOOLS = [
         hour: { type: 'number' },
         minute: { type: 'number' },
         targetF: { type: 'number' },
+        days: { type: 'array', items: { type: 'number' }, description: 'Weekdays to run, Monday=1 through Sunday=7.' },
       },
       required: ['eventId'],
     },
@@ -141,6 +142,7 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
       hour: typeof args.hour === 'number' ? args.hour : undefined,
       minute: typeof args.minute === 'number' ? args.minute : undefined,
       targetF: typeof args.targetF === 'number' ? args.targetF : undefined,
+      days: Array.isArray(args.days) ? args.days.map((day) => Number(day)) : undefined,
     }, now());
     return JSON.stringify({ events: saved.events, catchupFrom: saved.catchupFrom });
   }

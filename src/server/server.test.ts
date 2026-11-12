@@ -22,6 +22,7 @@ import {
 } from './http';
 import { handleMcp } from './mcp';
 import { createRestDb } from './restDb';
+import { defaultEvents } from '../domain/schedule';
 import { createSqlDb, type SetpointDb } from './sqlDb';
 
 const migration = readFileSync(
@@ -98,6 +99,7 @@ describe('shared server', () => {
       schedulePhase: 'armed',
       catchupNote: null,
       catchupFrom: '2099-01-01T00:00:00.000Z',
+      events: defaultEvents(),
       settings,
       deviceMap: { up: bot('up'), down: bot('down'), meter: { ...bot('meter'), deviceType: 'Meter' } },
     });
@@ -400,10 +402,45 @@ describe('shared server', () => {
     await db.patchState(null, { catchupFrom: '2026-11-01T00:00:00.000Z' });
     const renamed = await editScheduleEvent(db, 'default-wake', { label: 'Morning' }, wednesdayMorning);
     expect(renamed.catchupFrom).toContain('2026-11-01');
+    const daysOnly = await editScheduleEvent(db, 'default-wake', { days: [1, 2, 3, 4, 5] }, wednesdayMorning);
+    expect(daysOnly.catchupFrom).toContain('2026-11-01');
+    expect(daysOnly.events.find((event) => event.id === 'default-wake')?.days).toEqual([1, 2, 3, 4, 5]);
     const moved = await editScheduleEvent(db, 'default-wake', { hour: 7 }, wednesdayMorning);
     expect(Date.parse(moved.catchupFrom ?? '')).toBe(wednesdayMorning.getTime());
     const reordered = await editScheduleEvent(db, 'default-wake', { label: 'Wake' }, wednesdayMorning);
     expect(Date.parse(reordered.catchupFrom ?? '')).toBe(wednesdayMorning.getTime());
+  });
+
+  it('lets MCP edit days and create an event without resetting the cursor', async () => {
+    await db.patchState(null, { catchupFrom: '2026-11-01T00:00:00.000Z' });
+    const days = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 20,
+      method: 'tools/call',
+      params: { name: 'edit_schedule', arguments: { eventId: 'default-sleep', days: [7, 1, 2, 3, 4] } },
+    });
+    const daysBody = JSON.parse(textOf(days)) as { events: { id: string; days: number[] }[]; catchupFrom: string };
+    expect(daysBody.catchupFrom).toContain('2026-11-01');
+    expect(daysBody.events.find((event) => event.id === 'default-sleep')?.days).toEqual([1, 2, 3, 4, 7]);
+    const created = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 21,
+      method: 'tools/call',
+      params: {
+        name: 'edit_schedule',
+        arguments: { eventId: 'sleep-2', label: 'Sleep 2', hour: 0, minute: 0, targetF: 61, days: [6, 7] },
+      },
+    });
+    const createdBody = JSON.parse(textOf(created)) as { events: { id: string; label: string; hour: number }[]; catchupFrom: string };
+    expect(createdBody.catchupFrom).toContain('2026-11-01');
+    expect(createdBody.events.find((event) => event.id === 'sleep-2')).toMatchObject({
+      label: 'Sleep 2',
+      hour: 0,
+      minute: 0,
+      targetF: 61,
+      days: [6, 7],
+      enabled: true,
+    });
   });
 
   it('stores meter reads and rolls raw rows older than 30 days', async () => {
