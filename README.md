@@ -8,6 +8,23 @@ Demo mode is the default. It runs with simulated devices and needs no SwitchBot 
 
 <img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to 61 F.">
 
+## Screenshots
+
+These are from the in-browser demo, at iPhone size. The room readings and charts are simulated. Sleep and Wake are the default schedule.
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/app-home.png" width="250" alt="Home screen in demo mode. The virtual setpoint is 70 degrees, the room is about 68, and the next change is Sleep at 11:45 PM."><br>Home</td>
+    <td align="center"><img src="docs/images/app-schedule.png" width="250" alt="Schedule screen in Eastern Time, with Sleep at 61 on weekdays and Wake at 70 every day."><br>Schedule</td>
+    <td align="center"><img src="docs/images/app-history.png" width="250" alt="History day chart of simulated room temperature, with coral lines at setpoint changes."><br>History, day</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/app-recalibrate.png" width="250" alt="Recalibrate sheet on Home. Saving replaces the virtual setpoint and does not press any buttons."><br>Recalibrate</td>
+    <td align="center"><img src="docs/images/app-history-week.png" width="250" alt="History week chart of simulated room temperature over seven days."><br>History, week</td>
+    <td align="center"><img src="docs/images/app-skip-day.png" width="250" alt="Skip a day sheet listing upcoming Sleep times you can skip."><br>Skip a day</td>
+  </tr>
+</table>
+
 ## Why I made this
 
 I wanted to turn my regular thermostat into a smart one. I wanted to be able to adjust it from my phone and add the ability for custom complex requests even most smart thermostats can't handle.
