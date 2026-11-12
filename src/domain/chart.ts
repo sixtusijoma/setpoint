@@ -51,11 +51,14 @@ export type ChartPick = {
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+export type ChartDomain = { startMs: number; endMs: number };
+
 export function chartGeometry(
   samples: HistorySample[],
   changes: SetpointChange[],
   metric: ChartMetric,
   frame: ChartFrame,
+  domain?: ChartDomain,
 ): ChartGeometry {
   const plotLeft = frame.left;
   const plotRight = Math.max(plotLeft + 1, frame.width - frame.right);
@@ -64,8 +67,9 @@ export function chartGeometry(
   const times = samples.map((sample) => Date.parse(sample.at));
   const changeTimes = changes.map((change) => Date.parse(change.at));
   const known = [...times, ...changeTimes].filter((time) => Number.isFinite(time));
-  const startMs = known.length > 0 ? Math.min(...known) : 0;
-  const endMs = known.length > 0 ? Math.max(...known) : 0;
+  const fixed = domain && domain.endMs > domain.startMs ? domain : null;
+  const startMs = fixed ? fixed.startMs : known.length > 0 ? Math.min(...known) : 0;
+  const endMs = fixed ? fixed.endMs : known.length > 0 ? Math.max(...known) : 0;
   const timeSpan = Math.max(1, endMs - startMs);
   const values = samples.map((sample) => sample[metric]);
   let min = values.length > 0 ? Math.min(...values) : 0;
@@ -144,7 +148,14 @@ export function timeTicks(geometry: ChartGeometry): ChartTick[] {
   const range = endMs - startMs;
   const first = DateTime.fromMillis(startMs, { zone: TIME_ZONE }).startOf('day');
   const instants: { at: DateTime; label: string }[] = [];
-  for (let day = first; day.toMillis() <= endMs; day = day.plus({ days: 1 })) {
+  if (range > 62 * DAY_MS) {
+    for (let month = first.startOf('month'); month.toMillis() <= endMs; month = month.plus({ months: 1 })) {
+      if ((month.month - 1) % 3 === 0) {
+        instants.push({ at: month, label: month.month === 1 ? month.toFormat('yyyy') : month.toFormat('LLL') });
+      }
+    }
+  }
+  for (let day = first; range <= 62 * DAY_MS && day.toMillis() <= endMs; day = day.plus({ days: 1 })) {
     if (range <= 1.5 * DAY_MS) {
       for (const hour of [0, 6, 12, 18]) {
         const at = day.set({ hour });
@@ -184,18 +195,22 @@ export function formatAxis(metric: ChartMetric, value: number): string {
   return `${Math.round(value)}`;
 }
 
-export function formatReadoutTime(iso: string): string {
+export function formatReadoutTime(iso: string, options: { withYear?: boolean; daily?: boolean } = {}): string {
   const instant = DateTime.fromISO(iso, { setZone: true }).setZone(TIME_ZONE);
   if (!instant.isValid) {
     return '';
   }
-  return `${instant.toFormat('ccc, LLL d · h:mm a')} ET`;
+  const date = instant.toFormat(options.withYear || options.daily ? 'ccc, LLL d, yyyy' : 'ccc, LLL d');
+  return options.daily ? date : `${date} · ${instant.toFormat('h:mm a')} ET`;
 }
 
-export function formatTooltipTime(iso: string, rangeMs: number): string {
+export function formatTooltipTime(iso: string, rangeMs: number, bucketSeconds = 0): string {
   const instant = DateTime.fromISO(iso, { setZone: true }).setZone(TIME_ZONE);
   if (!instant.isValid) {
     return '';
+  }
+  if (bucketSeconds >= DAY_MS / 1000) {
+    return instant.toFormat('LLL d, yyyy');
   }
   if (rangeMs <= 1.5 * DAY_MS) {
     return instant.toFormat('h:mm a');
@@ -211,6 +226,9 @@ export function bucketLabel(bucketSeconds: number): string {
     return `${Math.round(bucketSeconds / 60)}-min average`;
   }
   const hours = bucketSeconds / (60 * 60);
+  if (hours === 24) {
+    return 'Daily average';
+  }
   return hours === 1 ? '1-hour average' : `${Math.round(hours)}-hour average`;
 }
 

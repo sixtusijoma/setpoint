@@ -2,13 +2,8 @@ import type { CommandSource } from '@/domain/pressSession';
 import type { HoldState, RunRecord, ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
 import type { SwitchBotDevice } from '@/devices/switchbot';
-import {
-  readChangePage,
-  type ChangePage,
-  type HistorySample,
-  type HistorySpan,
-  type SetpointChange,
-} from '@/domain/history';
+import { readChangePage, withinRange, type ChangePage, type HistorySample, type SetpointChange } from '@/domain/history';
+import type { HistoryWindow, HistoryWindowData } from '@/domain/historyWindow';
 import { chunkMeterCsv, combineSummaries, emptySummary, type MeterImportSummary } from '@/domain/meterCsv';
 import type { DeviceMap, Preset, Settings } from '@/state/model';
 
@@ -144,12 +139,38 @@ export function fetchRemoteSession(config: ServerConfig, appKey: string): Promis
   return call(config, appKey, 'session');
 }
 
-export function fetchHistory(
+export const OLD_HISTORY_FUNCTION =
+  'The history function on the server is out of date, so only the current day, week, or month can be shown. Redeploy it to browse older readings.';
+
+export async function fetchHistoryWindow(
   config: ServerConfig,
   appKey: string,
-  span: HistorySpan,
-): Promise<{ samples: HistorySample[]; changes: SetpointChange[] }> {
-  return call(config, appKey, `history?span=${span}`);
+  window: HistoryWindow,
+  current: boolean,
+): Promise<HistoryWindowData> {
+  const params = new URLSearchParams({ since: window.since, until: window.until });
+  if (window.span !== 'year') {
+    params.set('span', window.span);
+  }
+  const payload = await call<{
+    samples?: HistorySample[];
+    changes?: SetpointChange[];
+    bucketSeconds?: number;
+    firstAt?: string | null;
+  }>(config, appKey, `history?${params.toString()}`);
+  const samples = Array.isArray(payload?.samples) ? payload.samples : [];
+  const changes = Array.isArray(payload?.changes) ? payload.changes : [];
+  if (typeof payload?.bucketSeconds === 'number') {
+    return { samples, changes, bucketSeconds: payload.bucketSeconds, firstAt: payload.firstAt ?? null };
+  }
+  if (!current || window.span === 'year') {
+    throw new Error(OLD_HISTORY_FUNCTION);
+  }
+  return {
+    samples: withinRange(samples, window.since, window.until),
+    changes: withinRange(changes, window.since, window.until),
+    bucketSeconds: window.bucketSeconds,
+  };
 }
 
 export async function fetchChangePage(

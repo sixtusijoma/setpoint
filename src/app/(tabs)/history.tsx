@@ -1,3 +1,4 @@
+import { DatePickerSheet } from '@/components/date-picker-sheet';
 import { HistoryChart } from '@/components/history-chart';
 import { MeterImportSheet } from '@/components/meter-import-sheet';
 import { PillButton } from '@/components/ui';
@@ -10,17 +11,20 @@ import {
   type ChangeLog,
 } from '@/domain/changeLog';
 import { describeChangeSource, formatReadoutTime, type ChartMetric } from '@/domain/chart';
+import { changeKey, type HistorySpan, type SetpointChange } from '@/domain/history';
 import {
-  aggregateSamples,
-  bucketSecondsForRange,
-  changeKey,
-  changesInWindow,
-  sliceWindow,
-  spanWindowMs,
-  type HistorySpan,
-  type SetpointChange,
-} from '@/domain/history';
-import { offHistoryLoad, reduceHistoryLoad } from '@/domain/historyLoad';
+  canStepBack,
+  canStepForward,
+  etDay,
+  HISTORY_SPANS,
+  historyWindow,
+  initialHistoryView,
+  localWindowData,
+  reduceHistoryView,
+  viewWindow,
+  windowLabel,
+  type HistoryWindow,
+} from '@/domain/historyWindow';
 import type { ScheduleEvent } from '@/domain/schedule';
 import { pickCsvText } from '@/storage/pickCsv';
 import { useApp } from '@/state/store';
@@ -40,21 +44,25 @@ const METRICS: { id: ChartMetric; label: string }[] = [
 export default function HistoryScreen() {
   const app = useApp();
   const insets = useSafeAreaInsets();
-  const [span, setSpan] = useState<HistorySpan>('day');
   const [metric, setMetric] = useState<ChartMetric>('temperatureF');
-  const [load, dispatchLoad] = useReducer(reduceHistoryLoad, undefined, offHistoryLoad);
+  const [view, dispatchView] = useReducer(reduceHistoryView, undefined, initialHistoryView);
   const [log, dispatchLog] = useReducer(reduceChangeLog, undefined, idleChangeLog);
+  const [picking, setPicking] = useState(false);
   const liveServer = app.serverConfigured && app.state.mode === 'live';
+  const today = etDay(app.clock);
+  const lastDay = viewWindow(view, today).lastDay;
+  const period = useMemo(() => historyWindow(view.span, lastDay), [view.span, lastDay]);
+  const current = lastDay === today;
 
   useFocusEffect(
     useCallback(() => {
-      dispatchLoad(liveServer ? { type: 'fetch', span } : { type: 'off' });
-    }, [liveServer, span]),
+      dispatchView(liveServer ? { type: 'fetch', window: period } : { type: 'off' });
+    }, [liveServer, period]),
   );
 
   const refetchAfterImport = useEffectEvent(() => {
     if (liveServer) {
-      dispatchLoad({ type: 'fetch', span });
+      dispatchView({ type: 'fetch', window: period });
     }
   });
   useEffect(() => {
@@ -63,13 +71,12 @@ export default function HistoryScreen() {
     }
   }, [app.meterImport]);
 
-  const loadingRequest = load.status === 'loading' ? load.request : null;
-  const loadingSpan = load.status === 'loading' ? load.span : null;
-  const runLoad = useEffectEvent((request: number, target: HistorySpan) => {
-    app.loadHistory(target).then(
-      () => dispatchLoad({ type: 'loaded', request }),
+  const loading = view.load.status === 'loading' ? view.load : null;
+  const runLoad = useEffectEvent((request: number, target: HistoryWindow) => {
+    app.loadHistoryWindow(target, target.lastDay >= today).then(
+      (data) => dispatchView({ type: 'loaded', request, data, today }),
       (reason: unknown) =>
-        dispatchLoad({
+        dispatchView({
           type: 'fail',
           request,
           message: reason instanceof Error ? reason.message : 'History could not be loaded.',
@@ -77,21 +84,42 @@ export default function HistoryScreen() {
     );
   });
   useEffect(() => {
-    if (loadingRequest !== null && loadingSpan !== null) {
-      runLoad(loadingRequest, loadingSpan);
+    if (loading) {
+      runLoad(loading.request, loading.window);
     }
-  }, [loadingRequest, loadingSpan]);
+  }, [loading]);
+
+  const localData = useMemo(
+    () => (liveServer ? null : localWindowData(app.state.history, app.state.changes, period)),
+    [liveServer, app.state.history, app.state.changes, period],
+  );
+  const localFirstAt = localData?.firstAt ?? null;
+  useEffect(() => {
+    if (!liveServer) {
+      dispatchView({ type: 'bounds', firstAt: localFirstAt, today });
+    }
+  }, [liveServer, localFirstAt, today]);
+  const data = liveServer
+    ? view.load.status === 'ready' && view.load.window.key === period.key
+      ? view.load.data
+      : null
+    : localData;
+  const samples = data?.samples ?? [];
+  const changes = data?.changes ?? [];
+  const domain = useMemo(() => ({ startMs: period.startMs, endMs: period.endMs }), [period]);
+  const waiting = liveServer && (view.load.status === 'loading' || (view.load.status === 'ready' && data === null));
+  const failed = liveServer && view.load.status === 'error' ? view.load.message : null;
 
   const source = liveServer ? 'server' : 'local';
   useEffect(() => {
     dispatchLog({ type: 'reset' });
   }, [source]);
 
-  const headAt = newestAt(app.state.changes);
+  const headAt = Math.max(newestAt(app.state.changes) ?? -Infinity, newestAt(changes) ?? -Infinity);
   const refreshLog = useEffectEvent(() => {
     const listHead = changeLogItems(log)[0];
     const listHeadAt = listHead ? Date.parse(listHead.at) : null;
-    if (headAt !== null && log.status !== 'loading' && (listHeadAt === null || headAt > listHeadAt)) {
+    if (Number.isFinite(headAt) && log.status !== 'loading' && (listHeadAt === null || headAt > listHeadAt)) {
       dispatchLog({ type: 'reset' });
     }
   });
@@ -119,12 +147,6 @@ export default function HistoryScreen() {
     }
   }, [pendingRequest, pendingCursor]);
 
-  const bucketSeconds = bucketSecondsForRange(spanWindowMs(span));
-  const samples = useMemo(
-    () => aggregateSamples(sliceWindow(app.state.history, app.clock, span), bucketSeconds),
-    [app.state.history, app.clock, span, bucketSeconds],
-  );
-  const changes = useMemo(() => changesInWindow(app.state.changes, app.clock, span), [app.state.changes, app.clock, span]);
   const items = changeLogItems(log);
 
   async function chooseCsv() {
@@ -161,11 +183,54 @@ export default function HistoryScreen() {
           : 'Meter readings stored by the shared server. Coral lines are setpoint changes.'}
       </Text>
       <View style={styles.segment}>
-        <Segment label="Day" testID="history-day" on={span === 'day'} onPress={() => setSpan('day')} />
-        <Segment label="Week" testID="history-week" on={span === 'week'} onPress={() => setSpan('week')} />
-        <Segment label="Month" testID="history-month" on={span === 'month'} onPress={() => setSpan('month')} />
+        <StepArrow
+          glyph="‹"
+          label={`Previous ${view.span}`}
+          testID="history-prev"
+          disabled={!canStepBack(view, today)}
+          onPress={() => dispatchView({ type: 'step', by: -1, today })}
+        />
+        {HISTORY_SPANS.map((item) => (
+          <Segment
+            key={item.id}
+            label={item.label}
+            testID={`history-${item.id}`}
+            on={view.span === item.id}
+            onPress={() => dispatchView({ type: 'span', span: item.id, today })}
+          />
+        ))}
+        <StepArrow
+          glyph="›"
+          label={`Next ${view.span}`}
+          testID="history-next"
+          disabled={!canStepForward(view, today)}
+          onPress={() => dispatchView({ type: 'step', by: 1, today })}
+        />
       </View>
-      <Text style={styles.body}>{spanCaption(span)}</Text>
+      <View style={styles.rangeRow}>
+        <Pressable
+          testID="history-range"
+          accessibilityRole="button"
+          accessibilityHint="Opens a calendar to jump to a date"
+          onPress={() => setPicking(true)}
+          style={({ pressed }) => [styles.range, pressed && styles.pressed]}
+        >
+          <Text testID="history-range-label" style={styles.rangeText}>
+            {windowLabel(period)}
+          </Text>
+          <Text style={styles.rangeHint}>{rangeHint(view.span, current)}</Text>
+        </Pressable>
+        {current ? null : (
+          <Pressable
+            testID="history-now"
+            accessibilityRole="button"
+            onPress={() => dispatchView({ type: 'now' })}
+            style={styles.inlineButton}
+          >
+            <Text style={styles.inlineButtonText}>Now</Text>
+          </Pressable>
+        )}
+      </View>
       <PillButton label="Import CSV" testID="history-import" onPress={app.openMeterImport} />
       <View style={styles.segment}>
         {METRICS.map((item) => (
@@ -178,33 +243,47 @@ export default function HistoryScreen() {
           />
         ))}
       </View>
-      {load.status === 'loading' ? <Text style={styles.body}>Loading readings.</Text> : null}
-      {load.status === 'error' ? (
+      {failed !== null ? (
         <View style={styles.errorRow}>
-          <Text style={[styles.error, styles.grow]}>{load.message}</Text>
+          <Text testID="history-load-error" style={[styles.error, styles.grow]}>
+            {failed}
+          </Text>
           <Pressable
             accessibilityRole="button"
             testID="history-retry"
-            onPress={() => dispatchLoad({ type: 'fetch', span })}
+            onPress={() => dispatchView({ type: 'fetch', window: period })}
             style={styles.inlineButton}
           >
             <Text style={styles.inlineButtonText}>Try again</Text>
           </Pressable>
         </View>
       ) : null}
-      {samples.length === 0 && load.status !== 'loading' ? (
-        <View style={styles.empty}>
-          <Text style={styles.emptyTitle}>No readings in this window</Text>
-          <Text style={styles.body}>Pull to refresh on Home, or wait for the server meter.</Text>
+      {waiting ? (
+        <View testID="history-chart-loading" style={styles.placeholder}>
+          <ActivityIndicator color={colors.muted} />
+          <Text style={styles.body}>Loading readings for {windowLabel(period)}.</Text>
         </View>
       ) : null}
-      {samples.length > 0 ? (
+      {data !== null && samples.length === 0 ? (
+        <View testID="history-empty" style={styles.empty}>
+          <Text style={styles.emptyTitle}>No readings in this window</Text>
+          <Text style={styles.body}>
+            {current
+              ? 'Pull to refresh on Home, or wait for the server meter.'
+              : 'Nothing was stored for these dates. Step forward, or pick another date.'}
+          </Text>
+        </View>
+      ) : null}
+      {data !== null && samples.length > 0 ? (
         <HistoryChart
           samples={samples}
           changes={changes}
           metric={metric}
-          bucketSeconds={bucketSeconds}
+          bucketSeconds={data.bucketSeconds}
           events={app.state.events}
+          domain={domain}
+          current={current}
+          withYear={period.span === 'year' || period.firstDay.slice(0, 4) !== today.slice(0, 4)}
         />
       ) : null}
       <Text style={styles.section}>Setpoint changes</Text>
@@ -217,7 +296,7 @@ export default function HistoryScreen() {
       <FlatList
         data={items}
         keyExtractor={(item, index) => `${changeKey(item)}-${index}`}
-        renderItem={({ item }) => <ChangeRow change={item} events={app.state.events} />}
+        renderItem={({ item }) => <ChangeRow change={item} events={app.state.events} thisYear={today.slice(0, 4)} />}
         ListHeaderComponent={header}
         ListFooterComponent={
           <ChangeLogFooter
@@ -231,6 +310,17 @@ export default function HistoryScreen() {
         windowSize={9}
       />
       <MeterImportSheet state={app.meterImport} onChoose={() => void chooseCsv()} onClose={closeImport} />
+      <DatePickerSheet
+        visible={picking}
+        selected={period.lastDay}
+        earliestDay={view.earliestDay}
+        today={today}
+        onPick={(date) => {
+          setPicking(false);
+          dispatchView({ type: 'jump', date, today });
+        }}
+        onClose={() => setPicking(false)}
+      />
     </View>
   );
 }
@@ -246,12 +336,13 @@ function newestAt(changes: SetpointChange[]): number | null {
   return newest;
 }
 
-function ChangeRow({ change, events }: { change: SetpointChange; events: ScheduleEvent[] }) {
+function ChangeRow({ change, events, thisYear }: { change: SetpointChange; events: ScheduleEvent[]; thisYear: string }) {
+  const withYear = etDay(change.at).slice(0, 4) !== thisYear;
   return (
     <View testID="history-marker" style={styles.marker}>
       <Text style={styles.markerTitle}>{change.label}</Text>
       <Text style={styles.body}>
-        {change.setpoint}° · {formatReadoutTime(change.at)} · {describeChangeSource(change, events)}
+        {change.setpoint}° · {formatReadoutTime(change.at, { withYear })} · {describeChangeSource(change, events)}
       </Text>
     </View>
   );
@@ -302,14 +393,37 @@ function ChangeLogFooter({ log, onMore, onRetry }: { log: ChangeLog; onMore: () 
   );
 }
 
-function spanCaption(span: HistorySpan): string {
-  if (span === 'day') {
-    return 'Last 24 hours.';
-  }
-  if (span === 'week') {
-    return 'Last 7 days.';
-  }
-  return 'Last 30 days.';
+function rangeHint(span: HistorySpan, current: boolean): string {
+  const unit = span === 'day' ? 'Today' : `This ${span}, through today`;
+  return current ? `${unit} · Tap to pick a date` : 'Tap to pick a date';
+}
+
+function StepArrow({
+  glyph,
+  label,
+  testID,
+  disabled,
+  onPress,
+}: {
+  glyph: string;
+  label: string;
+  testID: string;
+  disabled: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      testID={testID}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled }}
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [styles.arrow, disabled && styles.arrowOff, pressed && !disabled && styles.pressed]}
+    >
+      <Text style={styles.arrowText}>{glyph}</Text>
+    </Pressable>
+  );
 }
 
 function Segment({
@@ -361,6 +475,30 @@ const styles = StyleSheet.create({
   },
   segmentOn: { backgroundColor: colors.raised, borderWidth: 1, borderColor: colors.neutral },
   segmentText: { color: colors.text, fontFamily: fonts.medium, fontSize: 13 },
+  arrow: {
+    width: 36,
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: colors.card,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  arrowOff: { opacity: 0.35 },
+  arrowText: { color: colors.text, fontFamily: fonts.medium, fontSize: 22, lineHeight: 26 },
+  pressed: { opacity: 0.7 },
+  rangeRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  range: { flex: 1, gap: 2 },
+  rangeText: { color: colors.text, fontFamily: fonts.semibold, fontSize: 16 },
+  rangeHint: { color: colors.muted, fontFamily: fonts.body, fontSize: 13 },
+  placeholder: {
+    minHeight: 360,
+    backgroundColor: colors.card,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    padding: 16,
+  },
   empty: { backgroundColor: colors.card, borderRadius: 16, padding: 16, gap: 6 },
   emptyTitle: { color: colors.text, fontFamily: fonts.semibold, fontSize: 18 },
   marker: { backgroundColor: colors.card, borderRadius: 14, padding: 12, gap: 4 },
