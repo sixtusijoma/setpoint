@@ -8,6 +8,7 @@ import {
   describeChangeSource,
   focusWithin,
   formatReadoutTime,
+  formatTooltipTime,
   idleFocus,
   nearestIndex,
   nearestMarker,
@@ -259,6 +260,10 @@ describe('chart geometry', () => {
     expect(bucketLabel(300)).toBe('5-min average');
     expect(bucketLabel(7200)).toBe('2-hour average');
     expect(bucketLabel(0)).toBe('Reading');
+    const day = 24 * 3600 * 1000;
+    expect(formatTooltipTime('2026-11-02T16:00:00Z', day)).toBe('11:00 AM');
+    expect(formatTooltipTime('2026-11-02T16:30:00Z', 7 * day)).toBe('Mon 11:30 AM');
+    expect(formatTooltipTime('2026-11-02T16:00:00Z', 30 * day)).toBe('Nov 2, 11 AM');
   });
 
   it('names where a change came from', () => {

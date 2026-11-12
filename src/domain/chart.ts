@@ -197,7 +197,10 @@ export function formatTooltipTime(iso: string, rangeMs: number): string {
   if (!instant.isValid) {
     return '';
   }
-  return rangeMs <= 1.5 * DAY_MS ? instant.toFormat('h:mm a') : instant.toFormat('ccc h:mm a');
+  if (rangeMs <= 1.5 * DAY_MS) {
+    return instant.toFormat('h:mm a');
+  }
+  return rangeMs <= 10 * DAY_MS ? instant.toFormat('ccc h:mm a') : instant.toFormat('LLL d, h a');
 }
 
 export function bucketLabel(bucketSeconds: number): string {

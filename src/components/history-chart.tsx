@@ -24,14 +24,24 @@ import { selectionFeedback } from '@/haptics';
 import { colors, fonts } from '@/theme';
 import { memo, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { StyleSheet, Text, View, type LayoutChangeEvent } from 'react-native';
-import { GestureDetector, useCompetingGestures, usePanGesture, useTapGesture } from 'react-native-gesture-handler';
+import {
+  GestureDetector,
+  useCompetingGestures,
+  usePanGesture,
+  useTapGesture,
+  type PanGestureConfig,
+  type TapGestureConfig,
+} from 'react-native-gesture-handler';
 import Svg, { Circle, Line, Polyline } from 'react-native-svg';
 
 const HEIGHT = 196;
-const TIP_WIDTH = 132;
+const TIP_WIDTH = 172;
 const TICK_WIDTH = 52;
 const MARKER_SLOP = 12;
 const FRAME: Omit<ChartFrame, 'width'> = { height: HEIGHT, top: 34, bottom: 8, left: 4, right: 48 };
+// Web only. GestureDetector's touchAction prop is wiped when RNGH applies a gesture config, which
+// left touch-action: none on the chart and blocked vertical page scrolls that start on it.
+const PAGE_SCROLLS = { touchAction: 'pan-y' } as const;
 
 export function HistoryChart({
   samples,
@@ -69,31 +79,36 @@ export function HistoryChart({
     lastMarker.current = focus.kind === 'idle' ? null : focus.marker;
   }, [focus]);
 
-  const scrubAt = (x: number) => {
-    const pick = pickAt(geometry, x, MARKER_SLOP);
-    if (pick) {
-      dispatch({ type: 'scrub', pick });
-    }
-  };
-  const pan = usePanGesture({
-    runOnJS: true,
-    activeOffsetX: [-6, 6],
-    failOffsetY: [-14, 14],
-    onActivate: (event) => scrubAt(event.x),
-    onUpdate: (event) => scrubAt(event.x),
-    onFinalize: () => dispatch({ type: 'release' }),
-  });
-  const tap = useTapGesture({
-    runOnJS: true,
-    maxDistance: 10,
-    onActivate: (event) => {
-      const pick = pickAt(geometry, event.x, MARKER_SLOP);
+  // Stable configs keep RNGH from re-sending them to the handlers on every scrub frame.
+  const geometryRef = useRef(geometry);
+  useEffect(() => {
+    geometryRef.current = geometry;
+  }, [geometry]);
+  const configs = useMemo(() => {
+    const send = (type: 'scrub' | 'tap', x: number) => {
+      const pick = pickAt(geometryRef.current, x, MARKER_SLOP);
       if (pick) {
-        dispatch({ type: 'tap', pick });
+        dispatch({ type, pick });
       }
-    },
-  });
-  const gesture = useCompetingGestures(pan, tap);
+    };
+    const pan: PanGestureConfig = {
+      ...PAGE_SCROLLS,
+      runOnJS: true,
+      activeOffsetX: [-6, 6],
+      failOffsetY: [-14, 14],
+      onActivate: (event) => send('scrub', event.x),
+      onUpdate: (event) => send('scrub', event.x),
+      onFinalize: () => dispatch({ type: 'release' }),
+    };
+    const tap: TapGestureConfig = {
+      ...PAGE_SCROLLS,
+      runOnJS: true,
+      maxDistance: 10,
+      onActivate: (event) => send('tap', event.x),
+    };
+    return { pan, tap };
+  }, []);
+  const gesture = useCompetingGestures(usePanGesture(configs.pan), useTapGesture(configs.tap));
 
   const latest = samples[samples.length - 1];
   const shown = focus.kind === 'idle' ? latest : samples[focus.sample];
@@ -102,7 +117,7 @@ export function HistoryChart({
   const crossY = focus.kind === 'idle' ? null : geometry.ys[focus.sample];
   const markerX = marker && focus.kind !== 'idle' ? geometry.markers.find((item) => item.change === focus.marker)?.x : undefined;
   const lineX = markerX ?? crossX ?? 0;
-  const tipLeft = Math.min(Math.max(0, lineX - TIP_WIDTH / 2), Math.max(0, width - TIP_WIDTH));
+  const tipLeft = Math.min(Math.max(0, lineX - TIP_WIDTH / 2), Math.max(0, geometry.plotRight - TIP_WIDTH));
   const rangeMs = geometry.endMs - geometry.startMs;
 
   const onLayout = (event: LayoutChangeEvent) => {
