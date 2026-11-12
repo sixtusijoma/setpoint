@@ -10,6 +10,7 @@ import {
   formatReadoutTime,
   formatTooltipTime,
   idleFocus,
+  markerRug,
   nearestIndex,
   nearestMarker,
   pickAt,
@@ -342,6 +343,21 @@ function pick(sample: number, marker: number | null = null, samples = 10, marker
 }
 
 describe('chart geometry', () => {
+  it('turns a window crowded with changes into a rug of ticks', () => {
+    const domain = { startMs: Date.parse('2025-11-13T05:00:00.000Z'), endMs: Date.parse('2026-11-13T05:00:00.000Z') };
+    const yearOfChanges = Array.from({ length: 700 }, (_, index) =>
+      change(index, new Date(domain.startMs + index * 12 * 3600_000).toISOString()),
+    );
+    const year = chartGeometry(hourly(3), yearOfChanges, 'temperatureF', frame, domain);
+    const rug = markerRug(year);
+    expect(rug).not.toBeNull();
+    expect(new Set(rug).size).toBe(rug?.length);
+    expect(rug?.length).toBeLessThanOrEqual(Math.ceil(year.plotRight - year.plotLeft) + 1);
+    expect(year.markers).toHaveLength(700);
+    const month = chartGeometry(hourly(3), yearOfChanges.slice(0, 60), 'temperatureF', frame);
+    expect(markerRug(month)).toBeNull();
+  });
+
   it('maps samples and markers into the plot and labels min and max', () => {
     const samples = hourly(5);
     const changes = [change(0, '2026-11-11T02:00:00.000Z'), change(1, '2026-11-11T04:30:00.000Z')];
