@@ -16,6 +16,7 @@ import {
   handleMeter,
   handlePress,
   handlePrune,
+  handleRecalibrate,
   handleSession,
   handleState,
   handleTick,
@@ -443,6 +444,91 @@ describe('shared server', () => {
     });
   });
 
+  it('recalibrates the shared setpoint without pressing and logs the change', async () => {
+    const env = appEnv();
+    const before = await db.readState();
+    const recalibrate = (body: unknown, headers = appHeaders()) =>
+      handleRecalibrate(new Request('http://local/recalibrate', { method: 'POST', headers, body: JSON.stringify(body) }), {
+        db,
+        env,
+        now: () => wednesdayMorning,
+      });
+
+    const denied = await handleRecalibrate(new Request('http://local/recalibrate', { method: 'POST', body: '{}' }), { db, env });
+    expect(denied.status).toBe(401);
+
+    const fraction = await recalibrate({ temperatureF: 66.5 });
+    expect(fraction.status).toBe(400);
+    expect((await fraction.json()).error).toBe('Temperatures are whole degrees.');
+    const outside = await recalibrate({ temperatureF: 40 });
+    expect(outside.status).toBe(400);
+    expect((await outside.json()).error).toContain('outside 50-85°');
+    expect((await db.readState()).virtualSetpoint).toBe(70);
+
+    const saved = await recalibrate({ temperatureF: 66 });
+    expect(saved.status).toBe(200);
+    const body = await saved.json();
+    expect(body.previous).toBe(70);
+    expect(body.setpoint).toBe(66);
+    const after = await db.readState();
+    expect(body.version).toBe(after.version);
+    expect(after.virtualSetpoint).toBe(66);
+    expect(after.events).toEqual(before.events);
+    expect(after.hold).toEqual(before.hold);
+    expect(after.catchupFrom).toBe(before.catchupFrom);
+    expect(after.records).toEqual(before.records);
+    expect((await db.readLease()).phase).toBe('idle');
+    const changes = await pg.query<{ setpoint: number; source: string; label: string; changed_at: Date }>(
+      `select setpoint, source, label, changed_at from public.setpoint_changes order by id`,
+    );
+    expect(changes.rows.map(({ setpoint, source, label }) => ({ setpoint, source, label }))).toEqual([
+      { setpoint: 66, source: 'recalibrated', label: 'Recalibrated · 66°' },
+    ]);
+    expect(new Date(changes.rows[0]?.changed_at ?? 0).toISOString()).toBe(wednesdayMorning.toISOString());
+  });
+
+  it('refuses to recalibrate while a press is running', async () => {
+    const env = appEnv();
+    expect(await db.acquireLease('app', 60)).toBe(true);
+    const busy = await handleRecalibrate(
+      new Request('http://local/recalibrate', { method: 'POST', headers: appHeaders(), body: JSON.stringify({ temperatureF: 64 }) }),
+      { db, env },
+    );
+    expect(busy.status).toBe(409);
+    expect((await busy.json()).error).toBe('A press is running. Wait for it to finish before recalibrating.');
+    expect((await db.readState()).virtualSetpoint).toBe(70);
+    const lease = await db.readLease();
+    expect(lease.phase).toBe('running');
+    expect(lease.owner).toBe('app');
+    await db.releaseLease('app');
+    const changes = await pg.query<{ n: number }>(`select count(*)::int as n from public.setpoint_changes`);
+    expect(changes.rows[0]?.n).toBe(0);
+  });
+
+  it('recalibrates through the MCP tool without pressing', async () => {
+    const pressed: string[] = [];
+    const call = (temperatureF: unknown) =>
+      handleMcp(db, {
+        jsonrpc: '2.0',
+        id: 9,
+        method: 'tools/call',
+        params: { name: 'recalibrate', arguments: { temperatureF } },
+      }, {
+        press: async (direction) => {
+          pressed.push(direction);
+        },
+      });
+    const saved = await call(68);
+    expect(JSON.parse(textOf(saved))).toEqual({ previous: 70, setpoint: 68 });
+    expect((await db.readState()).virtualSetpoint).toBe(68);
+    const refused = await call(90);
+    expect(refused.result).toMatchObject({ isError: true });
+    expect(textOf(refused)).toContain('outside 50-85°');
+    expect(pressed).toEqual([]);
+    const changes = await pg.query<{ source: string }>(`select source from public.setpoint_changes`);
+    expect(changes.rows.map((row) => row.source)).toEqual(['recalibrated']);
+  });
+
   it('stores meter reads and rolls raw rows older than 30 days', async () => {
     const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
     const recent = new Date().toISOString();
@@ -475,6 +561,7 @@ describe('shared server', () => {
       'edit_schedule',
       'skip_wake',
       'run_schedule_now',
+      'recalibrate',
       'status',
     ]);
     const set = await handleMcp(db, {

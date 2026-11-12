@@ -16,6 +16,8 @@ export default function SettingsScreen() {
   const [secret, setSecret] = useState('');
   const [status, setStatus] = useState<string | null>(null);
   const [recalOpen, setRecalOpen] = useState(false);
+  const [recalError, setRecalError] = useState<string | null>(null);
+  const [recalSaving, setRecalSaving] = useState(false);
   const [recal, setRecal] = useState(app.state.virtualSetpoint ?? 70);
   const settings = app.state.settings;
   const outside =
@@ -229,6 +231,7 @@ export default function SettingsScreen() {
         testID="settings-recalibrate"
         onPress={() => {
           setRecal(app.state.virtualSetpoint ?? 70);
+          setRecalError(null);
           setRecalOpen(true);
         }}
       />
@@ -296,15 +299,25 @@ export default function SettingsScreen() {
           onMinus={() => setRecal((value) => Math.max(settings.minF, value - 1))}
           onPlus={() => setRecal((value) => Math.min(settings.maxF, value + 1))}
         />
+        {recalError ? (
+          <Text testID="settings-recalibrate-error" style={[styles.body, styles.recalError]}>
+            {recalError}
+          </Text>
+        ) : null}
         <PillButton
-          label="Save setpoint"
+          label={recalSaving ? 'Saving…' : 'Save setpoint'}
           testID="settings-recalibrate-save"
+          disabled={recalSaving}
           onPress={() => {
-            const reason = app.recalibrate(recal);
-            if (reason) {
-              return;
-            }
-            setRecalOpen(false);
+            void (async () => {
+              setRecalSaving(true);
+              const reason = await app.recalibrate(recal);
+              setRecalSaving(false);
+              setRecalError(reason);
+              if (!reason) {
+                setRecalOpen(false);
+              }
+            })();
           }}
         />
       </Sheet>
@@ -433,4 +446,5 @@ const styles = StyleSheet.create({
   device: { backgroundColor: colors.card, borderRadius: 12, padding: 12 },
   deviceText: { color: colors.text, fontFamily: fonts.medium, fontSize: 14 },
   sheetTitle: { color: colors.text, fontFamily: fonts.displayStrong, fontSize: 28 },
+  recalError: { color: colors.poor },
 });

@@ -361,3 +361,48 @@ function sleepUnless(ms: number, isCancelled: () => boolean): Promise<boolean> {
     }, 20);
   });
 }
+
+const RECALIBRATE_OWNER = 'recalibrate';
+const RECALIBRATE_LEASE_SECONDS = 15;
+
+export class RecalibrateError extends Error {
+  constructor(
+    message: string,
+    readonly kind: 'invalid' | 'busy',
+  ) {
+    super(message);
+    this.name = 'RecalibrateError';
+  }
+}
+
+export async function recalibrateShared(
+  db: SetpointDb,
+  input: { temperatureF: unknown; now?: () => Date },
+): Promise<{ previous: number | null; setpoint: number; version: number }> {
+  const now = input.now ?? (() => new Date());
+  const degrees = input.temperatureF;
+  if (typeof degrees !== 'number' || !Number.isInteger(degrees)) {
+    throw new RecalibrateError('Temperatures are whole degrees.', 'invalid');
+  }
+  const acquired = await db.acquireLease(RECALIBRATE_OWNER, RECALIBRATE_LEASE_SECONDS);
+  if (!acquired) {
+    throw new RecalibrateError('A press is running. Wait for it to finish before recalibrating.', 'busy');
+  }
+  try {
+    const state = await db.readState();
+    const { minF, maxF } = state.settings;
+    if (degrees < minF || degrees > maxF) {
+      throw new RecalibrateError(`${degrees}° is outside ${minF}-${maxF}°. Widen the range or pick a temperature inside it.`, 'invalid');
+    }
+    const saved = await patchRetry(db, { virtualSetpoint: degrees });
+    await db.insertChange({
+      at: now().toISOString(),
+      setpoint: degrees,
+      source: 'recalibrated',
+      label: `Recalibrated · ${degrees}°`,
+    });
+    return { previous: state.virtualSetpoint, setpoint: saved.virtualSetpoint ?? degrees, version: saved.version };
+  } finally {
+    await db.releaseLease(RECALIBRATE_OWNER);
+  }
+}

@@ -47,13 +47,13 @@ import {
   fetchRemoteSession,
   fetchState,
   readServerConfig,
+  recalibrateRemote,
   requestRemoteMeter,
   runRemotePress,
   saveRemoteCredentials,
   saveState,
   ServerAuthError,
   type ServerConfig,
-  type SharedSnapshot,
 } from '@/server/appClient';
 import { deleteAppKey, loadAppKey, saveAppKey } from '@/storage/appKey';
 import { clearCredentials, loadCredentials, maskSecret, saveCredentials } from '@/storage/credentials';
@@ -69,6 +69,20 @@ import {
   type Persisted,
   type Preset,
 } from '@/state/model';
+import {
+  acceptVersion,
+  applySnapshot,
+  canPull,
+  createSharedSync,
+  MAX_PUSH_CONFLICTS,
+  mergePulled,
+  noteLocalChange,
+  resetSync,
+  settlePush,
+  snapshotFrom,
+  takePatch,
+  type SharedSync,
+} from '@/state/sharedSync';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AppState, Platform, type AppStateStatus } from 'react-native';
 
@@ -116,7 +130,7 @@ type AppContextValue = {
   forgetCredentials: () => Promise<void>;
   mapRole: (role: 'up' | 'down' | 'meter', device: SwitchBotDevice | null) => void;
   completeCalibration: (temp: number) => void;
-  recalibrate: (temp: number) => string | null;
+  recalibrate: (temp: number) => Promise<string | null>;
   bump: (direction: 1 | -1) => Promise<void>;
   setTo: (target: number) => Promise<CommandResult>;
   applyPreset: (preset: Preset) => Promise<void>;
@@ -185,42 +199,6 @@ function changeMark(source: CommandSource, setpoint: number): { source: string; 
   return { source: 'manual', label: `Manual · ${setpoint}°` };
 }
 
-function snapshotFrom(state: Persisted, version: number): SharedSnapshot {
-  return {
-    version,
-    virtualSetpoint: state.virtualSetpoint,
-    catchupFrom: state.catchupFrom,
-    mode: 'live',
-    hold: state.hold,
-    settings: state.settings,
-    deviceMap: state.deviceMap,
-    presets: state.presets,
-    events: state.events,
-    records: state.records,
-    schedulePhase: state.schedulePhase,
-    catchupNote: state.catchupNote,
-    roomLabel: state.roomLabel,
-  };
-}
-
-function applySnapshot(prev: Persisted, snap: SharedSnapshot): Persisted {
-  return {
-    ...prev,
-    virtualSetpoint: snap.virtualSetpoint,
-    catchupFrom: snap.catchupFrom,
-    hold: snap.hold,
-    settings: { ...prev.settings, ...snap.settings },
-    deviceMap: snap.deviceMap,
-    presets: snap.presets,
-    events: snap.events,
-    records: snap.records,
-    schedulePhase: snap.schedulePhase,
-    catchupNote: snap.catchupNote,
-    roomLabel: snap.roomLabel || prev.roomLabel,
-    mode: 'live',
-  };
-}
-
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<Persisted>(() => createDefaultState(new Date().toISOString()));
   const [ready, setReady] = useState(false);
@@ -251,8 +229,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const saveChain = useRef<Promise<void>>(Promise.resolve());
   const saveLatest = useRef<Persisted | null>(null);
   const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const serverVersion = useRef(0);
+  const syncRef = useRef<SharedSync>(createSharedSync());
   const pullSharedRef = useRef<() => Promise<void>>(async () => undefined);
+  const pushSharedRef = useRef<() => void>(() => undefined);
 
   const showMessage = useCallback((next: AppMessage) => {
     const merged = next === null ? null : pushMessage(messageRef.current, next);
@@ -291,44 +270,61 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setState(next);
   }, []);
 
-  const pushShared = useCallback((next: Persisted) => {
+  const pushShared = useCallback(() => {
     const auth = sessionAuth();
-    if (!auth || next.mode !== 'live') {
+    if (!auth || stateRef.current.mode !== 'live') {
       return;
     }
     if (pushTimer.current) {
       clearTimeout(pushTimer.current);
     }
     pushTimer.current = setTimeout(() => {
-      void saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, serverVersion.current))
+      pushTimer.current = null;
+      const sync = syncRef.current;
+      if (sync.sending.size > 0) {
+        return;
+      }
+      const patch = takePatch(sync, stateRef.current);
+      if (!patch) {
+        return;
+      }
+      void saveState(auth.config, auth.appKey, patch)
         .then((saved) => {
-          serverVersion.current = saved.version;
-          if (saved.virtualSetpoint !== stateRef.current.virtualSetpoint) {
-            commit((prev) => ({ ...prev, virtualSetpoint: saved.virtualSetpoint }));
+          settlePush(sync, { ok: true, saved });
+          commit((prev) => mergePulled(sync, prev, saved) ?? prev);
+          if (sync.dirty.size > 0) {
+            pushSharedRef.current();
           }
         })
         .catch((error) => {
+          const conflict = error instanceof Error && error.message.includes('Pull and retry');
+          settlePush(sync, { ok: false, conflict });
           if (noteAuth(error)) {
             return;
           }
-          const text = explainError(error, appKeyRef.current);
-          if (text.includes('Pull and retry')) {
+          if (conflict && sync.conflicts < MAX_PUSH_CONFLICTS) {
             void pullSharedRef.current();
             return;
           }
-          showMessage({ source: 'link', text });
+          showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
         });
     }, 250);
   }, [commit, noteAuth, sessionAuth, showMessage]);
 
+  pushSharedRef.current = pushShared;
+
   const commitShared = useCallback(
     (recipe: (prev: Persisted) => Persisted) => {
-      const next = recipe(stateRef.current);
+      const prev = stateRef.current;
+      const next = recipe(prev);
+      if (next.mode === 'live' && sessionAuth()) {
+        noteLocalChange(syncRef.current, prev, next);
+      }
       stateRef.current = next;
       setState(next);
-      pushShared(next);
+      pushShared();
     },
-    [pushShared],
+    [pushShared, sessionAuth],
   );
 
   useEffect(() => {
@@ -371,12 +367,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
           if (cancelled) {
             return;
           }
-          serverVersion.current = snap.version;
+          acceptVersion(syncRef.current, snap.version);
           applyAccess({ type: 'accepted' });
           if (stateRef.current.mode === 'live') {
             if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
-              const saved = await saveState(config, key, snapshotFrom(stateRef.current, serverVersion.current));
-              serverVersion.current = saved.version;
+              const saved = await saveState(config, key, snapshotFrom(stateRef.current, syncRef.current.version));
+              acceptVersion(syncRef.current, saved.version);
             } else {
               commit((prev) => applySnapshot(prev, snap));
             }
@@ -426,18 +422,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const pullShared = useCallback(async () => {
     const auth = sessionAuth();
-    if (!auth || stateRef.current.mode !== 'live' || isRunning(sessionRef.current)) {
+    const sync = syncRef.current;
+    if (!auth || stateRef.current.mode !== 'live' || isRunning(sessionRef.current) || !canPull(sync)) {
       return;
     }
     try {
       const snap = await fetchState(auth.config, auth.appKey);
-      serverVersion.current = snap.version;
-      if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
-        const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, serverVersion.current));
-        serverVersion.current = saved.version;
+      if (!canPull(sync)) {
         return;
       }
-      commit((prev) => applySnapshot(prev, snap));
+      if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+        acceptVersion(sync, snap.version);
+        const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, sync.version));
+        acceptVersion(sync, saved.version);
+        return;
+      }
+      commit((prev) => mergePulled(sync, prev, snap) ?? prev);
+      if (sync.dirty.size > 0 && sync.sending.size === 0 && !pushTimer.current) {
+        pushSharedRef.current();
+      }
     } catch (error) {
       if (noteAuth(error)) {
         return;
@@ -885,7 +888,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         document.removeEventListener('visibilitychange', onVisible);
       }
     };
-  }, [commit, ready, state.virtualSetpoint]);
+  }, [commit, ready, state.virtualSetpoint === null]);
 
   useEffect(() => {
     return watchNotificationOpen(() => {
@@ -1077,7 +1080,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const snap = await fetchState(config, trimmed);
           await saveAppKey(trimmed);
           appKeyRef.current = trimmed;
-          serverVersion.current = snap.version;
+          resetSync(syncRef.current);
+          acceptVersion(syncRef.current, snap.version);
           applyAccess({ type: 'accepted' });
           if (stateRef.current.mode === 'live') {
             commit((prev) => applySnapshot(prev, snap));
@@ -1215,33 +1219,49 @@ export function AppProvider({ children }: { children: ReactNode }) {
           ),
         );
       },
-      recalibrate: (temp) => {
+      recalibrate: async (temp) => {
         const session = sessionRef.current;
         const written = writeSetpoint(stateRef.current.virtualSetpoint, { degrees: temp, source: 'recalibrated' }, session);
         if (!written.ok) {
-          showMessage({ source: 'press', text: written.reason });
           return written.reason;
         }
         const range = stateRef.current.settings;
         if (temp < range.minF || temp > range.maxF) {
-          const reason = `${temp}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
-          showMessage({ source: 'link', text: reason });
-          return reason;
+          return `${temp}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
         }
-        const at = new Date().toISOString();
-        commitShared((prev) =>
-          appendLog(
-            {
-              ...prev,
-              virtualSetpoint: temp,
-              changes: [...prev.changes, { at, setpoint: temp, source: 'manual', label: `Recalibrated · ${temp}°` }].slice(-400),
-            },
-            'calibration',
-            `Recalibrated the virtual setpoint to ${temp}°. No buttons were pressed.`,
-            at,
-          ),
-        );
-        return null;
+        const recalibrated = (setpoint: number, at: string) =>
+          commit((prev) =>
+            appendLog(
+              {
+                ...prev,
+                virtualSetpoint: setpoint,
+                changes: [...prev.changes, { at, setpoint, source: 'manual', label: `Recalibrated · ${setpoint}°` }].slice(-400),
+              },
+              'calibration',
+              `Recalibrated the virtual setpoint to ${setpoint}°. No buttons were pressed.`,
+              at,
+            ),
+          );
+        const auth = sessionAuth();
+        if (!auth || stateRef.current.mode !== 'live') {
+          recalibrated(temp, new Date().toISOString());
+          return null;
+        }
+        const sync = syncRef.current;
+        sync.recalibrating = true;
+        try {
+          const saved = await recalibrateRemote(auth.config, auth.appKey, temp);
+          acceptVersion(sync, saved.version);
+          recalibrated(saved.setpoint, new Date().toISOString());
+          return null;
+        } catch (error) {
+          if (noteAuth(error)) {
+            return 'The app key was rejected.';
+          }
+          return explainError(error, appKeyRef.current);
+        } finally {
+          sync.recalibrating = false;
+        }
       },
       bump: async (direction) => {
         const current = stateRef.current.virtualSetpoint;

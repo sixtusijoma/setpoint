@@ -43,7 +43,7 @@ The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be 
 
 `supabase/config.toml` sets `verify_jwt = false` for every function. Each function checks its own credential in one helper:
 
-- App functions (`state`, `press`, `session`, `history`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
+- App functions (`state`, `press`, `recalibrate`, `session`, `history`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
 - `meter` also accepts `x-setpoint-cron-secret` so the ten-minute job can keep running. A phone call still needs the app key.
 - `tick` and `prune` accept only `x-setpoint-cron-secret` matching `CRON_SECRET`.
 - `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`. The app key does not open it.
@@ -51,6 +51,7 @@ The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be 
 ```bash
 supabase functions deploy state
 supabase functions deploy press
+supabase functions deploy recalibrate
 supabase functions deploy session
 supabase functions deploy tick
 supabase functions deploy meter
@@ -112,7 +113,7 @@ Authorization: Bearer <SETPOINT_MCP_KEY>
 
 Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The function also accepts `Accept: application/json`. If the gateway asks for an `apikey` header, send the public anon key there. The function does not treat that header as the MCP secret.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history`, `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history`, `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), `status`.
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 

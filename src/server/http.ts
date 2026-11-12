@@ -1,7 +1,7 @@
 import { listDevices, pressBot, readMeter } from '../devices/switchbot';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
-import { deviceIds, executeSharedPress, runSchedulerTick, type PressTiming } from './engine';
+import { deviceIds, executeSharedPress, RecalibrateError, recalibrateShared, runSchedulerTick, type PressTiming } from './engine';
 import { appKeyMatches, sameSecret, type ServerEnv } from './env';
 import { handleMcp } from './mcp';
 import type { SetpointDb } from './sqlDb';
@@ -175,6 +175,26 @@ export async function handleState(request: Request, options: HandlerOptions): Pr
     return json(request, options.env, saved);
   }
   return json(request, options.env, { error: 'Method not allowed.' }, 405);
+}
+
+export async function handleRecalibrate(request: Request, options: HandlerOptions): Promise<Response> {
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
+  }
+  if (request.method !== 'POST') {
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
+  }
+  const body = (await request.json()) as { temperatureF?: unknown };
+  try {
+    const result = await recalibrateShared(options.db, { temperatureF: body.temperatureF, now: options.now });
+    return json(request, options.env, result);
+  } catch (error) {
+    if (error instanceof RecalibrateError) {
+      return json(request, options.env, { error: error.message }, error.kind === 'busy' ? 409 : 400);
+    }
+    throw error;
+  }
 }
 
 export async function handlePress(request: Request, options: HandlerOptions): Promise<Response> {

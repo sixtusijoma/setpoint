@@ -113,6 +113,14 @@ export function saveState(
   return call(config, appKey, 'state', { method: 'PUT', body: JSON.stringify(patch) });
 }
 
+export function recalibrateRemote(
+  config: ServerConfig,
+  appKey: string,
+  temperatureF: number,
+): Promise<{ previous: number | null; setpoint: number; version: number }> {
+  return call(config, appKey, 'recalibrate', { method: 'POST', body: JSON.stringify({ temperatureF }) });
+}
+
 export function runRemotePress(
   config: ServerConfig,
   appKey: string,

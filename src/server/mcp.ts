@@ -1,6 +1,6 @@
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
 import type { Occurrence } from '../domain/schedule';
-import { deviceIds, editScheduleEvent, executeSharedPress, storeMeterRead, type PressTiming } from './engine';
+import { deviceIds, editScheduleEvent, executeSharedPress, recalibrateShared, storeMeterRead, type PressTiming } from './engine';
 import type { SetpointDb } from './sqlDb';
 import type { CommandSource } from './types';
 
@@ -58,6 +58,15 @@ export const MCP_TOOLS = [
     name: 'run_schedule_now',
     description: 'Apply one schedule target now and mark that occurrence done early or late.',
     inputSchema: { type: 'object', properties: { eventId: { type: 'string' } }, required: ['eventId'] },
+  },
+  {
+    name: 'recalibrate',
+    description: 'Correct the tracked setpoint to what the thermostat display shows right now. Presses nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: { temperatureF: { type: 'number', description: 'What the thermostat display shows right now, in whole degrees F.' } },
+      required: ['temperatureF'],
+    },
   },
   {
     name: 'status',
@@ -151,6 +160,10 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
   }
   if (name === 'run_schedule_now') {
     return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press, deps.timing));
+  }
+  if (name === 'recalibrate') {
+    const saved = await recalibrateShared(db, { temperatureF: args.temperatureF, now });
+    return JSON.stringify({ previous: saved.previous, setpoint: saved.setpoint });
   }
   if (name === 'set_to' || name === 'nudge') {
     const state = await db.readState();

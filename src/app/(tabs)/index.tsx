@@ -27,6 +27,8 @@ export default function HomeScreen() {
     : (setpoint - app.state.settings.minF) / Math.max(1, app.state.settings.maxF - app.state.settings.minF);
   const [setToOpen, setSetToOpen] = useState(false);
   const [recalOpen, setRecalOpen] = useState(false);
+  const [recalError, setRecalError] = useState<string | null>(null);
+  const [recalSaving, setRecalSaving] = useState(false);
   const [draft, setDraft] = useState(setpoint);
   const [recal, setRecal] = useState(setpoint);
   const [resumeOpen, setResumeOpen] = useState(false);
@@ -114,6 +116,7 @@ export default function HomeScreen() {
 
   function openRecalibrate() {
     setRecal(setpoint);
+    setRecalError(null);
     setRecalOpen(true);
   }
 
@@ -361,15 +364,25 @@ export default function HomeScreen() {
           onMinus={() => setRecal((value) => Math.max(app.state.settings.minF, value - 1))}
           onPlus={() => setRecal((value) => Math.min(app.state.settings.maxF, value + 1))}
         />
+        {recalError ? (
+          <Text testID="recalibrate-error" style={[styles.sheetBody, styles.recalError]}>
+            {recalError}
+          </Text>
+        ) : null}
         <PillButton
-          label="Save setpoint"
+          label={recalSaving ? 'Saving…' : 'Save setpoint'}
           testID="recalibrate-save"
+          disabled={recalSaving}
           onPress={() => {
-            const reason = app.recalibrate(recal);
-            if (reason) {
-              return;
-            }
-            setRecalOpen(false);
+            void (async () => {
+              setRecalSaving(true);
+              const reason = await app.recalibrate(recal);
+              setRecalSaving(false);
+              setRecalError(reason);
+              if (!reason) {
+                setRecalOpen(false);
+              }
+            })();
           }}
         />
       </Sheet>
@@ -626,5 +639,8 @@ const styles = StyleSheet.create({
     fontFamily: fonts.body,
     fontSize: 15,
     lineHeight: 21,
+  },
+  recalError: {
+    color: colors.poor,
   },
 });
