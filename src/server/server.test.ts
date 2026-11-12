@@ -30,6 +30,7 @@ import { createSqlDb, type SetpointDb } from './sqlDb';
 const migration = [
   'supabase/migrations/20261111120000_setpoint.sql',
   'supabase/migrations/20261112120000_meter_import.sql',
+  'supabase/migrations/20261112180000_setpoint_change_pages.sql',
 ]
   .map((file) => readFileSync(path.join(process.cwd(), file), 'utf8'))
   .join('\n');
@@ -910,6 +911,80 @@ describe('shared server', () => {
     expect((await monthHttp.json()).samples.map((row: { co2Ppm: number }) => row.co2Ppm)).toEqual([333, 222, 111]);
   });
 
+  it('pages setpoint changes newest first with a cursor and keeps the span response', async () => {
+    const env = appEnv();
+    const start = Date.parse('2026-01-05T12:00:00.000Z');
+    for (let index = 0; index < 52; index += 1) {
+      await db.insertChange({
+        at: new Date(start + index * 6 * 60 * 60 * 1000).toISOString(),
+        setpoint: 60 + (index % 12),
+        source: index % 3 === 0 ? 'schedule' : 'manual',
+        label: `Change ${index}`,
+      });
+    }
+    const tie = new Date(start + 51 * 6 * 60 * 60 * 1000).toISOString();
+    await db.insertChange({ at: tie, setpoint: 71, source: 'manual', label: 'Change 52' });
+    const page = (cursor: string | null, limit = '20') => {
+      const params = new URLSearchParams({ view: 'changes', limit });
+      if (cursor) {
+        params.set('cursor', cursor);
+      }
+      return handleHistory(new Request(`http://local/history?${params.toString()}`, { headers: appHeaders() }), { db, env });
+    };
+
+    const labels: string[] = [];
+    const sizes: number[] = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 10; guard += 1) {
+      const response = await page(cursor);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { changes: { label: string; at: string }[]; nextCursor: string | null };
+      expect(Object.keys(body).sort()).toEqual(['changes', 'nextCursor']);
+      sizes.push(body.changes.length);
+      labels.push(...body.changes.map((change) => change.label));
+      cursor = body.nextCursor;
+      if (!cursor) {
+        break;
+      }
+    }
+    expect(sizes).toEqual([20, 20, 13]);
+    expect(labels).toHaveLength(53);
+    expect(new Set(labels).size).toBe(53);
+    expect(labels.slice(0, 3)).toEqual(['Change 52', 'Change 51', 'Change 50']);
+    expect(labels[labels.length - 1]).toBe('Change 0');
+
+    const exact = await (await page(null, '53')).json();
+    expect(exact.changes).toHaveLength(53);
+    expect(exact.nextCursor).toBeNull();
+    const clamped = await (await page(null, '5000')).json();
+    expect(clamped.changes).toHaveLength(53);
+    const tiny = await (await page(null, '0')).json();
+    expect(tiny.changes).toHaveLength(1);
+    const defaulted = await (await page(null, 'lots')).json();
+    expect(defaulted.changes).toHaveLength(20);
+
+    const bad = await page('not-a-cursor');
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toContain('cursor');
+    const denied = await handleHistory(new Request('http://local/history?view=changes'), { db, env });
+    expect(denied.status).toBe(401);
+
+    const legacy = await handleHistory(new Request('http://local/history?span=day', { headers: appHeaders() }), {
+      db,
+      env,
+      now: () => new Date(start + 52 * 6 * 60 * 60 * 1000),
+    });
+    const legacyBody = await legacy.json();
+    expect(Object.keys(legacyBody).sort()).toEqual(['changes', 'samples']);
+    expect(legacyBody.changes.map((change: { label: string }) => change.label).sort()).toEqual([
+      'Change 48',
+      'Change 49',
+      'Change 50',
+      'Change 51',
+      'Change 52',
+    ]);
+  });
+
   it('keeps import-meter on the app key', async () => {
     const env = appEnv();
     const csv = 'Timestamp,Temperature(°F),Humidity(%),CO2\n2026-11-11 6:51 PM,70,47,740\n';
@@ -983,7 +1058,11 @@ describe('rest client', () => {
         if (String(input).endsWith('/import_meter_reads')) {
           return new Response(JSON.stringify({ inserted: 1 }));
         }
-        if (String(input).endsWith('/list_meter_reads') || String(input).endsWith('/list_setpoint_changes')) {
+        if (
+          String(input).endsWith('/list_meter_reads') ||
+          String(input).endsWith('/list_setpoint_changes') ||
+          String(input).endsWith('/list_setpoint_changes_page')
+        ) {
           return new Response('[]');
         }
         return new Response('true');
@@ -1011,6 +1090,14 @@ describe('rest client', () => {
       p_until: '2026-05-01T00:00:00.000Z',
       p_bucket_seconds: 7200,
     });
+    const firstPage = await db.listChangesPage(null, 15);
+    expect(firstPage).toEqual({ changes: [], more: false });
+    await db.listChangesPage({ at: '2026-04-21T17:39:04+00:00', id: 42 }, 15);
+    const pageCalls = calls.filter((call) => call.url.endsWith('/list_setpoint_changes_page'));
+    expect(pageCalls.map((call) => JSON.parse(call.body))).toEqual([
+      { p_before_at: null, p_before_id: null, p_limit: 16 },
+      { p_before_at: '2026-04-21T17:39:04+00:00', p_before_id: 42, p_limit: 16 },
+    ]);
   });
 });
 

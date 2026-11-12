@@ -83,6 +83,107 @@ export function historyQuery(input: { span?: unknown; since?: unknown; until?: u
   };
 }
 
+export const CHANGE_PAGE_DEFAULT = 20;
+export const CHANGE_PAGE_MAX = 100;
+
+export type ChangePage = {
+  changes: SetpointChange[];
+  nextCursor: string | null;
+};
+
+export type ChangeCursor = {
+  at: string;
+  id: number;
+};
+
+export type ChangePageQuery = {
+  limit: number;
+  before: ChangeCursor | null;
+};
+
+function toBase64Url(text: string): string {
+  return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fromBase64Url(text: string): string | null {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) {
+    return null;
+  }
+  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (text.length % 4)) % 4);
+  try {
+    return atob(padded);
+  } catch {
+    return null;
+  }
+}
+
+export function encodeChangeCursor(cursor: ChangeCursor): string {
+  return toBase64Url(`${cursor.id}|${cursor.at}`);
+}
+
+export function decodeChangeCursor(value: string): ChangeCursor | null {
+  const text = fromBase64Url(value);
+  const match = text?.match(/^(\d{1,18})\|(.+)$/);
+  if (!match) {
+    return null;
+  }
+  const id = Number(match[1]);
+  const at = match[2];
+  if (!Number.isSafeInteger(id) || !Number.isFinite(Date.parse(at))) {
+    return null;
+  }
+  return { id, at };
+}
+
+export function changePageQuery(input: { limit?: string | null; cursor?: string | null }): ChangePageQuery {
+  const parsed = Number(input.limit);
+  const limit =
+    input.limit && Number.isFinite(parsed)
+      ? Math.min(CHANGE_PAGE_MAX, Math.max(1, Math.floor(parsed)))
+      : CHANGE_PAGE_DEFAULT;
+  if (!input.cursor) {
+    return { limit, before: null };
+  }
+  const before = decodeChangeCursor(input.cursor);
+  if (!before) {
+    throw new Error('That page cursor is not valid. Start again from the newest change.');
+  }
+  return { limit, before };
+}
+
+export function newestFirst(changes: SetpointChange[]): SetpointChange[] {
+  return changes
+    .filter((change) => Number.isFinite(Date.parse(change.at)))
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+}
+
+export function readChangePage(payload: { changes?: unknown; nextCursor?: unknown }): ChangePage {
+  const changes = Array.isArray(payload.changes) ? (payload.changes as SetpointChange[]) : [];
+  if (!('nextCursor' in payload)) {
+    return { changes: newestFirst(changes), nextCursor: null };
+  }
+  return {
+    changes,
+    nextCursor: typeof payload.nextCursor === 'string' && payload.nextCursor ? payload.nextCursor : null,
+  };
+}
+
+export function pageLocalChanges(changes: SetpointChange[], cursor: string | null, limit: number): ChangePage {
+  const offset = cursor === null ? 0 : Number(cursor);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error('That page cursor is not valid. Start again from the newest change.');
+  }
+  const size = Math.max(1, Math.floor(limit));
+  const ordered = newestFirst(changes);
+  const page = ordered.slice(offset, offset + size);
+  const next = offset + page.length;
+  return { changes: page, nextCursor: next < ordered.length ? String(next) : null };
+}
+
+export function changeKey(change: SetpointChange): string {
+  return `${change.at}|${change.setpoint}|${change.source}|${change.label}`;
+}
+
 export function sliceWindow(samples: HistorySample[], now: Date, span: HistorySpan): HistorySample[] {
   const start = now.getTime() - spanWindowMs(span);
   return samples
