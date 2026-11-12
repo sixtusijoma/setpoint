@@ -12,6 +12,12 @@ export type CommandSource =
   | { kind: 'retry' }
   | { kind: 'run-now'; eventId: string; label: string; occurrenceKey: string };
 
+export const PRESS_SPACING_MS: Readonly<Record<Direction, number>> = { down: 5000, up: 6000 };
+
+export function pressGapMs(direction: Direction, delayMs: number): number {
+  return Math.max(delayMs, PRESS_SPACING_MS[direction]);
+}
+
 export type SessionStatus = 'done' | 'cancelled' | 'failed' | 'ambiguous' | 'already' | 'refused' | 'busy';
 
 export type RunningSession = {
@@ -58,6 +64,7 @@ export type SessionEvent =
   | { type: 'rejected'; reason: string }
   | { type: 'ambiguous'; reason: string }
   | { type: 'wait-elapsed' }
+  | { type: 'out-of-time' }
   | { type: 'interrupt' };
 
 export function idleSession(): PressSession {
@@ -272,6 +279,21 @@ export function reduceSession(session: PressSession, event: SessionEvent): Press
     });
   }
 
+  if (event.type === 'out-of-time') {
+    if (session.phase === 'in-flight') {
+      return session;
+    }
+    return settle({
+      status: 'failed',
+      stoppedAt: session.setpoint,
+      wanted: session.target,
+      reason: `Out of server time after ${session.actionIndex} of ${session.actions.length} presses. The rest were not sent. Send it again to finish.`,
+      committedAdjusts: session.committedAdjusts,
+      notifyCheck: false,
+      source: session.source,
+    });
+  }
+
   if (event.type === 'wait-elapsed') {
     if (session.phase !== 'waiting') {
       return session;
@@ -360,6 +382,7 @@ export type RunPressInput = {
   mode: Mode;
   plan: SetPlan;
   delayMs: number;
+  timeLimit?: { endsAt: number; perPressMs: number; now: () => number };
   press: (direction: Direction, signal: AbortSignal) => Promise<void>;
   sleep: (ms: number, isCancelled: () => boolean) => Promise<boolean>;
   beforeSend: (index: number, isCancelled: () => boolean) => Promise<boolean>;
@@ -419,7 +442,14 @@ export async function runPressSession(input: RunPressInput): Promise<SettledSess
 
   while (isRunning(session)) {
     if (session.phase === 'waiting') {
-      const aborted = await input.sleep(input.delayMs, () => input.isCancelled() || input.isInterrupted());
+      const next = session.actions[session.actionIndex];
+      const gap = next ? pressGapMs(next.direction, input.delayMs) : input.delayMs;
+      const limit = input.timeLimit;
+      if (limit && limit.now() + gap + limit.perPressMs > limit.endsAt) {
+        session = reduceSession(session, { type: 'out-of-time' });
+        return asSettled(publish(session) ?? session);
+      }
+      const aborted = await input.sleep(gap, () => input.isCancelled() || input.isInterrupted());
       if (input.isInterrupted() && !input.isCancelled()) {
         session = reduceSession(session, { type: 'interrupt' });
         return asSettled(publish(session) ?? session);

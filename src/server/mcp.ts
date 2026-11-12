@@ -1,6 +1,6 @@
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
 import type { Occurrence } from '../domain/schedule';
-import { deviceIds, editScheduleEvent, executeSharedPress, storeMeterRead } from './engine';
+import { deviceIds, editScheduleEvent, executeSharedPress, storeMeterRead, type PressTiming } from './engine';
 import type { SetpointDb } from './sqlDb';
 import type { CommandSource } from './types';
 
@@ -68,6 +68,7 @@ export const MCP_TOOLS = [
 type ToolDeps = {
   now?: () => Date;
   armMs?: number;
+  timing?: PressTiming;
   press?: (direction: 'up' | 'down', signal: AbortSignal) => Promise<void>;
   readMeter?: () => Promise<{ temperatureF: number; humidity: number; co2Ppm: number }>;
 };
@@ -147,7 +148,7 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     return JSON.stringify(await skipTool(db, args, now));
   }
   if (name === 'run_schedule_now') {
-    return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press));
+    return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press, deps.timing));
   }
   if (name === 'set_to' || name === 'nudge') {
     const state = await db.readState();
@@ -158,7 +159,7 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
       ? Number(args.temperatureF)
       : state.virtualSetpoint + (args.direction === 'down' ? -state.settings.step : state.settings.step);
     const source: CommandSource = name === 'set_to' ? { kind: 'set-to' } : { kind: 'manual' };
-    const result = await executeSharedPress(db, { target, source, owner: 'mcp', now, armMs: deps.armMs ?? 400, press });
+    const result = await executeSharedPress(db, { target, source, owner: 'mcp', now, armMs: deps.armMs ?? 400, timing: deps.timing, press });
     return JSON.stringify(result);
   }
   throw new Error('Unknown tool');
@@ -209,6 +210,7 @@ async function runNowTool(
   eventId: string,
   now: () => Date,
   press: (direction: 'up' | 'down', signal: AbortSignal) => Promise<void>,
+  pressTiming?: PressTiming,
 ): Promise<unknown> {
   const state = await db.readState();
   const event = state.events.find((item) => item.id === eventId);
@@ -225,6 +227,7 @@ async function runNowTool(
     owner: 'mcp',
     now,
     armMs: 0,
+    timing: pressTiming,
     press,
   });
   if (result.status !== 'done' && result.status !== 'already') {

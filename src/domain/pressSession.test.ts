@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { executePlan, sleepUnlessCancelled } from '@/domain/execute';
 import { planSetTo, type PressAction } from '@/domain/planSetTo';
 import {
   classifyPressError,
   idleSession,
   PressOutcomeError,
+  PRESS_SPACING_MS,
+  pressGapMs,
   reduceSession,
   runPressSession,
   sessionProgress,
@@ -289,5 +292,127 @@ describe('classifyPressError', () => {
     timeout.name = 'TimeoutError';
     expect(classifyPressError(timeout).kind).toBe('ambiguous');
     expect(classifyPressError(new Error('device offline')).kind).toBe('rejected');
+  });
+});
+
+describe('press spacing', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function timedRun(current: number, target: number, cancelAfterPress?: number) {
+    const plan = planSetTo({ current, target, step: 1, minF: 50, maxF: 85, pressCap: 15, wakeFirst: false });
+    if (!plan.ok) {
+      throw new Error(plan.reason);
+    }
+    const log: { direction: string; startedAt: number; returnedAt: number }[] = [];
+    let cancelled = false;
+    const run = executePlan(plan, current, {
+      pressUp: async () => {
+        const startedAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        log.push({ direction: 'up', startedAt, returnedAt: Date.now() });
+        if (log.length === cancelAfterPress) {
+          cancelled = true;
+        }
+      },
+      pressDown: async () => {
+        const startedAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        log.push({ direction: 'down', startedAt, returnedAt: Date.now() });
+        if (log.length === cancelAfterPress) {
+          cancelled = true;
+        }
+      },
+      delayMs: 1000,
+      sleep: sleepUnlessCancelled,
+      isCancelled: () => cancelled,
+      onProgress: () => undefined,
+      onCommitted: () => undefined,
+    });
+    return { run, log };
+  }
+
+  function gapsOf(log: { startedAt: number; returnedAt: number }[]): number[] {
+    return log.slice(1).map((entry, index) => entry.startedAt - (log[index]?.returnedAt ?? 0));
+  }
+
+  it('waits at least 5 seconds between down presses, measured from the last return', async () => {
+    vi.useFakeTimers();
+    const { run, log } = timedRun(70, 65);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await run;
+    expect(result.status).toBe('done');
+    expect(result.completedPresses).toBe(5);
+    expect(log).toHaveLength(5);
+    expect(gapsOf(log).every((gap) => gap >= PRESS_SPACING_MS.down)).toBe(true);
+    expect(gapsOf(log).every((gap) => gap < PRESS_SPACING_MS.down + 100)).toBe(true);
+  });
+
+  it('waits at least 6 seconds between up presses', async () => {
+    vi.useFakeTimers();
+    const { run, log } = timedRun(70, 73);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect((await run).status).toBe('done');
+    expect(gapsOf(log)).toHaveLength(2);
+    expect(gapsOf(log).every((gap) => gap >= PRESS_SPACING_MS.up)).toBe(true);
+  });
+
+  it('cancels during the wait without sending the rest', async () => {
+    vi.useFakeTimers();
+    const { run, log } = timedRun(70, 65, 2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await run;
+    expect(result.status).toBe('cancelled');
+    expect(result.completedPresses).toBe(2);
+    expect(result.stoppedAt).toBe(68);
+    expect(log).toHaveLength(2);
+  });
+
+  it('keeps a longer configured delay', () => {
+    expect(pressGapMs('down', 1000)).toBe(5000);
+    expect(pressGapMs('up', 1000)).toBe(6000);
+    expect(pressGapMs('down', 8000)).toBe(8000);
+  });
+});
+
+describe('press time limit', () => {
+  it('stops before a press that could not finish in time and never reports it done', async () => {
+    let clock = 0;
+    const presses: string[] = [];
+    const sessions: PressSession[] = [];
+    const plan = planSetTo({ current: 70, target: 79, step: 1, minF: 50, maxF: 85, pressCap: 15, wakeFirst: false });
+    const settled = await runPressSession({
+      current: 70,
+      target: 79,
+      source,
+      mode: 'live',
+      plan,
+      delayMs: 0,
+      timeLimit: { endsAt: 30_000, perPressMs: 12_000, now: () => clock },
+      press: async (direction) => {
+        presses.push(direction);
+        clock += 1000;
+      },
+      sleep: async (ms) => {
+        clock += ms;
+        return false;
+      },
+      beforeSend: async () => false,
+      isCancelled: () => false,
+      isInterrupted: () => false,
+      onSession: (session) => sessions.push(session),
+    });
+    expect(presses).toEqual(['up', 'up', 'up']);
+    expect(settled.status).toBe('failed');
+    expect(settled.stoppedAt).toBe(73);
+    expect(settled.committedAdjusts).toBe(3);
+    expect(settled.reason).toContain('Out of server time after 3 of 9 presses');
+    expect(sessions.some((session) => session.phase === 'settled' && session.status === 'done')).toBe(false);
+  });
+
+  it('ignores the time limit while a press is in flight', () => {
+    const inflight = reduceSession(armed(), { type: 'begin-send' });
+    expect(reduceSession(inflight, { type: 'out-of-time' })).toBe(inflight);
   });
 });

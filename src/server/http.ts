@@ -1,7 +1,7 @@
 import { listDevices, pressBot, readMeter } from '../devices/switchbot';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
-import { deviceIds, executeSharedPress, runSchedulerTick } from './engine';
+import { deviceIds, executeSharedPress, runSchedulerTick, type PressTiming } from './engine';
 import { appKeyMatches, sameSecret, type ServerEnv } from './env';
 import { handleMcp } from './mcp';
 import type { SetpointDb } from './sqlDb';
@@ -11,6 +11,7 @@ export type HandlerOptions = {
   db: SetpointDb;
   env: ServerEnv;
   now?: () => Date;
+  timing?: PressTiming;
   pressDevice?: (deviceId: string, signal: AbortSignal) => Promise<void>;
   readMeterDevice?: (deviceId: string) => Promise<{ temperatureF: number; humidity: number; co2Ppm: number }>;
   listRemoteDevices?: () => Promise<{ deviceId: string; deviceName: string; deviceType: string; enableCloudService: boolean | null; hubDeviceId: string }[]>;
@@ -205,6 +206,7 @@ export async function handlePress(request: Request, options: HandlerOptions): Pr
     owner: 'app',
     now: options.now,
     armMs: 400,
+    timing: options.timing,
     press: await pressWith(options, state),
   });
   return json(request, options.env, result);
@@ -233,6 +235,7 @@ export async function handleTick(request: Request, options: HandlerOptions): Pro
   const state = await options.db.readState();
   const result = await runSchedulerTick(options.db, {
     now: options.now,
+    timing: options.timing,
     press: await pressWith(options, state),
   });
   return json(request, options.env, result);
@@ -359,6 +362,7 @@ export async function handleMcpRequest(request: Request, options: HandlerOptions
   const state = await options.db.readState();
   const result = await handleMcp(options.db, body, {
     now: options.now,
+    timing: options.timing,
     press: await pressWith(options, state),
     readMeter: meterReader(options),
   });

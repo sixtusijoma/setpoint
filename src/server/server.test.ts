@@ -3,9 +3,10 @@ import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { PressOutcomeError } from '../domain/pressSession';
+import { PRESS_SPACING_MS, PressOutcomeError } from '../domain/pressSession';
+import { SWITCHBOT_TIMEOUT_MS } from '../devices/switchbot';
 import { hashAppKey, type ServerEnv } from './env';
-import { editScheduleEvent, executeSharedPress, runSchedulerTick } from './engine';
+import { editScheduleEvent, executeSharedPress, runSchedulerTick, SERVER_WALL_CLOCK_MS, serverDeadline } from './engine';
 import {
   APP_KEY_HEADER,
   handleCredentials,
@@ -38,6 +39,14 @@ const bot = (id: string) => ({
 
 const settings = { step: 1, delayMs: 0, minF: 50, maxF: 85, pressCap: 15, wakeFirst: false };
 const wednesdayMorning = new Date('2026-11-11T15:00:00.000Z');
+
+const gaps: number[] = [];
+const fast = {
+  sleep: async (ms: number, isCancelled: () => boolean) => {
+    gaps.push(ms);
+    return isCancelled();
+  },
+};
 
 describe('shared server', () => {
   const pg = new PGlite();
@@ -110,6 +119,7 @@ describe('shared server', () => {
       target: 72,
       source: { kind: 'set-to' },
       owner: 'test',
+      timing: fast,
       press: async (direction) => {
         presses.push(direction);
       },
@@ -131,6 +141,7 @@ describe('shared server', () => {
       target: 71,
       source: { kind: 'manual' },
       owner: 'test',
+      timing: fast,
       press: async () => {
         throw new PressOutcomeError('The response was lost.', 'ambiguous');
       },
@@ -150,6 +161,7 @@ describe('shared server', () => {
       target: 71,
       source: { kind: 'manual' },
       owner: 'test',
+      timing: fast,
       press: async () => {
         throw new PressOutcomeError('The up bot did not respond.', 'rejected');
       },
@@ -160,6 +172,7 @@ describe('shared server', () => {
       target: 70,
       source: { kind: 'preset', label: 'Home' },
       owner: 'test',
+      timing: fast,
       press: async () => {
         throw new Error('should not press');
       },
@@ -168,12 +181,82 @@ describe('shared server', () => {
     expect((await db.readState()).hold).toBeNull();
   });
 
+  it('spaces shared presses per direction for set_to, nudge, and the schedule', async () => {
+    gaps.length = 0;
+    const down = await executeSharedPress(db, {
+      target: 65,
+      source: { kind: 'set-to' },
+      owner: 'test',
+      timing: fast,
+      press: async () => undefined,
+    });
+    expect(down.status).toBe('done');
+    expect(gaps).toEqual([5000, 5000, 5000, 5000]);
+
+    gaps.length = 0;
+    await db.patchState(null, { hold: null });
+    const up = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'set_to', arguments: { temperatureF: 68 } },
+    }, { armMs: 0, timing: fast, press: async () => undefined });
+    expect(textOf(up)).toContain('"status":"done"');
+    expect(gaps).toEqual([6000, 6000]);
+
+    gaps.length = 0;
+    await db.patchState(null, { hold: null, virtualSetpoint: 68, catchupFrom: '2026-11-11T01:00:00.000Z' });
+    const tick = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined });
+    expect(tick.apply).not.toBeNull();
+    expect(gaps).toEqual([6000]);
+  });
+
+  it('stops a long run before the server time limit and keeps the presses it sent', async () => {
+    let clock = 0;
+    const presses: string[] = [];
+    const result = await executeSharedPress(db, {
+      target: 79,
+      source: { kind: 'set-to' },
+      owner: 'test',
+      timing: {
+        clock: () => clock,
+        deadlineAt: 30_000,
+        sleep: async (ms) => {
+          clock += ms;
+          return false;
+        },
+      },
+      press: async (direction) => {
+        presses.push(direction);
+        clock += 1000;
+      },
+    });
+    expect(presses).toHaveLength(3);
+    expect(result.status).toBe('failed');
+    expect(result.stoppedAt).toBe(73);
+    expect(result.reason).toContain('Out of server time after 3 of 9 presses');
+    const state = await db.readState();
+    expect(state.virtualSetpoint).toBe(73);
+    const changes = await pg.query<{ n: number }>(`select count(*)::int as n from public.setpoint_changes`);
+    expect(changes.rows[0]?.n).toBe(3);
+    expect((await db.readLease()).phase).toBe('idle');
+  });
+
+  it('leaves room for a nine-press run up inside the worker limit', () => {
+    const budget = serverDeadline(0);
+    const typicalPressMs = 2000;
+    const lastPressStarts = 8 * (typicalPressMs + PRESS_SPACING_MS.up);
+    expect(budget).toBeLessThanOrEqual(SERVER_WALL_CLOCK_MS - 10_000);
+    expect(lastPressStarts + SWITCHBOT_TIMEOUT_MS).toBeLessThan(budget);
+  });
+
   it('cancels before the first press is sent', async () => {
     let presses = 0;
     const pending = executeSharedPress(db, {
       target: 73,
       source: { kind: 'manual' },
       owner: 'test',
+      timing: fast,
       armMs: 120,
       press: async () => {
         presses += 1;
@@ -199,6 +282,7 @@ describe('shared server', () => {
       target: 72,
       source: { kind: 'set-to' },
       owner: 'test',
+      timing: fast,
       press: async () => {
         presses += 1;
         if (presses === 1) {
@@ -243,6 +327,7 @@ describe('shared server', () => {
     const presses: string[] = [];
     const outcome = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
+      timing: fast,
       press: async (direction) => {
         presses.push(direction);
       },
@@ -263,10 +348,10 @@ describe('shared server', () => {
       id: 1,
       method: 'tools/call',
       params: { name: 'skip_wake', arguments: { eventId: 'default-wake', date: '2026-11-11' } },
-    }, { now: () => wednesdayMorning, armMs: 0, press: async () => undefined });
+    }, { now: () => wednesdayMorning, armMs: 0, timing: fast, press: async () => undefined });
     const skippedText = textOf(skipped);
     expect(skippedText).toContain('default-wake');
-    const quiet = await runSchedulerTick(db, { now: () => wednesdayMorning, press: async () => undefined });
+    const quiet = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined });
     expect(quiet.apply).toBeNull();
     const state = await db.readState();
     const skip = state.records.find((record) => record.eventId === 'default-wake' && record.status === 'skipped');
@@ -294,6 +379,7 @@ describe('shared server', () => {
     }, {
       now: () => wednesdayMorning,
       armMs: 0,
+      timing: fast,
       press: async () => undefined,
     });
     expect(textOf(ran)).toContain('done-late');
@@ -302,6 +388,7 @@ describe('shared server', () => {
     expect(after.hold).toBeNull();
     const again = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
+      timing: fast,
       press: async () => {
         throw new Error('should not press a finished wake');
       },
@@ -358,7 +445,7 @@ describe('shared server', () => {
       id: 2,
       method: 'tools/call',
       params: { name: 'set_to', arguments: { temperatureF: 72 } },
-    }, { armMs: 0, press: async () => undefined });
+    }, { armMs: 0, timing: fast, press: async () => undefined });
     expect(textOf(set)).toContain('done');
     const row = await pg.query<{ virtual_setpoint: number }>(`select virtual_setpoint from public.shared_state where id = 1`);
     expect(row.rows[0]?.virtual_setpoint).toBe(72);
@@ -383,7 +470,7 @@ describe('shared server', () => {
         headers: { Authorization: 'Bearer mcp-placeholder', 'Content-Type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/list' }),
       }),
-      { db, env, pressDevice: async () => undefined },
+      { db, env, pressDevice: async () => undefined, timing: fast },
     );
     expect(allowed.status).toBe(200);
   });
@@ -449,7 +536,7 @@ describe('shared server', () => {
     await db.patchState(null, { virtualSetpoint: 68, catchupFrom: '2026-11-11T01:00:00.000Z' });
     const tick = await handleTick(
       new Request('http://local/tick', { method: 'POST', headers: { 'x-setpoint-cron-secret': 'cron-placeholder' } }),
-      { db, env, now: () => wednesdayMorning, pressDevice: async () => undefined },
+      { db, env, now: () => wednesdayMorning, pressDevice: async () => undefined, timing: fast },
     );
     const body = await tick.json();
     expect(body.note).toBe('Sleep was missed, applied Wake.');
@@ -468,7 +555,7 @@ describe('shared server', () => {
         headers: { [APP_KEY_HEADER]: 'not-the-key', 'Content-Type': 'application/json' },
         body: JSON.stringify({ target: 71, source: { kind: 'manual' } }),
       }),
-      { db, env, pressDevice: async () => undefined },
+      { db, env, pressDevice: async () => undefined, timing: fast },
     );
     expect(wrong.status).toBe(401);
 
@@ -493,7 +580,7 @@ describe('shared server', () => {
         headers: appHeaders(),
         body: JSON.stringify({ target: 71, source: { kind: 'manual' } }),
       }),
-      { db, env, pressDevice: async () => undefined },
+      { db, env, pressDevice: async () => undefined, timing: fast },
     );
     expect(pressed.status).toBe(200);
     const session = await handleSession(new Request('http://local/session', { headers: appHeaders() }), { db, env });

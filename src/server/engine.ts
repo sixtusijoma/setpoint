@@ -10,10 +10,26 @@ import {
 import { holdFor, scheduleEditResetsCursor, type ScheduleEvent } from '../domain/schedule';
 import { runDueSchedule } from '../domain/scheduleRunner';
 import type { HistorySample } from '../domain/history';
+import { SWITCHBOT_TIMEOUT_MS } from '../devices/switchbot';
 import type { SetpointDb } from './sqlDb';
 import type { CommandResult, ServerDeviceMap, SharedSnapshot } from './types';
 
 const LEASE_SECONDS = 180;
+const LEASE_POLL_MS = 250;
+
+export const SERVER_WALL_CLOCK_MS = 150_000;
+export const SERVER_TIME_MARGIN_MS = 20_000;
+const workerStartedAt = Date.now();
+
+export type PressTiming = {
+  sleep?: (ms: number, isCancelled: () => boolean) => Promise<boolean>;
+  clock?: () => number;
+  deadlineAt?: number;
+};
+
+export function serverDeadline(startedAt: number = workerStartedAt): number {
+  return startedAt + SERVER_WALL_CLOCK_MS - SERVER_TIME_MARGIN_MS;
+}
 
 function changeLabel(source: CommandSource, setpoint: number): { source: string; label: string } {
   if (source.kind === 'run-now' && source.label === 'Sleep') {
@@ -53,6 +69,7 @@ export async function executeSharedPress(
     owner: string;
     now?: () => Date;
     armMs?: number;
+    timing?: PressTiming;
     press: (direction: Direction, signal: AbortSignal) => Promise<void>;
   },
 ): Promise<CommandResult> {
@@ -76,7 +93,7 @@ export async function executeSharedPress(
       }
     });
     void db.touchLease(input.owner, LEASE_SECONDS);
-  }, 50);
+  }, LEASE_POLL_MS);
   try {
     if (initial.virtualSetpoint === null) {
       return {
@@ -112,8 +129,13 @@ export async function executeSharedPress(
       mode: 'live',
       plan,
       delayMs: initial.settings.delayMs,
+      timeLimit: {
+        endsAt: input.timing?.deadlineAt ?? serverDeadline(),
+        perPressMs: SWITCHBOT_TIMEOUT_MS,
+        now: input.timing?.clock ?? Date.now,
+      },
       press: input.press,
-      sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
+      sleep: input.timing?.sleep ?? ((ms, isCancelled) => sleepUnless(ms, isCancelled)),
       beforeSend: async (index) => {
         if (index === 0 && (input.armMs ?? 0) > 0) {
           const started = Date.now();
@@ -176,6 +198,7 @@ export async function runSchedulerTick(
   input: {
     owner?: string;
     now?: () => Date;
+    timing?: PressTiming;
     press: (direction: Direction, signal: AbortSignal) => Promise<void>;
   },
 ): Promise<{ apply: string | null; note: string | null }> {
@@ -204,6 +227,7 @@ export async function runSchedulerTick(
         source: { kind: 'schedule' },
         owner: input.owner ?? 'scheduler',
         now,
+        timing: input.timing,
         press: input.press,
       });
       if (

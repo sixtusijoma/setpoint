@@ -2,6 +2,7 @@ import { PillButton, Sheet, Stepper } from '@/components/ui';
 import { HUB_COPY, TOKEN_PATH, WAKE_HELP, WEB_SECRET_COPY } from '@/copy';
 import { deviceNotes, type SwitchBotDevice } from '@/devices/switchbot';
 import type { Co2Tone } from '@/domain/co2';
+import { PRESS_SPACING_MS } from '@/domain/pressSession';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
 import { useState } from 'react';
@@ -181,8 +182,11 @@ export default function SettingsScreen() {
         label="Delay"
         value={`${settings.delayMs} ms`}
         onMinus={() => app.updateSettings({ delayMs: Math.max(250, settings.delayMs - 250) })}
-        onPlus={() => app.updateSettings({ delayMs: Math.min(5000, settings.delayMs + 250) })}
+        onPlus={() => app.updateSettings({ delayMs: Math.min(10000, settings.delayMs + 250) })}
       />
+      <Text style={styles.body}>
+        {`Presses wait at least ${PRESS_SPACING_MS.down / 1000} s going down and ${PRESS_SPACING_MS.up / 1000} s going up so the thermostat catches each one. A longer delay here wins.`}
+      </Text>
       <Adjust
         label="Minimum"
         value={`${settings.minF}°`}
