@@ -91,6 +91,17 @@ export function chartGeometry(
   return { xs, ys, points, min, max, startMs, endMs, plotLeft, plotRight, plotTop, plotBottom, markers, changeCount: changes.length };
 }
 
+const RUG_GAP = 4;
+
+// Too many changes for full-height lines (a year of schedule runs fills the plot), so they become
+// short ticks along the bottom, one per pixel column.
+export function markerRug(geometry: ChartGeometry): number[] | null {
+  if (geometry.markers.length * RUG_GAP <= geometry.plotRight - geometry.plotLeft) {
+    return null;
+  }
+  return [...new Set(geometry.markers.map((marker) => Math.round(marker.x)))];
+}
+
 function round(value: number): number {
   return Math.round(value * 10) / 10;
 }

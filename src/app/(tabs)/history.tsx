@@ -393,9 +393,15 @@ function ChangeLogFooter({ log, onMore, onRetry }: { log: ChangeLog; onMore: () 
   );
 }
 
+const CURRENT_RANGE: Record<HistorySpan, string> = {
+  day: 'Today',
+  week: 'Last 7 days',
+  month: 'Last month',
+  year: 'Last 12 months',
+};
+
 function rangeHint(span: HistorySpan, current: boolean): string {
-  const unit = span === 'day' ? 'Today' : `This ${span}, through today`;
-  return current ? `${unit} · Tap to pick a date` : 'Tap to pick a date';
+  return current ? `${CURRENT_RANGE[span]} · Tap to pick a date` : 'Tap to pick a date';
 }
 
 function StepArrow({

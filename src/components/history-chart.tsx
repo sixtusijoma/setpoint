@@ -9,6 +9,7 @@ import {
   formatReadoutTime,
   formatTooltipTime,
   idleFocus,
+  markerRug,
   pickAt,
   reduceChartFocus,
   snappedMarker,
@@ -39,6 +40,7 @@ const HEIGHT = 196;
 const TIP_WIDTH = 172;
 const TICK_WIDTH = 52;
 const MARKER_SLOP = 12;
+const RUG_HEIGHT = 10;
 const FRAME: Omit<ChartFrame, 'width'> = { height: HEIGHT, top: 34, bottom: 8, left: 4, right: 48 };
 // Web only. GestureDetector's touchAction prop is wiped when RNGH applies a gesture config, which
 // left touch-action: none on the chart and blocked vertical page scrolls that start on it.
@@ -77,6 +79,7 @@ export function HistoryChart({
     [samples, changes, metric, width, domain],
   );
   const ticks = useMemo(() => timeTicks(geometry), [geometry]);
+  const dense = useMemo(() => markerRug(geometry) !== null, [geometry]);
 
   const lastMarker = useRef<number | null>(null);
   useEffect(() => {
@@ -207,7 +210,9 @@ export function HistoryChart({
             ? `Release to go back to ${restingLabel}.`
             : focus.kind === 'pinned'
               ? `Tap the same spot again to go back to ${restingLabel}.`
-              : 'Drag across the chart to read a value. Tap a coral line to see that change.'}
+              : dense
+                ? 'Drag across the chart to read a value. Coral ticks along the bottom are setpoint changes.'
+                : 'Drag across the chart to read a value. Tap a coral line to see that change.'}
         </Text>
       )}
     </View>
@@ -226,6 +231,7 @@ const ChartBase = memo(function ChartBase({
   metric: ChartMetric;
 }) {
   const last = geometry.xs.length - 1;
+  const rug = markerRug(geometry);
   return (
     <View style={styles.overlay}>
       <Svg width={width} height={HEIGHT}>
@@ -258,17 +264,29 @@ const ChartBase = memo(function ChartBase({
           strokeWidth={1}
         />
         <Polyline points={geometry.points} fill="none" stroke={colors.neutral} strokeWidth={2} strokeLinejoin="round" />
-        {geometry.markers.map((marker) => (
-          <Line
-            key={`marker-${marker.change}`}
-            x1={marker.x}
-            x2={marker.x}
-            y1={geometry.plotTop}
-            y2={geometry.plotBottom}
-            stroke={colors.coral}
-            strokeWidth={1}
-          />
-        ))}
+        {rug
+          ? rug.map((x) => (
+              <Line
+                key={`rug-${x}`}
+                x1={x}
+                x2={x}
+                y1={geometry.plotBottom - RUG_HEIGHT}
+                y2={geometry.plotBottom}
+                stroke={colors.coral}
+                strokeWidth={1}
+              />
+            ))
+          : geometry.markers.map((marker) => (
+              <Line
+                key={`marker-${marker.change}`}
+                x1={marker.x}
+                x2={marker.x}
+                y1={geometry.plotTop}
+                y2={geometry.plotBottom}
+                stroke={colors.coral}
+                strokeWidth={1}
+              />
+            ))}
         {last >= 0 ? <Circle cx={geometry.xs[last]} cy={geometry.ys[last]} r={4} fill={colors.text} /> : null}
       </Svg>
       <Text style={[styles.axis, { top: geometry.plotTop - 8 }]}>{formatAxis(metric, geometry.max)}</Text>
