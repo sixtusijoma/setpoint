@@ -1,12 +1,49 @@
 # Setpoint
 
-Setpoint is a phone-first thermostat remote. It keeps a virtual setpoint (the number on the physical thermostat display) and changes it by pressing a SwitchBot up bot or down bot. The room sensor is room air. It is never the setpoint, and Setpoint never waits for the room to reach a target.
-
-Demo mode is the default. It runs with simulated devices and needs no SwitchBot account and no server. Live control can run on the phone, or through the shared server described in [DEPLOY.md](DEPLOY.md).
+Setpoint turns a regular, non-smart thermostat into a smart one. Two SwitchBot Bots sit on the up and down buttons and press them for you, and you control it from a phone app.
 
 <img src="docs/images/thermostat.jpg" width="800" alt="Emerson thermostat with SwitchBot Bots on the up and down buttons. The display reads Set To 71 and Room Temperature 66.">
 
-<img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to 61 F.">
+## Why I made this
+
+I wanted to turn my regular thermostat into a smart one. I wanted to be able to adjust it from my phone and add the ability for custom complex requests even most smart thermostats can't handle.
+
+## What it does
+
+- Set the temperature from your phone. You can turn the dial, use Set to, or tap a preset such as Sleep, Wake, Away, or Home.
+- Run a daily schedule. The default is Sleep at 61°F on weekdays at 11:45 PM, and Wake at 70°F every day at 6:45 AM. You can add, edit, or turn off events.
+- Skip the next run of a schedule, or skip one date. Both can be undone.
+- Sleep now and Wake now apply that target immediately, then mark that run done early or late. They are not a hold, and the next regular run still happens.
+- A temporary hold can pause the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
+- Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
+- History charts room temperature, humidity, and CO2 for a day or a week, with marks where the setpoint changed.
+- An activity log of presses, calibrations, and schedule runs.
+- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, and more.
+- A Siri shortcut can send a spoken request to a Thermostat bot, which then uses that MCP server.
+
+The Home chip says Following schedule, a hold, or Off schedule. Off schedule means the tracked setpoint does not match the current scheduled target. Tap it to retry. That chip does not use the meter.
+
+## How it works
+
+The thermostat cannot report the number on its display. Setpoint keeps a tracked setpoint, also called the virtual setpoint, by counting successful button presses.
+
+```mermaid
+flowchart TD
+  App[Phone app] --> Server[Supabase server]
+  MCP[AI assistant via MCP] --> Server
+  Server --> Cloud[SwitchBot cloud]
+  Cloud --> Hub[Hub Mini]
+  Hub --> Bots[Bots press the up and down buttons]
+  Meter[Meter reads room temperature, humidity, and CO2] --> Hub
+```
+
+You enter the number on the display once. After that, each successful up press adds one step (default 1°F) and each successful down press subtracts one. If someone presses the physical buttons, or the count drifts, use Recalibrate. Setpoint never waits for the room to reach a target, and it never copies the room sensor into the setpoint. The meter is read-only.
+
+When you set a temperature, the app presses the correct bot the right number of times and waits between presses (default 1 second) so the thermostat can register each one. Requests outside the allowed range (default 50 to 85°F) or over the press cap (default 15) are refused before any press. If a press fails, Setpoint stops, keeps the presses that already succeeded, and does not count the failed one. There is an optional setting, off by default, where the first press only wakes the display and does not change the tracked setpoint.
+
+There are two live paths. On an iPhone, the app can talk to the SwitchBot Open API directly, with the token in the Keychain. When `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` are set and the app is in live mode, the shared server owns those SwitchBot calls, stores history, and keeps the scheduler running while the phone is asleep. Live control from the browser is not supported. Demo mode never contacts SwitchBot or the server, and there is no Bluetooth fallback.
+
+Schedules use America/New_York (Eastern Time). Catch-up applies only the latest due target and marks earlier ones missed.
 
 ## Screenshots
 
@@ -25,80 +62,149 @@ These are from the in-browser demo, at iPhone size. The room readings and charts
   </tr>
 </table>
 
-## Why I made this
+## What you need
 
-I wanted to turn my regular thermostat into a smart one. I wanted to be able to adjust it from my phone and add the ability for custom complex requests even most smart thermostats can't handle.
+Hardware, for live control:
+
+- A regular thermostat with physical up and down buttons. This project was built around an Emerson.
+- Two SwitchBot Bots, set to Press Mode, mounted on those buttons.
+- A SwitchBot Hub Mini, or another SwitchBot hub, near the devices, with cloud service enabled.
+- A SwitchBot Meter Pro (CO2), or another SwitchBot meter that reports temperature, humidity, and CO2.
+
+Accounts and software:
+
+- A SwitchBot account, plus an Open API token and secret. In the SwitchBot app: Profile, Preferences, About, tap the app version about 10 times, then Developer Options, token and secret.
+- For the shared server, history on the server, schedules while the phone is asleep, and assistant control: a free Supabase project and the [Supabase CLI](https://supabase.com/docs/guides/cli).
+- Node.js 22.13 or later. This app uses Expo SDK 58, which supports Node 22.13+, 24.3+, or 26+. Odd-numbered releases such as 23 and 25 are not supported.
+- Expo Go, if you want to run the app on a phone during development.
+
+You can try the app in demo mode with only Node.js. No SwitchBot account or Supabase project is required for that.
+
+## Getting started
+
+### Try the demo
+
+Demo mode is the default. It uses simulated devices and works without any environment variables.
+
+```bash
+git clone https://github.com/sixtusijoma/setpoint.git
+cd setpoint
+npm install
+npm run web
+```
+
+`npm run web` serves the app on port 43117. Open [http://127.0.0.1:43117](http://127.0.0.1:43117), tap Try the demo, and enter a starting temperature. You can turn the dial, run Sleep now, edit the schedule, and browse the charts. The simulated room starts near 68.4°F, 47% humidity, and about 740 ppm CO2. Pull to refresh drifts that room. It does not move the setpoint.
+
+On a phone with Expo Go:
+
+```bash
+npm start
+```
+
+Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run android` start the same dev server pointed at those platforms.
+
+### Set up live control
+
+1. Mount the two bots on the thermostat's up and down buttons, in Press Mode. Place the Hub Mini nearby with cloud service enabled, and place the meter in the room.
+2. Copy the SwitchBot Open API token and secret from the SwitchBot app, using the path under [What you need](#what-you-need).
+
+**Phone only.** You can skip the server and run live mode from the iPhone app. Start the app, choose Connect SwitchBot, enter the token and secret, map the up bot, down bot, and meter, then enter the number on the thermostat display. The token stays in the Keychain via `expo-secure-store`. This is not a safe path in the browser: a token saved there lasts only for that tab session, and cloud control from the browser is blocked. Without the shared server, the scheduler only runs while the app can run.
+
+**Shared server.** Use this when you want schedules to keep running while the phone is asleep, history stored on the server, and assistant control through MCP. The steps below are the main path. [DEPLOY.md](DEPLOY.md) has the full detail, including cron jobs and how each function is authenticated.
+
+1. Create a free Supabase project, then from this repo, with the Supabase CLI logged in as an owner of that project:
+
+   ```bash
+   supabase link --project-ref <your-project-ref>
+   supabase db push
+   ```
+
+   That applies `supabase/migrations/20261111120000_setpoint.sql`.
+
+2. Set these function secret names in the project. The CLI prompts for the values. Do not put the values in the repo, in `EXPO_PUBLIC_*` variables, or in the app bundle.
+
+   ```bash
+   supabase secrets set SWITCHBOT_TOKEN SWITCHBOT_SECRET SETPOINT_APP_KEY SETPOINT_MCP_KEY CRON_SECRET
+   ```
+
+   Generate `SETPOINT_APP_KEY` yourself and enter the same value once in the app later. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be omitted here if the phone will upload them through Settings. The scheduler still needs one of those two sources before it can press.
+
+3. Deploy the functions:
+
+   ```bash
+   supabase functions deploy state
+   supabase functions deploy press
+   supabase functions deploy recalibrate
+   supabase functions deploy session
+   supabase functions deploy tick
+   supabase functions deploy meter
+   supabase functions deploy history
+   supabase functions deploy credentials
+   supabase functions deploy devices
+   supabase functions deploy prune
+   supabase functions deploy mcp
+   ```
+
+4. Schedule the server jobs as described in [DEPLOY.md](DEPLOY.md). A tick runs every minute, a meter read every 10 minutes, and a prune job once a day.
+
+5. Point the app at the project. You can export these in your shell, or put them in a `.env` file in the project root (that file is gitignored):
+
+   ```bash
+   EXPO_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+   EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<the public anon key>
+   ```
+
+   Use the public anon key, not the service role key. The service role key stays on the server. Do not put the SwitchBot token, the MCP key, or the app key in these variables. Demo mode ignores them.
+
+6. Start the app with `npm start` or `npm run ios`. When those two variables are set, the app asks for `SETPOINT_APP_KEY` once and stores it with `expo-secure-store` on iOS and Android. On the web demo, secure storage is unavailable, so the key stays in `sessionStorage` for that tab only. Then enter the SwitchBot token and secret if the server does not already have them, map the devices, and enter the number on the thermostat display.
 
 ## Control it with Siri
 
 I use an iOS Shortcut named Thermostat. It runs Dictate Text, then sends that text with the Grok Bot app's Send Message action to my Thermostat bot. The bot controls Setpoint through its MCP server, so a phrase like "Going to bed early tonight set sleep now" can run Sleep now, the same command the app uses. I trigger the shortcut with Siri, or with Back Tap.
 
-## Run it
+<img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to 61 F.">
+
+## Control it with an AI assistant
+
+After the shared server is deployed, an MCP client can call:
+
+```text
+https://<project-ref>.supabase.co/functions/v1/mcp
+```
+
+with this header:
+
+```text
+Authorization: Bearer <SETPOINT_MCP_KEY>
+```
+
+Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The function also accepts `Accept: application/json`. If the gateway asks for an `apikey` header, send the public anon key there. The function does not treat that header as the MCP secret. The app key does not open this endpoint.
+
+A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
+
+Tools: `set_to`, `nudge`, `read_room`, `room_history`, `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
+
+See [DEPLOY.md](DEPLOY.md) for the rest of the server notes.
+
+## Project structure
+
+```text
+src/app/           Screens: Home, Schedule, History, Activity, Settings, and onboarding
+src/components/    Dial, charts, and shared UI
+src/domain/        Schedule, presses, and setpoint logic
+src/devices/       SwitchBot API client and the demo room simulator
+src/server/        Shared server handlers and the MCP tools
+src/state/         App state and sync with the shared server
+src/storage/       Local persistence and credential storage
+supabase/          Database migration, edge functions, and cron SQL
+docs/images/       Photos used in this README
+```
+
+## Tests
 
 ```bash
-npm install
 npm test
 npm run typecheck
-npm run web
 ```
 
-`npm run web` serves the app on port 43117. Open it at [http://127.0.0.1:43117](http://127.0.0.1:43117).
-
-Optional, only for live mode with the shared server:
-
-```bash
-EXPO_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
-EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<the public anon key>
-```
-
-Do not put the service role key, the SwitchBot token, the MCP key, or the app key in these variables. Demo mode ignores them.
-
-The private app key is not an environment variable. When the two variables above are set, the app asks for it once and stores it with `expo-secure-store` on iOS and Android. Do not put that key in `EXPO_PUBLIC_*` or in the app bundle. On the web demo, secure storage is unavailable, so the key stays in `sessionStorage` for that tab only.
-
-On a phone, use Expo Go:
-
-```bash
-npx expo start
-```
-
-This project uses Expo SDK 58. Schedules use America/New_York. There is no Bluetooth fallback.
-
-## Demo and live
-
-Demo works in the browser and in Expo Go. The simulated room starts near 68.4°F, 47% humidity, and about 740 ppm CO2. Pull to refresh drifts that room. It does not move the setpoint.
-
-Live control without the two environment variables uses the SwitchBot Open API from the iPhone app. The token stays in the Keychain. Browser calls to SwitchBot are not the supported path.
-
-When both environment variables are set and the app is in live mode, the shared server owns the SwitchBot calls. The phone uploads the token once into a private table, then presses, device lists, and meter reads go through the server. The scheduler on the server keeps running while the phone is asleep. Demo mode never contacts the server.
-
-## Virtual setpoint
-
-1. The first time there is no saved setpoint, Setpoint asks what the thermostat display shows. That becomes the virtual setpoint. It does not press any buttons.
-2. The number is saved on the device. Later launches open straight to the thermostat.
-3. Recalibrate, from Home or Settings, only when someone has pressed the physical buttons or the count has drifted. It is never a startup prompt once a setpoint is saved.
-4. A successful up press adds the step (default 1°F). A successful down press subtracts it.
-5. Set to N presses the correct bot `|current - N| / step` times, waiting between presses (default 1000 ms) so the thermostat can register each one.
-6. If a press fails, Setpoint stops. It keeps the presses that already succeeded and does not count the failed press or any press not yet sent.
-7. If a request was sent and the response was lost, that degree is not counted, the run stops, and Setpoint asks you to check the thermostat. Later schedules still run.
-8. Cancel before a press is sent skips it. Cancel during a press lets that press finish, shows "Finishing the current press", and skips the rest.
-9. A temporary hold starts only after a manual, set-to, or preset press actually moves the setpoint. A failed press, a cancel before any press, and a preset that is already showing do not start one.
-10. Requests that would leave the min/max range (default 50-85°F) or exceed the press cap (default 15) are refused before any press. Targets have to line up with the step.
-11. Optional, default off: the first press only wakes the display. That leading press does not change the virtual setpoint, and it counts toward the cap.
-
-## Schedule, skip, and history
-
-Catch-up applies only the latest due target and marks earlier ones missed. A note such as "Sleep was missed, applied Wake." shows on Home and Schedule. Only a time or temperature edit resets the catch-up cursor.
-
-The Home chip says Following schedule, a hold, or Off schedule. Off schedule means the tracked setpoint does not match the current scheduled target. Tap it to retry. The chip does not use the meter.
-
-Skip the next occurrence of a schedule, or skip one date. Both are undoable. Sleep now and Wake now apply that target immediately through the same press path and mark that occurrence done early or late. They are not a hold, and the next normal occurrence still runs.
-
-Room History charts temperature, humidity, and CO2 for a day or a week, with markers where the setpoint changed. Demo history is stored on the phone. Live history is stored by the server. See [DEPLOY.md](DEPLOY.md).
-
-## SwitchBot token
-
-In the SwitchBot app: Profile, Preferences, About, tap the app version about 10 times, Developer Options, token and secret.
-
-Remote control needs a SwitchBot Hub near the devices, with cloud service enabled. Bots should be in Press Mode. The meter is a Meter Pro (CO2). It is read-only.
-
-On iOS the token and secret are stored in the Keychain via `expo-secure-store` when the server is not configured. On the web they stay in `sessionStorage` for the tab only, which is not a safe place for a real token. The secret is masked after you save it. Nothing in this repo contains a token.
+`npm test` runs Vitest. The suite loads the database migration into PGlite and covers the press lease, the scheduler, skips, run-now, meter prune, and the MCP tools. `npm run lint` is also available.
