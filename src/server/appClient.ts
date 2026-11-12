@@ -2,8 +2,13 @@ import type { CommandSource } from '@/domain/pressSession';
 import type { HoldState, RunRecord, ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
 import type { SwitchBotDevice } from '@/devices/switchbot';
-import { readChangePage, type ChangePage, type HistorySpan } from '@/domain/history';
-import type { HistorySample, SetpointChange } from '@/domain/history';
+import {
+  readChangePage,
+  type ChangePage,
+  type HistorySample,
+  type HistorySpan,
+  type SetpointChange,
+} from '@/domain/history';
 import { chunkMeterCsv, combineSummaries, emptySummary, type MeterImportSummary } from '@/domain/meterCsv';
 import type { DeviceMap, Preset, Settings } from '@/state/model';
 
