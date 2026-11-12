@@ -16,7 +16,7 @@ I wanted to turn my regular thermostat into a smart one. I wanted to be able to 
 - Sleep now and Wake now apply that target immediately, then mark that run done early or late. They are not a hold, and the next regular run still happens.
 - A temporary hold can pause the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
 - Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
-- History charts room temperature, humidity, and CO2 for a day, a week, or a month, with marks where the setpoint changed. Longer windows are averaged so the chart stays small. Drag across the chart to read a value in Eastern Time, or tap a coral mark to see what changed the setpoint. The list of setpoint changes loads 15 at a time, newest first.
+- History charts room temperature, humidity, and CO2 for a day, a week, a month, or a year, with marks where the setpoint changed. Longer windows are averaged so the chart stays small, and the year view shows one average per Eastern Time day. The arrows beside the span step back or forward one day, week, month, or year, back to the first stored reading. Tap the dates to jump to any day, or tap Now to come back. Drag across the chart to read a value in Eastern Time, or tap a coral mark to see what changed the setpoint. The list of setpoint changes loads 15 at a time, newest first, across all stored history.
 - Import older room readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
 - An activity log of presses, calibrations, and schedule runs.
 - An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, import meter history, and more.
@@ -120,7 +120,7 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    supabase db push
    ```
 
-   That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, and `supabase/migrations/20261112180000_setpoint_change_pages.sql`. On a project that already runs, the last one plus `supabase functions deploy history` is all the History list's paging needs. See [DEPLOY.md](DEPLOY.md).
+   That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, `supabase/migrations/20261112180000_setpoint_change_pages.sql`, and `supabase/migrations/20261113090000_history_windows.sql`. On a project that already runs, `supabase db push` and then `supabase functions deploy history` and `supabase functions deploy mcp` is all that browsing older History windows needs. See [DEPLOY.md](DEPLOY.md).
 
 2. Set these function secret names in the project. The CLI prompts for the values. Do not put the values in the repo, in `EXPO_PUBLIC_*` variables, or in the app bundle.
 
@@ -201,7 +201,7 @@ Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The functi
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, or `month`, or both `since` and `until` as ISO timestamps, 800 days at most), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, `month`, or `year`, or both `since` and `until` as ISO timestamps, 800 days at most; ranges over 120 days come back as daily Eastern Time averages), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
 
 See [DEPLOY.md](DEPLOY.md) for the rest of the server notes.
 
