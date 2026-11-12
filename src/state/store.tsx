@@ -27,7 +27,7 @@ import {
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
 import { formatClock } from '@/domain/time';
-import { LOCAL_HISTORY_CAP, seedDemoHistory, type HistorySpan } from '@/domain/history';
+import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage, type HistorySpan } from '@/domain/history';
 import { mergeMeterHistory, parseMeterCsv } from '@/domain/meterCsv';
 import { driftClimate, initialClimate } from '@/devices/simulator';
 import {
@@ -43,6 +43,7 @@ import { errorFeedback, pressFeedback, successFeedback } from '@/haptics';
 import { notifyCheckThermostat, requestReminderPermission, syncReminders, watchNotificationOpen } from '@/notifications/reminders';
 import {
   cancelRemotePress,
+  fetchChangePage,
   fetchHistory,
   importMeterCsvRemote,
   fetchRemoteDevices,
@@ -159,6 +160,7 @@ type AppContextValue = {
   runEventNow: (eventId: string) => Promise<void>;
   retrySchedule: () => Promise<void>;
   loadHistory: (span: HistorySpan) => Promise<void>;
+  loadChangesPage: (cursor: string | null, limit: number) => Promise<ChangePage>;
   meterImport: MeterImportState;
   openMeterImport: () => void;
   cancelMeterImport: () => void;
@@ -242,6 +244,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const saveChain = useRef<Promise<void>>(Promise.resolve());
   const saveLatest = useRef<Persisted | null>(null);
   const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historyTicket = useRef(0);
   const syncRef = useRef<SharedSync>(createSharedSync());
   const pullSharedRef = useRef<() => Promise<void>>(async () => undefined);
   const pushSharedRef = useRef<() => void>(() => undefined);
@@ -1598,17 +1601,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (!auth || stateRef.current.mode !== 'live') {
           return;
         }
+        historyTicket.current += 1;
+        const ticket = historyTicket.current;
         try {
           const history = await fetchHistory(auth.config, auth.appKey, span);
+          if (ticket !== historyTicket.current) {
+            return;
+          }
           commit((prev) => ({
             ...prev,
             history: history.samples,
             changes: history.changes,
           }));
         } catch (error) {
-          if (!noteAuth(error)) {
-            showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
-          }
+          throw new Error(noteAuth(error) ? 'The app key was rejected.' : explainError(error, appKeyRef.current));
+        }
+      },
+      loadChangesPage: async (cursor, limit) => {
+        const auth = sessionAuth();
+        if (!auth || stateRef.current.mode !== 'live') {
+          return pageLocalChanges(stateRef.current.changes, cursor, limit);
+        }
+        try {
+          return await fetchChangePage(auth.config, auth.appKey, cursor, limit);
+        } catch (error) {
+          throw new Error(noteAuth(error) ? 'The app key was rejected.' : explainError(error, appKeyRef.current));
         }
       },
       meterImport,

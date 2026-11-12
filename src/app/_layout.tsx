@@ -16,6 +16,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import '../global.css';
@@ -31,12 +32,14 @@ export default function RootLayout() {
     Outfit_600SemiBold,
   });
   return (
-    <SafeAreaProvider>
-      <AppProvider>
-        <StatusBar style="light" />
-        <Frame fontsReady={fontsLoaded || Boolean(fontError)} />
-      </AppProvider>
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={styles.root}>
+      <SafeAreaProvider>
+        <AppProvider>
+          <StatusBar style="light" />
+          <Frame fontsReady={fontsLoaded || Boolean(fontError)} />
+        </AppProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
@@ -84,6 +87,9 @@ function Boot({ fontsReady }: { fontsReady: boolean }) {
 }
 
 const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
   outer: {
     flex: 1,
     backgroundColor: colors.outer,

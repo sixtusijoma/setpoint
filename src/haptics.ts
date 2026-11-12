@@ -15,6 +15,14 @@ export function pressFeedback(): void {
   void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 }
 
+export function selectionFeedback(): void {
+  if (Platform.OS === 'web') {
+    vibrate(4);
+    return;
+  }
+  void Haptics.selectionAsync();
+}
+
 export function successFeedback(): void {
   if (Platform.OS === 'web') {
     vibrate([8, 24, 12]);

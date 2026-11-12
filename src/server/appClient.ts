@@ -2,7 +2,7 @@ import type { CommandSource } from '@/domain/pressSession';
 import type { HoldState, RunRecord, ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
 import type { SwitchBotDevice } from '@/devices/switchbot';
-import type { HistorySpan } from '@/domain/history';
+import { readChangePage, type ChangePage, type HistorySpan } from '@/domain/history';
 import type { HistorySample, SetpointChange } from '@/domain/history';
 import { chunkMeterCsv, combineSummaries, emptySummary, type MeterImportSummary } from '@/domain/meterCsv';
 import type { DeviceMap, Preset, Settings } from '@/state/model';
@@ -145,6 +145,20 @@ export function fetchHistory(
   span: HistorySpan,
 ): Promise<{ samples: HistorySample[]; changes: SetpointChange[] }> {
   return call(config, appKey, `history?span=${span}`);
+}
+
+export async function fetchChangePage(
+  config: ServerConfig,
+  appKey: string,
+  cursor: string | null,
+  limit: number,
+): Promise<ChangePage> {
+  const params = new URLSearchParams({ view: 'changes', limit: String(limit) });
+  if (cursor) {
+    params.set('cursor', cursor);
+  }
+  const payload = await call<{ changes?: unknown; nextCursor?: unknown }>(config, appKey, `history?${params.toString()}`);
+  return readChangePage(payload ?? {});
 }
 
 export async function importMeterCsvRemote(
