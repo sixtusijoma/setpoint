@@ -13,12 +13,13 @@ import {
   reduceChartFocus,
   snappedMarker,
   timeTicks,
+  type ChartDomain,
   type ChartFrame,
   type ChartGeometry,
   type ChartMetric,
   type ChartTick,
 } from '@/domain/chart';
-import type { HistorySample, SetpointChange } from '@/domain/history';
+import { DAY_BUCKET_SECONDS, type HistorySample, type SetpointChange } from '@/domain/history';
 import type { ScheduleEvent } from '@/domain/schedule';
 import { selectionFeedback } from '@/haptics';
 import { colors, fonts } from '@/theme';
@@ -49,12 +50,18 @@ export function HistoryChart({
   metric,
   bucketSeconds,
   events,
+  domain,
+  current,
+  withYear,
 }: {
   samples: HistorySample[];
   changes: SetpointChange[];
   metric: ChartMetric;
   bucketSeconds: number;
   events: ScheduleEvent[];
+  domain: ChartDomain;
+  current: boolean;
+  withYear: boolean;
 }) {
   const [width, setWidth] = useState(320);
   const [stored, dispatch] = useReducer(reduceChartFocus, undefined, idleFocus);
@@ -66,8 +73,8 @@ export function HistoryChart({
   }
   const focus = focusWithin(stored, samples.length, changes.length);
   const geometry = useMemo(
-    () => chartGeometry(samples, changes, metric, { ...FRAME, width }),
-    [samples, changes, metric, width],
+    () => chartGeometry(samples, changes, metric, { ...FRAME, width }, domain),
+    [samples, changes, metric, width, domain],
   );
   const ticks = useMemo(() => timeTicks(geometry), [geometry]);
 
@@ -119,6 +126,9 @@ export function HistoryChart({
   const lineX = markerX ?? crossX ?? 0;
   const tipLeft = Math.min(Math.max(0, lineX - TIP_WIDTH / 2), Math.max(0, geometry.plotRight - TIP_WIDTH));
   const rangeMs = geometry.endMs - geometry.startMs;
+  const daily = bucketSeconds >= DAY_BUCKET_SECONDS;
+  const readout = (at: string | undefined) => formatReadoutTime(at ?? '', { withYear, daily });
+  const restingLabel = current ? 'the latest reading' : 'the last reading in this range';
 
   const onLayout = (event: LayoutChangeEvent) => {
     setWidth(Math.max(120, Math.round(event.nativeEvent.layout.width)));
@@ -131,8 +141,8 @@ export function HistoryChart({
       </Text>
       <Text testID="history-chart-caption" style={styles.caption}>
         {focus.kind === 'idle'
-          ? `Latest · ${formatReadoutTime(latest?.at ?? '')}`
-          : `${formatReadoutTime(shown?.at ?? '')} · ${bucketLabel(bucketSeconds)}`}
+          ? `${current ? 'Latest' : 'Last in range'} · ${readout(latest?.at)}`
+          : `${readout(shown?.at)} · ${bucketLabel(bucketSeconds)}`}
       </Text>
       <View onLayout={onLayout}>
         <GestureDetector gesture={gesture}>
@@ -172,7 +182,7 @@ export function HistoryChart({
                 >
                   <Text style={styles.tipValue} numberOfLines={1}>
                     {formatMetric(metric, shown?.[metric] ?? 0)}
-                    <Text style={styles.tipTime}> · {formatTooltipTime(shown?.at ?? '', rangeMs)}</Text>
+                    <Text style={styles.tipTime}> · {formatTooltipTime(shown?.at ?? '', rangeMs, bucketSeconds)}</Text>
                   </Text>
                 </View>
               </View>
@@ -187,16 +197,16 @@ export function HistoryChart({
           <View style={styles.detailText}>
             <Text style={styles.detailTitle}>{marker.label}</Text>
             <Text style={styles.detailBody}>
-              Set to {marker.setpoint}° · {formatReadoutTime(marker.at)} · {describeChangeSource(marker, events)}
+              Set to {marker.setpoint}° · {formatReadoutTime(marker.at, { withYear })} · {describeChangeSource(marker, events)}
             </Text>
           </View>
         </View>
       ) : (
         <Text testID="history-chart-hint" style={styles.hint}>
           {focus.kind === 'scrubbing'
-            ? 'Release to go back to the latest reading.'
+            ? `Release to go back to ${restingLabel}.`
             : focus.kind === 'pinned'
-              ? 'Tap the same spot again to go back to the latest reading.'
+              ? `Tap the same spot again to go back to ${restingLabel}.`
               : 'Drag across the chart to read a value. Tap a coral line to see that change.'}
         </Text>
       )}

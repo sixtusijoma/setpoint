@@ -27,7 +27,8 @@ import {
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
 import { formatClock } from '@/domain/time';
-import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage, type HistorySpan } from '@/domain/history';
+import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage } from '@/domain/history';
+import { localWindowData, type HistoryWindow, type HistoryWindowData } from '@/domain/historyWindow';
 import { mergeMeterHistory, parseMeterCsv } from '@/domain/meterCsv';
 import { driftClimate, initialClimate } from '@/devices/simulator';
 import {
@@ -44,7 +45,7 @@ import { notifyCheckThermostat, requestReminderPermission, syncReminders, watchN
 import {
   cancelRemotePress,
   fetchChangePage,
-  fetchHistory,
+  fetchHistoryWindow,
   importMeterCsvRemote,
   fetchRemoteDevices,
   fetchRemoteSession,
@@ -159,7 +160,7 @@ type AppContextValue = {
   undoOccurrence: (key: string) => Promise<void>;
   runEventNow: (eventId: string) => Promise<void>;
   retrySchedule: () => Promise<void>;
-  loadHistory: (span: HistorySpan) => Promise<void>;
+  loadHistoryWindow: (window: HistoryWindow, current: boolean) => Promise<HistoryWindowData>;
   loadChangesPage: (cursor: string | null, limit: number) => Promise<ChangePage>;
   meterImport: MeterImportState;
   openMeterImport: () => void;
@@ -244,7 +245,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const saveChain = useRef<Promise<void>>(Promise.resolve());
   const saveLatest = useRef<Persisted | null>(null);
   const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const historyTicket = useRef(0);
   const syncRef = useRef<SharedSync>(createSharedSync());
   const pullSharedRef = useRef<() => Promise<void>>(async () => undefined);
   const pushSharedRef = useRef<() => void>(() => undefined);
@@ -1596,23 +1596,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
           commitShared((prev) => ({ ...prev, records: applied.records }));
         }
       },
-      loadHistory: async (span) => {
+      loadHistoryWindow: async (window, current) => {
         const auth = sessionAuth();
         if (!auth || stateRef.current.mode !== 'live') {
-          return;
+          return localWindowData(stateRef.current.history, stateRef.current.changes, window);
         }
-        historyTicket.current += 1;
-        const ticket = historyTicket.current;
         try {
-          const history = await fetchHistory(auth.config, auth.appKey, span);
-          if (ticket !== historyTicket.current) {
-            return;
-          }
-          commit((prev) => ({
-            ...prev,
-            history: history.samples,
-            changes: history.changes,
-          }));
+          return await fetchHistoryWindow(auth.config, auth.appKey, window, current);
         } catch (error) {
           throw new Error(noteAuth(error) ? 'The app key was rejected.' : explainError(error, appKeyRef.current));
         }

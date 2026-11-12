@@ -29,7 +29,22 @@ import {
   type HistorySample,
   type SetpointChange,
 } from '@/domain/history';
-import { offHistoryLoad, reduceHistoryLoad } from '@/domain/historyLoad';
+import {
+  calendarMonth,
+  canStepBack,
+  canStepForward,
+  historyWindow,
+  initialHistoryView,
+  localWindowData,
+  monthTitle,
+  reduceHistoryView,
+  shiftMonth,
+  viewWindow,
+  windowLabel,
+  type HistoryView,
+  type HistoryViewEvent,
+  type HistoryWindowData,
+} from '@/domain/historyWindow';
 import { defaultEvents } from '@/domain/schedule';
 
 const change = (index: number, at = new Date(Date.UTC(2026, 9, 1) + index * 3600_000).toISOString()): SetpointChange => ({
@@ -144,25 +159,169 @@ describe('setpoint change pages', () => {
   });
 });
 
-describe('history window load', () => {
-  it('only settles the latest request', () => {
-    let load = offHistoryLoad();
-    load = reduceHistoryLoad(load, { type: 'fetch', span: 'day' });
-    const firstRequest = load.request;
-    load = reduceHistoryLoad(load, { type: 'fetch', span: 'month' });
-    expect(reduceHistoryLoad(load, { type: 'loaded', request: firstRequest })).toBe(load);
-    const failed = reduceHistoryLoad(load, { type: 'fail', request: load.request, message: 'Offline.' });
-    expect(failed).toMatchObject({ status: 'error', span: 'month', message: 'Offline.' });
-    expect(reduceHistoryLoad(failed, { type: 'loaded', request: load.request })).toBe(failed);
-    const ready = reduceHistoryLoad(reduceHistoryLoad(failed, { type: 'fetch', span: 'month' }), {
-      type: 'loaded',
-      request: failed.request + 1,
+const TODAY = '2026-11-12';
+const EARLIEST = '2025-11-22T14:05:00.000Z';
+
+function run(view: HistoryView, ...events: HistoryViewEvent[]): HistoryView {
+  return events.reduce(reduceHistoryView, view);
+}
+
+function windowData(firstAt: string | null = EARLIEST): HistoryWindowData {
+  return { samples: [], changes: [], bucketSeconds: 300, firstAt };
+}
+
+function loadedView(span: HistoryView['span'] = 'day'): HistoryView {
+  const view = run(initialHistoryView(), { type: 'span', span, today: TODAY });
+  const fetched = reduceHistoryView(view, { type: 'fetch', window: viewWindow(view, TODAY) });
+  return reduceHistoryView(fetched, { type: 'loaded', request: fetched.load.request, data: windowData(), today: TODAY });
+}
+
+describe('history windows', () => {
+  it('covers whole Eastern Time days and sends exact since and until instants', () => {
+    const day = historyWindow('day', '2026-11-12');
+    expect(day).toMatchObject({
+      key: 'day:2026-11-12',
+      firstDay: '2026-11-12',
+      since: '2026-11-12T05:00:00.000Z',
+      until: '2026-11-13T04:59:59.999Z',
+      bucketSeconds: 300,
     });
-    expect(ready).toMatchObject({ status: 'ready', span: 'month' });
-    const off = reduceHistoryLoad(ready, { type: 'off' });
-    expect(off.status).toBe('off');
-    expect(reduceHistoryLoad(off, { type: 'off' })).toBe(off);
-    expect(reduceHistoryLoad(off, { type: 'loaded', request: off.request })).toBe(off);
+    expect(day.endMs - day.startMs).toBe(24 * 3600_000);
+    const week = historyWindow('week', '2026-10-11');
+    expect(week).toMatchObject({ firstDay: '2026-10-05', since: '2026-10-05T04:00:00.000Z', bucketSeconds: 1800 });
+    expect(windowLabel(week)).toBe('Oct 5 to Oct 11, 2026');
+    expect(windowLabel(day)).toBe('Thu, Nov 12, 2026');
+    const month = historyWindow('month', '2026-03-15');
+    expect(month).toMatchObject({ firstDay: '2026-02-16', bucketSeconds: 7200 });
+    const year = historyWindow('year', '2026-11-12');
+    expect(year).toMatchObject({ firstDay: '2025-11-13', since: '2025-11-13T05:00:00.000Z', bucketSeconds: 86400 });
+    expect(windowLabel(year)).toBe('Nov 13, 2025 to Nov 12, 2026');
+  });
+
+  it('keeps DST days whole at five minute buckets', () => {
+    const fallBack = historyWindow('day', '2026-11-01');
+    expect(fallBack.endMs - fallBack.startMs).toBe(25 * 3600_000);
+    expect(fallBack).toMatchObject({ since: '2026-11-01T04:00:00.000Z', until: '2026-11-02T04:59:59.999Z', bucketSeconds: 300 });
+    const springForward = historyWindow('day', '2026-03-08');
+    expect(springForward.endMs - springForward.startMs).toBe(23 * 3600_000);
+    expect(springForward).toMatchObject({ since: '2026-03-08T05:00:00.000Z', until: '2026-03-09T03:59:59.999Z' });
+    const week = historyWindow('week', '2026-11-04');
+    expect(week.endMs - week.startMs).toBe((7 * 24 + 1) * 3600_000);
+    expect(week.bucketSeconds).toBe(1800);
+  });
+
+  it('slices and buckets local readings to the window', () => {
+    const window = historyWindow('day', '2026-11-11');
+    const samples = hourly(48, '2026-11-10T12:00:00.000Z');
+    const changes = [change(0, '2026-11-11T04:59:00.000Z'), change(1, '2026-11-11T12:00:00.000Z')];
+    const data = localWindowData(samples, changes, window);
+    expect(data.firstAt).toBe('2026-11-10T12:00:00.000Z');
+    expect(data.samples).toHaveLength(24);
+    expect(data.samples[0]?.at).toBe('2026-11-11T05:00:00.000Z');
+    expect(data.changes.map((item) => item.at)).toEqual(['2026-11-11T12:00:00.000Z']);
+    expect(localWindowData([], [], window).firstAt).toBeNull();
+  });
+});
+
+describe('history window navigation', () => {
+  it('follows today until stepped back and returns to now', () => {
+    const view = initialHistoryView();
+    expect(viewWindow(view, TODAY).lastDay).toBe(TODAY);
+    expect(viewWindow(view, '2026-11-13').lastDay).toBe('2026-11-13');
+    expect(canStepForward(view, TODAY)).toBe(false);
+    expect(reduceHistoryView(view, { type: 'step', by: 1, today: TODAY })).toBe(view);
+    const back = run(view, { type: 'span', span: 'week', today: TODAY }, { type: 'step', by: -1, today: TODAY });
+    expect(back.lastDay).toBe('2026-11-05');
+    expect(windowLabel(viewWindow(back, TODAY))).toBe('Oct 30 to Nov 5, 2026');
+    expect(canStepForward(back, TODAY)).toBe(true);
+    expect(run(back, { type: 'step', by: 1, today: TODAY }).lastDay).toBeNull();
+    expect(run(back, { type: 'now' }).lastDay).toBeNull();
+    const months = run(back, { type: 'span', span: 'month', today: TODAY }, { type: 'step', by: -1, today: TODAY });
+    expect(months.lastDay).toBe('2026-10-05');
+    expect(viewWindow(months, TODAY).firstDay).toBe('2026-09-06');
+  });
+
+  it('steps across DST without losing whole days', () => {
+    const view = run(initialHistoryView(), { type: 'jump', date: '2026-11-02', today: TODAY });
+    const fallBack = run(view, { type: 'step', by: -1, today: TODAY });
+    expect(fallBack.lastDay).toBe('2026-11-01');
+    expect(viewWindow(fallBack, TODAY).until).toBe('2026-11-02T04:59:59.999Z');
+    const spring = run(view, { type: 'jump', date: '2026-03-09', today: TODAY }, { type: 'step', by: -1, today: TODAY });
+    expect(viewWindow(spring, TODAY)).toMatchObject({ lastDay: '2026-03-08', since: '2026-03-08T05:00:00.000Z' });
+  });
+
+  it('stops at the earliest stored reading', () => {
+    let view = run(loadedView('month'), { type: 'jump', date: '2025-12-30', today: TODAY });
+    expect(view.earliestDay).toBe('2025-11-22');
+    expect(viewWindow(view, TODAY).firstDay).toBe('2025-11-30');
+    expect(canStepBack(view, TODAY)).toBe(true);
+    view = run(view, { type: 'step', by: -1, today: TODAY });
+    expect(viewWindow(view, TODAY)).toMatchObject({ lastDay: '2025-11-30', firstDay: '2025-11-01' });
+    expect(canStepBack(view, TODAY)).toBe(false);
+    expect(run(view, { type: 'step', by: -1, today: TODAY })).toBe(view);
+    expect(run(view, { type: 'jump', date: '2024-01-01', today: TODAY }).lastDay).toBe('2025-11-22');
+    expect(run(view, { type: 'jump', date: '2027-01-01', today: TODAY }).lastDay).toBeNull();
+    expect(run(view, { type: 'jump', date: '2026-02-30', today: TODAY })).toBe(view);
+    expect(canStepBack(initialHistoryView(), TODAY)).toBe(true);
+  });
+
+  it('reads bounds from local data and from server responses', () => {
+    const bounded = run(initialHistoryView(), { type: 'bounds', firstAt: '2026-01-01T03:00:00.000Z', today: TODAY });
+    expect(bounded.earliestDay).toBe('2025-12-31');
+    expect(run(bounded, { type: 'bounds', firstAt: null, today: TODAY }).earliestDay).toBe(TODAY);
+    const fetched = run(bounded, { type: 'fetch', window: viewWindow(bounded, TODAY) });
+    const legacy = run(fetched, {
+      type: 'loaded',
+      request: fetched.load.request,
+      data: { samples: [], changes: [], bucketSeconds: 300 },
+      today: TODAY,
+    });
+    expect(legacy.earliestDay).toBe('2025-12-31');
+    expect(legacy.load.status).toBe('ready');
+  });
+
+  it('never lets an older window response overwrite a newer one', () => {
+    const view = loadedView('week');
+    const old = run(view, { type: 'step', by: -1, today: TODAY });
+    const oldFetch = run(old, { type: 'fetch', window: viewWindow(old, TODAY) });
+    const newer = run(oldFetch, { type: 'step', by: -1, today: TODAY });
+    const newerFetch = run(newer, { type: 'fetch', window: viewWindow(newer, TODAY) });
+    const oldRequest = oldFetch.load.request;
+    expect(newerFetch.load.request).toBe(oldRequest + 1);
+    const late = { samples: hourly(2), changes: [], bucketSeconds: 1800, firstAt: EARLIEST };
+    expect(run(newerFetch, { type: 'loaded', request: oldRequest, data: late, today: TODAY })).toBe(newerFetch);
+    expect(run(newerFetch, { type: 'fail', request: oldRequest, message: 'late' })).toBe(newerFetch);
+    const settled = run(newerFetch, { type: 'loaded', request: newerFetch.load.request, data: windowData(), today: TODAY });
+    expect(settled.load).toMatchObject({ status: 'ready', window: { key: 'week:2026-10-29' } });
+    expect(run(settled, { type: 'loaded', request: oldRequest, data: late, today: TODAY })).toBe(settled);
+    const off = run(settled, { type: 'off' });
+    expect(off.load.status).toBe('off');
+    expect(run(off, { type: 'off' })).toBe(off);
+    expect(run(off, { type: 'loaded', request: off.load.request, data: late, today: TODAY })).toBe(off);
+  });
+
+  it('keeps the error with its window so retry asks again', () => {
+    const fetched = run(loadedView(), { type: 'fetch', window: historyWindow('day', '2026-06-01') });
+    const failed = run(fetched, { type: 'fail', request: fetched.load.request, message: 'Offline.' });
+    expect(failed.load).toMatchObject({ status: 'error', message: 'Offline.', window: { key: 'day:2026-06-01' } });
+    const retried = run(failed, { type: 'fetch', window: historyWindow('day', '2026-06-01') });
+    expect(retried.load).toMatchObject({ status: 'loading', request: fetched.load.request + 1 });
+  });
+});
+
+describe('date picker month', () => {
+  it('lays out Monday-first weeks and disables days outside the stored range', () => {
+    const weeks = calendarMonth('2025-11-30', '2025-11-22', TODAY);
+    expect(monthTitle('2025-11-30')).toBe('November 2025');
+    expect(weeks[0]?.[0]).toMatchObject({ date: '2025-10-27', inMonth: false, enabled: false });
+    const days = weeks.flat();
+    expect(days.find((item) => item.date === '2025-11-21')?.enabled).toBe(false);
+    expect(days.find((item) => item.date === '2025-11-22')?.enabled).toBe(true);
+    expect(days.at(-1)?.date).toBe('2025-11-30');
+    const now = calendarMonth(TODAY, null, TODAY).flat();
+    expect(now.find((item) => item.date === TODAY)?.enabled).toBe(true);
+    expect(now.find((item) => item.date === '2026-11-13')?.enabled).toBe(false);
+    expect(shiftMonth('2026-01-31', -1)).toBe('2025-12-01');
   });
 });
 
