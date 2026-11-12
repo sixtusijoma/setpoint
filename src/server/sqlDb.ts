@@ -1,7 +1,9 @@
-import type { HistorySample, SetpointChange } from '../domain/history';
+import type { ChangeCursor, HistorySample, SetpointChange } from '../domain/history';
 import type { LeaseView, SharedSnapshot } from './types';
 
 type Query = <T>(sql: string, params?: unknown[]) => Promise<T[]>;
+
+export type StoredChange = SetpointChange & { id: number };
 
 function asJson<T>(value: unknown): T {
   if (typeof value === 'string') {
@@ -24,6 +26,7 @@ export type SetpointDb = {
   insertChange: (change: SetpointChange) => Promise<void>;
   listReads: (sinceIso: string, untilIso?: string | null, bucketSeconds?: number) => Promise<HistorySample[]>;
   listChanges: (sinceIso: string, untilIso?: string | null) => Promise<SetpointChange[]>;
+  listChangesPage: (before: ChangeCursor | null, limit: number) => Promise<{ changes: StoredChange[]; more: boolean }>;
   pruneReads: () => Promise<{ rolled: number; deleted: number }>;
   saveCredentials: (token: string, secret: string) => Promise<void>;
   readCredentials: () => Promise<{ token: string; secret: string } | null>;
@@ -116,6 +119,17 @@ export function createSqlDb(query: Query): SetpointDb {
         [sinceIso, untilIso],
       );
       return asJson<SetpointChange[]>(rows[0]?.list_setpoint_changes ?? []);
+    },
+    async listChangesPage(before, limit) {
+      const rows = await query<{ list_setpoint_changes_page: unknown }>(
+        'select public.list_setpoint_changes_page($1::timestamptz, $2::bigint, $3::int) as list_setpoint_changes_page',
+        [before?.at ?? null, before?.id ?? null, limit + 1],
+      );
+      const listed = asJson<StoredChange[]>(rows[0]?.list_setpoint_changes_page ?? []).map((row) => ({
+        ...row,
+        id: Number(row.id),
+      }));
+      return { changes: listed.slice(0, limit), more: listed.length > limit };
     },
     async pruneReads() {
       const rows = await query<{ prune_meter_reads: unknown }>('select public.prune_meter_reads() as prune_meter_reads');

@@ -1,5 +1,5 @@
 import { listDevices, pressBot, readMeter } from '../devices/switchbot';
-import { historyQuery } from '../domain/history';
+import { changePageQuery, encodeChangeCursor, historyQuery, type ChangePageQuery } from '../domain/history';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
 import { deviceIds, executeSharedPress, RecalibrateError, recalibrateShared, runSchedulerTick, type PressTiming } from './engine';
@@ -299,6 +299,20 @@ export async function handleHistory(request: Request, options: HandlerOptions): 
     return denied;
   }
   const url = new URL(request.url);
+  if (url.searchParams.get('view') === 'changes') {
+    let page: ChangePageQuery;
+    try {
+      page = changePageQuery({ limit: url.searchParams.get('limit'), cursor: url.searchParams.get('cursor') });
+    } catch (error) {
+      return json(request, options.env, { error: error instanceof Error ? error.message : 'Bad page request.' }, 400);
+    }
+    const listed = await options.db.listChangesPage(page.before, page.limit);
+    const last = listed.changes[listed.changes.length - 1];
+    return json(request, options.env, {
+      changes: listed.changes.map(({ at, setpoint, source, label }) => ({ at, setpoint, source, label })),
+      nextCursor: listed.more && last ? encodeChangeCursor({ at: last.at, id: last.id }) : null,
+    });
+  }
   const now = options.now ?? (() => new Date());
   const range = historyQuery({ span: url.searchParams.get('span') }, now());
   const samples = await options.db.listReads(range.since, range.until, range.bucketSeconds);
