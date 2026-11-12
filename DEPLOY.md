@@ -15,7 +15,7 @@ supabase link --project-ref rdyjczebydnmfvbgylya
 supabase db push
 ```
 
-That applies `supabase/migrations/20261111120000_setpoint.sql` and `supabase/migrations/20261112120000_meter_import.sql`. The first creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. The second adds an `origin` column (`live` or `import`) on meter reads, the `import_meter_reads` function, and `since` / `until` arguments on the history functions. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
+That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, and `supabase/migrations/20261112180000_setpoint_change_pages.sql`. The first creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. The second adds an `origin` column (`live` or `import`) on meter reads, the `import_meter_reads` function, and `since` / `until` arguments on the history functions. The third adds an index on setpoint changes by time and the `list_setpoint_changes_page` function that the History list pages through. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
 
 ## 2. Set function secrets
 
@@ -45,6 +45,7 @@ The CLI prompts for the values. `SWITCHBOT_TOKEN` and `SWITCHBOT_SECRET` can be 
 
 - App functions (`state`, `press`, `recalibrate`, `session`, `history`, `import-meter`, `credentials`, `devices`, and `meter` when the phone calls it) require the header `x-setpoint-app-key`. The helper hashes that header and compares it to the stored hash of `SETPOINT_APP_KEY` in constant time. A missing or wrong key returns 401. The public anon key is not enough.
 - `import-meter` is `POST`. Send JSON `{ "csv": "<file text>" }` or a raw `text/csv` body. It returns `{ "inserted", "duplicates", "skipped", "firstAt", "lastAt", "skipReasons" }`. `skipReasons` lists up to three sample reasons when `skipped` is greater than 0. It uses the existing `SETPOINT_APP_KEY`. It does not add a secret. `tick` and `prune` stay on `CRON_SECRET`. `mcp` stays on `SETPOINT_MCP_KEY`.
+- `history` takes `?span=day|week|month` (or `since` and `until`) and returns `{ "changes", "samples" }` as before. `?view=changes&limit=20&cursor=<nextCursor>` returns one page of setpoint changes, newest first, as `{ "changes", "nextCursor" }`. `limit` is 1 to 100 and defaults to 20. Pass the previous `nextCursor` to get older changes. It is `null` on the last page. A cursor that does not decode returns 400.
 - `meter` also accepts `x-setpoint-cron-secret` so the ten-minute job can keep running. A phone call still needs the app key.
 - `tick` and `prune` accept only `x-setpoint-cron-secret` matching `CRON_SECRET`.
 - `mcp` requires `Authorization: Bearer` to match `SETPOINT_MCP_KEY`. The app key does not open it.
@@ -63,6 +64,10 @@ supabase functions deploy devices
 supabase functions deploy prune
 supabase functions deploy mcp
 ```
+
+### Upgrading a project that already runs
+
+The paged setpoint change list needs `supabase db push` (for `20261112180000_setpoint_change_pages.sql`) and then `supabase functions deploy history`. The other functions bundle the same shared server code, but their behavior did not change, so they do not need a redeploy. The MCP `room_history` tool is unchanged. Run the migration first: a `history` function deployed before it still answers `?span=` requests, but `?view=changes` fails until the database function exists. An app build that pages the list still works against an older `history` function. It gets every change in one response and shows the end of the list.
 
 ## 4. Schedule the jobs
 
@@ -121,4 +126,4 @@ A client starts with `initialize`, then `notifications/initialized`, then `tools
 
 ## Local tests
 
-Docker was not available in the environment that added this server, so the suite does not boot the Supabase CLI stack. `npm test` loads both migrations into PGlite and runs the press lease, the scheduler, skips, run-now, meter prune, CSV import, history ranges, and the MCP tools against those rows. The edge entrypoints are thin wrappers around the same handlers.
+Docker was not available in the environment that added this server, so the suite does not boot the Supabase CLI stack. `npm test` loads the migrations into PGlite and runs the press lease, the scheduler, skips, run-now, meter prune, CSV import, history ranges, setpoint change pages, and the MCP tools against those rows. The edge entrypoints are thin wrappers around the same handlers.
