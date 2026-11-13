@@ -10,23 +10,19 @@ I wanted to turn my regular thermostat into a smart one. I wanted to be able to 
 
 ## What it does
 
-- Set the temperature from your phone. You can turn the dial, use Set to, or tap a preset such as Sleep, Wake, Away, or Home.
-- Run a daily schedule. The default is Sleep at 61°F on weekdays at 11:45 PM, and Wake at 70°F every day at 6:45 AM. You can add, edit, or turn off events.
-- Skip the next run of a schedule, or skip one date. Both can be undone.
-- Sleep now and Wake now apply that target immediately, then mark that run done early or late. They are not a hold, and the next regular run still happens.
-- A temporary hold can pause the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
+- Set the temperature from your phone with the dial, Set to, or a preset such as Sleep, Wake, Away, or Home.
+- Run a daily schedule. The default is Sleep at 61°F on weekdays at 11:45 PM, and Wake at 70°F every day at 6:45 AM. You can add, edit, or turn off events, skip the next run or a date (both can be undone), or run Sleep now or Wake now to apply that target immediately. Those mark the run done early or late. They are not a hold, and the next regular run still happens.
+- A temporary hold pauses the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
 - Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
-- History charts room temperature, humidity, and CO2 for a day, a week, a month, or a year, with marks where the setpoint changed. Longer windows are averaged so the chart stays small, and the year view shows one average per Eastern Time day. The arrows beside the span step back or forward one day, week, month, or year, back to the first stored reading. Tap the dates to jump to any day, or tap Now to come back. Drag across the chart to read a value in Eastern Time, or tap a coral mark to see what changed the setpoint. The list of setpoint changes loads 15 at a time, newest first, across all stored history.
-- Import older room readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
+- History charts room temperature, humidity, and CO2 for a day, week, month, or year, with marks at setpoint changes. Longer windows are averaged, and the year view uses one average per Eastern Time day. You can step or jump through past windows, drag the chart to read a value, or tap a coral mark for details. The change list loads 15 at a time, newest first. You can also import older readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
 - An activity log of presses, calibrations, and schedule runs.
-- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, import meter history, and more.
-- A Siri shortcut can send a spoken request to a Thermostat bot, which then uses that MCP server.
+- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, import meter history, and more. A Siri shortcut can send a spoken request to a Thermostat bot, which then uses that MCP server.
 
 The Home chip says Following schedule, a hold, or Off schedule. Off schedule means the tracked setpoint does not match the current scheduled target. Tap it to retry. That chip does not use the meter.
 
 ## How it works
 
-The thermostat cannot report the number on its display. Setpoint keeps a tracked setpoint, also called the virtual setpoint, by counting successful button presses.
+The thermostat cannot report the number on its display, so Setpoint tracks a virtual setpoint by counting successful button presses.
 
 ```mermaid
 flowchart TD
@@ -38,11 +34,11 @@ flowchart TD
   Meter[Meter reads room temperature, humidity, and CO2] --> Hub
 ```
 
-You enter the number on the display once. After that, each successful up press adds one step (default 1°F) and each successful down press subtracts one. If someone presses the physical buttons, or the count drifts, use Recalibrate. Setpoint never waits for the room to reach a target, and it never copies the room sensor into the setpoint. The meter is read-only.
+You enter the display number once. Each successful up press then adds one step (default 1°F) and each successful down press subtracts one. If someone presses the physical buttons, or the count drifts, use Recalibrate. Setpoint never waits for the room to reach a target, and it never copies the room sensor into the setpoint. The meter is read-only.
 
-When you set a temperature, the app presses the correct bot the right number of times and waits between presses (default 1 second) so the thermostat can register each one. Requests outside the allowed range (default 50 to 85°F) or over the press cap (default 15) are refused before any press. If a press fails, Setpoint stops, keeps the presses that already succeeded, and does not count the failed one. There is an optional setting, off by default, where the first press only wakes the display and does not change the tracked setpoint.
+To change the temperature, the app presses the correct bot the right number of times, waiting between presses (default 1 second) so the thermostat can register each one. Requests outside the allowed range (default 50 to 85°F) or over the press cap (default 15) are refused before any press. If a press fails, Setpoint stops, keeps the presses that already succeeded, and does not count the failed one. An optional setting, off by default, uses the first press only to wake the display and does not change the tracked setpoint.
 
-There are two live paths. On an iPhone, the app can talk to the SwitchBot Open API directly, with the token in the Keychain. When `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` are set and the app is in live mode, the shared server owns those SwitchBot calls, stores history, and keeps the scheduler running while the phone is asleep. Live control from the browser is not supported. Demo mode never contacts SwitchBot or the server, and there is no Bluetooth fallback.
+There are two live paths. On an iPhone, the app can call the SwitchBot Open API directly, with the token in the Keychain. When `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` are set and the app is in live mode, the shared server owns those calls, stores history, and keeps the scheduler running while the phone is asleep. Live control from the browser is not supported. Demo mode never contacts SwitchBot or the server, and there is no Bluetooth fallback.
 
 Schedules use America/New_York (Eastern Time). Catch-up applies only the latest due target and marks earlier ones missed.
 
@@ -159,23 +155,6 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    Use the public anon key, not the service role key. The service role key stays on the server. Do not put the SwitchBot token, the MCP key, or the app key in these variables. Demo mode ignores them.
 
 6. Start the app with `npm start` or `npm run ios`. When those two variables are set, the app asks for `SETPOINT_APP_KEY` once and stores it with `expo-secure-store` on iOS and Android. On the web demo, secure storage is unavailable, so the key stays in `sessionStorage` for that tab only. Then enter the SwitchBot token and secret if the server does not already have them, map the devices, and enter the number on the thermostat display.
-
-## Import meter history
-
-The SwitchBot Open API returns only the current meter reading. Older readings come from a CSV the SwitchBot app exports.
-
-1. Open the SwitchBot app and the Meter Pro (CO2).
-2. Scroll below the graphs to Export Data.
-3. Pick an interval and a start and end time, then export. The file is a CSV for Excel.
-4. In Setpoint, open History and tap Import CSV, then Choose CSV. The sheet reports how many rows were inserted, how many were already stored, and how many were skipped.
-
-You can also send the file to a Thermostat bot that is connected to Setpoint's MCP server. The bot calls `import_meter_csv` with the CSV text.
-
-Celsius and Fahrenheit exports both work. The SwitchBot app writes whichever temperature unit is selected in its settings. Times without a timezone are read as America/New_York. Importing the same file again does not add duplicate rows. If a live reading is already stored at the same instant, that live reading is kept.
-
-The CSV must be comma-separated, with a period as the decimal mark. Semicolon-separated files and decimal commas are not supported. The file needs a timestamp, temperature, humidity, and CO2 column, so an export from a meter that does not report CO2 will be rejected.
-
-Demo and local mode store the import on the phone, keeping the latest 20,000 readings. Live mode sends the file to the server in chunks, and the server keeps every imported row. See [DEPLOY.md](DEPLOY.md).
 
 ## Control it with Siri
 
