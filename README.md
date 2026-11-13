@@ -205,6 +205,17 @@ Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, 
 
 See [DEPLOY.md](DEPLOY.md) for the rest of the server notes.
 
+## Things you can ask
+
+You can give the Thermostat bot plain-language requests like these:
+
+- "Set it to 71 for the next 14 minutes, then drop it back to 68."
+- "What's it like in here? If it's under 66, warm it up to 70."
+- "How cold did it get last night, and when did it hit the low?"
+- "CO2's been high lately. When does it spike?"
+
+The timed and conditional ones are handled by the assistant doing the follow-up step itself, not by a built-in Setpoint feature.
+
 ## Project structure
 
 ```text
