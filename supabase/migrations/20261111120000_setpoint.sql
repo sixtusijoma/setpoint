@@ -25,8 +25,8 @@ insert into public.shared_state (
   1,
   '{"step":1,"delayMs":1000,"minF":50,"maxF":85,"pressCap":15,"wakeFirst":false}'::jsonb,
   '{"up":null,"down":null,"meter":null}'::jsonb,
-  '[{"id":"sleep","label":"Sleep","tempF":61},{"id":"wake","label":"Wake","tempF":70},{"id":"away","label":"Away","tempF":62},{"id":"home","label":"Home","tempF":72}]'::jsonb,
-  '[{"id":"default-sleep","label":"Sleep","hour":23,"minute":45,"targetF":61,"days":[1,2,3,4,5],"enabled":true},{"id":"default-wake","label":"Wake","hour":6,"minute":45,"targetF":70,"days":[1,2,3,4,5,6,7],"enabled":true}]'::jsonb
+  '[{"id":"sleep","label":"Sleep","tempF":66},{"id":"wake","label":"Wake","tempF":70},{"id":"away","label":"Away","tempF":62},{"id":"home","label":"Home","tempF":72}]'::jsonb,
+  '[{"id":"default-sleep","label":"Sleep","hour":22,"minute":0,"targetF":66,"days":[1,2,3,4,5,6,7],"enabled":true},{"id":"default-wake","label":"Wake","hour":7,"minute":0,"targetF":70,"days":[1,2,3,4,5,6,7],"enabled":true}]'::jsonb
 ) on conflict (id) do nothing;
 
 create table if not exists public.press_lease (

@@ -444,9 +444,9 @@ describe('chart geometry', () => {
   it('names where a change came from', () => {
     const events = defaultEvents();
     const at = (iso: string, source: string, label: string, setpoint = 70): SetpointChange => ({ at: iso, source, label, setpoint });
-    expect(describeChangeSource(at('2026-11-11T11:46:00.000Z', 'schedule', 'Schedule · 70°'), events)).toBe('Schedule · Wake');
-    expect(describeChangeSource(at('2026-11-12T04:45:30.000Z', 'schedule', 'Schedule · 61°', 61), events)).toBe('Schedule · Sleep');
-    expect(describeChangeSource(at('2026-11-15T04:45:00.000Z', 'schedule', 'Schedule · 61°', 61), events)).toBe('Schedule');
+    expect(describeChangeSource(at('2026-11-11T12:01:00.000Z', 'schedule', 'Schedule · 70°'), events)).toBe('Schedule · Wake');
+    expect(describeChangeSource(at('2026-11-12T03:00:30.000Z', 'schedule', 'Schedule · 66°', 66), events)).toBe('Schedule · Sleep');
+    expect(describeChangeSource(at('2026-11-15T03:00:30.000Z', 'schedule', 'Schedule · 66°', 66), events)).toBe('Schedule · Sleep');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'schedule', 'Schedule · 70°'), events)).toBe('Schedule');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'manual', 'Manual · 69°'), events)).toBe('Manual');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'manual', 'Home · 72°'), events)).toBe('Home preset');

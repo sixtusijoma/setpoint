@@ -96,7 +96,7 @@ export function createId(): string {
 
 export function defaultPresets(): Preset[] {
   return [
-    { id: 'sleep', label: 'Sleep', tempF: 61 },
+    { id: 'sleep', label: 'Sleep', tempF: 66 },
     { id: 'wake', label: 'Wake', tempF: 70 },
     { id: 'away', label: 'Away', tempF: 62 },
     { id: 'home', label: 'Home', tempF: 72 },

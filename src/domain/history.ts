@@ -313,14 +313,14 @@ export function seedDemoHistory(now: Date): { history: HistorySample[]; changes:
   }
   for (let day = 13; day >= 0; day -= 1) {
     const morning = new Date(end - day * DAY_MS);
-    morning.setUTCHours(11, 45, 0, 0);
+    morning.setUTCHours(12, 0, 0, 0);
     const night = new Date(end - day * DAY_MS);
-    night.setUTCHours(4, 45, 0, 0);
+    night.setUTCHours(3, 0, 0, 0);
     if (morning.getTime() <= end) {
       changes.push({ at: morning.toISOString(), setpoint: 70, source: 'schedule', label: 'Wake' });
     }
-    if (night.getTime() <= end && night.getUTCDay() !== 0 && night.getUTCDay() !== 6) {
-      changes.push({ at: night.toISOString(), setpoint: 61, source: 'schedule', label: 'Sleep' });
+    if (night.getTime() <= end) {
+      changes.push({ at: night.toISOString(), setpoint: 66, source: 'schedule', label: 'Sleep' });
     }
   }
   changes.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));

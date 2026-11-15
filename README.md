@@ -11,7 +11,7 @@ I wanted to turn my regular thermostat into a smart one. I wanted to be able to 
 ## What it does
 
 - Set the temperature from your phone with the dial, Set to, or a preset such as Sleep, Wake, Away, or Home.
-- Run a daily schedule. The default is Sleep at 61°F on weekdays at 11:45 PM, and Wake at 70°F every day at 6:45 AM. You can add, edit, or turn off events, skip the next run or a date (both can be undone), or run Sleep now or Wake now to apply that target immediately. Those mark the run done early or late. They are not a hold, and the next regular run still happens.
+- Run a daily schedule. The default is Sleep at 66°F every day at 10:00 PM, and Wake at 70°F every day at 7:00 AM. You can add, edit, or turn off events, skip the next run or a date (both can be undone), or run Sleep now or Wake now to apply that target immediately. Those mark the run done early or late. They are not a hold, and the next regular run still happens.
 - A temporary hold pauses the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
 - Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
 - History charts room temperature, humidity, and CO2 for a day, week, month, or year, with marks at setpoint changes. Longer windows are averaged, and the year view uses one average per Eastern Time day. You can step or jump through past windows, drag the chart to read a value, or tap a coral mark for details. The change list loads 15 at a time, newest first. You can also import older readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
@@ -48,8 +48,8 @@ These are from the in-browser demo, at iPhone size. The room readings and charts
 
 <table>
   <tr>
-    <td align="center"><img src="docs/images/app-home.png" width="250" alt="Home screen in demo mode. The virtual setpoint is 70 degrees, the room is about 68, and the next change is Sleep at 11:45 PM."><br>Home</td>
-    <td align="center"><img src="docs/images/app-schedule.png" width="250" alt="Schedule screen in Eastern Time, with Sleep at 61 on weekdays and Wake at 70 every day."><br>Schedule</td>
+    <td align="center"><img src="docs/images/app-home.png" width="250" alt="Home screen in demo mode. The virtual setpoint is 70 degrees, the room is about 68, and the next scheduled change is listed."><br>Home</td>
+    <td align="center"><img src="docs/images/app-schedule.png" width="250" alt="Schedule screen in Eastern Time, with Sleep and Wake on the default daily schedule."><br>Schedule</td>
     <td align="center"><img src="docs/images/app-history.png" width="250" alt="History day chart of simulated room temperature, with coral lines at setpoint changes."><br>History, day</td>
   </tr>
   <tr>
@@ -160,7 +160,7 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
 
 I use an iOS Shortcut named Thermostat. It runs Dictate Text, then sends that text with the Grok Bot app's Send Message action to my Thermostat bot. The bot controls Setpoint through its MCP server, so a phrase like "Going to bed early tonight set sleep now" can run Sleep now, the same command the app uses. I trigger the shortcut with Siri, or with Back Tap.
 
-<img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to 61 F.">
+<img src="docs/images/thermostat-bot-chat.png" width="360" alt="Thermostat bot chat on iPhone. After a temperature check, a request to set sleep now runs Sleep and drops the setpoint to the Sleep temperature.">
 
 ## Control it with an AI assistant
 

@@ -411,7 +411,7 @@ describe('shared server', () => {
     const daysOnly = await editScheduleEvent(db, 'default-wake', { days: [1, 2, 3, 4, 5] }, wednesdayMorning);
     expect(daysOnly.catchupFrom).toContain('2026-11-01');
     expect(daysOnly.events.find((event) => event.id === 'default-wake')?.days).toEqual([1, 2, 3, 4, 5]);
-    const moved = await editScheduleEvent(db, 'default-wake', { hour: 7 }, wednesdayMorning);
+    const moved = await editScheduleEvent(db, 'default-wake', { hour: 8 }, wednesdayMorning);
     expect(Date.parse(moved.catchupFrom ?? '')).toBe(wednesdayMorning.getTime());
     const reordered = await editScheduleEvent(db, 'default-wake', { label: 'Wake' }, wednesdayMorning);
     expect(Date.parse(reordered.catchupFrom ?? '')).toBe(wednesdayMorning.getTime());

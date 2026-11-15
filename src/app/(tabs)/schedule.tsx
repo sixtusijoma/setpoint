@@ -186,7 +186,7 @@ export default function ScheduleScreen() {
       <ConfirmDialog
         visible={restoreOpen}
         title="Restore defaults?"
-        body="Replace your weekly schedule with Sleep on weekday nights at 11:45 PM, 61°, and Wake every morning at 6:45 AM, 70°."
+        body="Replace your weekly schedule with Sleep every night at 10:00 PM, 66°, and Wake every morning at 7:00 AM, 70°."
         confirmLabel="Restore"
         onClose={() => setRestoreOpen(false)}
         onConfirm={() => {

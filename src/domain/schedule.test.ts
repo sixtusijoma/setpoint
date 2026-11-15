@@ -27,50 +27,50 @@ describe('schedule clock', () => {
     expect(source.includes('Date.now')).toBe(false);
   });
 
-  it('places 6:45 AM Eastern on different UTC instants in EST and EDT', () => {
+  it('places 7:00 AM Eastern on different UTC instants in EST and EDT', () => {
     const winter = DateTime.fromObject(
-      { year: 2026, month: 1, day: 15, hour: 6, minute: 45 },
+      { year: 2026, month: 1, day: 15, hour: 7, minute: 0 },
       { zone: TIME_ZONE },
     );
     const summer = DateTime.fromObject(
-      { year: 2026, month: 7, day: 15, hour: 6, minute: 45 },
+      { year: 2026, month: 7, day: 15, hour: 7, minute: 0 },
       { zone: TIME_ZONE },
     );
-    expect(winter.toUTC().toISO()).toBe('2026-01-15T11:45:00.000Z');
-    expect(summer.toUTC().toISO()).toBe('2026-07-15T10:45:00.000Z');
+    expect(winter.toUTC().toISO()).toBe('2026-01-15T12:00:00.000Z');
+    expect(summer.toUTC().toISO()).toBe('2026-07-15T11:00:00.000Z');
     const winterHits = listOccurrences(
       defaultEvents(),
       winter.minus({ minutes: 1 }),
       winter.plus({ minutes: 1 }),
     );
     const wake = winterHits.find((item) => item.label === 'Wake');
-    expect(wake?.at).toBe('2026-01-15T11:45:00.000Z');
+    expect(wake?.at).toBe('2026-01-15T12:00:00.000Z');
   });
 
-  it('keeps Friday night Sleep and gives Saturday only Wake', () => {
+  it('keeps Friday night Sleep and lists Saturday Wake and Sleep', () => {
     const fridayEvening = at({ year: 2026, month: 11, day: 6, hour: 21, minute: 0 });
     const next = nextOccurrence(defaultEvents(), fridayEvening);
     expect(next?.label).toBe('Sleep');
-    expect(next?.targetF).toBe(61);
+    expect(next?.targetF).toBe(66);
     const sleepAt = DateTime.fromISO(next?.at ?? '', { setZone: true }).setZone(TIME_ZONE);
     expect(sleepAt.weekday).toBe(5);
-    expect(sleepAt.hour).toBe(23);
-    expect(sleepAt.minute).toBe(45);
+    expect(sleepAt.hour).toBe(22);
+    expect(sleepAt.minute).toBe(0);
 
-    const fridayLate = at({ year: 2026, month: 11, day: 6, hour: 23, minute: 50 });
+    const fridayLate = at({ year: 2026, month: 11, day: 6, hour: 22, minute: 5 });
     const afterSleep = nextOccurrence(defaultEvents(), fridayLate);
     const wakeAt = DateTime.fromISO(afterSleep?.at ?? '', { setZone: true }).setZone(TIME_ZONE);
     expect(afterSleep?.label).toBe('Wake');
     expect(wakeAt.weekday).toBe(6);
-    expect(wakeAt.hour).toBe(6);
-    expect(wakeAt.minute).toBe(45);
+    expect(wakeAt.hour).toBe(7);
+    expect(wakeAt.minute).toBe(0);
 
     const saturday = DateTime.fromObject(
       { year: 2026, month: 11, day: 7, hour: 12, minute: 0 },
       { zone: TIME_ZONE },
     );
     const onSaturday = listOccurrences(defaultEvents(), saturday.startOf('day'), saturday.endOf('day'));
-    expect(onSaturday.map((item) => item.label)).toEqual(['Wake']);
+    expect(onSaturday.map((item) => item.label)).toEqual(['Wake', 'Sleep']);
   });
 
   it('marks earlier overdue occurrences missed and applies only the latest', () => {
@@ -189,19 +189,19 @@ describe('cancelled inbox', () => {
     const early: RunRecord = {
       key: 'early',
       eventId: 'default-wake',
-      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 6, minute: 45 }),
+      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 7, minute: 0 }),
       label: 'Wake',
       targetF: 70,
       status: 'cancelled',
       message: 'Cancelled',
-      recordedAt: iso({ year: 2026, month: 11, day: 10, hour: 6, minute: 50 }),
+      recordedAt: iso({ year: 2026, month: 11, day: 10, hour: 7, minute: 5 }),
     };
     const later: RunRecord = {
       ...early,
       key: 'later',
-      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 23, minute: 45 }),
+      occurrenceAt: iso({ year: 2026, month: 11, day: 10, hour: 22, minute: 0 }),
       label: 'Sleep',
-      targetF: 61,
+      targetF: 66,
       status: 'done-on-time',
     };
     expect(openCancelled([early]).map((record) => record.key)).toEqual(['early']);

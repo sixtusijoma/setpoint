@@ -101,7 +101,7 @@ describe('occurrence state machine', () => {
     const evening = at({ year: 2026, month: 11, day: 9, hour: 21, minute: 0 });
     const sleep = occurrenceForRunNow(defaultEvents(), 'default-sleep', evening);
     expect(sleep?.label).toBe('Sleep');
-    expect(DateTime.fromISO(sleep?.at ?? '', { setZone: true }).setZone(TIME_ZONE).hour).toBe(23);
+    expect(DateTime.fromISO(sleep?.at ?? '', { setZone: true }).setZone(TIME_ZONE).hour).toBe(22);
   });
 });
 

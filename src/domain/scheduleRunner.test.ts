@@ -113,6 +113,6 @@ describe('runDueSchedule', () => {
       },
     });
     expect(leftAlone.records.find((item) => item.key === record.key)?.status).toBe('cancelled');
-    expect(nextOccurrence(defaultEvents(), at(9, 0))?.label).toBe('Wake');
+    expect(nextOccurrence(defaultEvents(), at(9, 0))?.label).toBe('Sleep');
   });
 });
