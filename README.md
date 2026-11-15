@@ -10,15 +10,12 @@ I wanted to turn my regular thermostat into a smart one. I wanted to be able to 
 
 ## What it does
 
-- Set the temperature from your phone with the dial, Set to, or a preset such as Sleep, Wake, Away, or Home.
-- Run a daily schedule. The default is Sleep at 66°F every day at 10:00 PM, and Wake at 70°F every day at 7:00 AM. You can add, edit, or turn off events, skip the next run or a date (both can be undone), or run Sleep now or Wake now to apply that target immediately. Those mark the run done early or late. They are not a hold, and the next regular run still happens.
-- A temporary hold pauses the schedule after you change the temperature by hand in the app. Resume it from Home when you want the schedule to take over again.
-- Recalibrate tells the app what the thermostat display actually shows, without pressing any buttons.
-- History charts room temperature, humidity, and CO2 for a day, week, month, or year, with marks at setpoint changes. Longer windows are averaged, and the year view uses one average per Eastern Time day. You can step or jump through past windows, drag the chart to read a value, or tap a coral mark for details. The change list loads 15 at a time, newest first. You can also import older readings from a CSV the SwitchBot app exports. Importing the same file again does not add duplicate rows.
-- An activity log of presses, calibrations, and schedule runs.
-- An MCP server so an AI assistant can set the temperature, edit the schedule, skip a wake, recalibrate, import meter history, and more. A Siri shortcut can send a spoken request to a Thermostat bot, which then uses that MCP server.
-
-The Home chip says Following schedule, a hold, or Off schedule. Off schedule means the tracked setpoint does not match the current scheduled target. Tap it to retry. That chip does not use the meter.
+- Set the temperature from your phone with the dial or a preset (Sleep, Wake, Away, Home).
+- Run a daily schedule (by default, Sleep at 66°F at 10:00 PM and Wake at 70°F at 7:00 AM). You can edit it, skip a run, or run an event now.
+- Hold a temperature you set by hand until you resume the schedule.
+- Recalibrate when the thermostat display and the app disagree.
+- Chart room temperature, humidity, and CO2 over a day, week, month, or year, with your setpoint changes marked.
+- Let an AI assistant or Siri control it through an MCP server.
 
 ## How it works
 
