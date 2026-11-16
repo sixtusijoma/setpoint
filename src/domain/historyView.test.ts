@@ -41,6 +41,7 @@ import {
   reduceHistoryView,
   shiftMonth,
   viewWindow,
+  visibleHistoryData,
   windowLabel,
   type HistoryView,
   type HistoryViewEvent,
@@ -299,6 +300,25 @@ describe('history window navigation', () => {
     expect(off.load.status).toBe('off');
     expect(run(off, { type: 'off' })).toBe(off);
     expect(run(off, { type: 'loaded', request: off.load.request, data: late, today: TODAY })).toBe(off);
+  });
+
+  it('keeps the previous chart while the same window reloads', () => {
+    const ready = loadedView();
+    if (ready.load.status !== 'ready') {
+      throw new Error('expected a ready window');
+    }
+    const key = ready.load.window.key;
+    const again = reduceHistoryView(ready, { type: 'fetch', window: ready.load.window });
+    expect(again.load).toMatchObject({ status: 'loading', previous: ready.load.data });
+    expect(visibleHistoryData(again, key)).toBe(ready.load.data);
+    const failed = reduceHistoryView(again, { type: 'fail', request: again.load.request, message: 'Offline.' });
+    expect(failed.load).toMatchObject({ status: 'error', previous: ready.load.data });
+    expect(visibleHistoryData(failed, key)).toBe(ready.load.data);
+    const otherWindow = historyWindow('day', '2026-06-01');
+    const other = reduceHistoryView(ready, { type: 'fetch', window: otherWindow });
+    expect(other.load).toMatchObject({ status: 'loading', previous: null });
+    expect(visibleHistoryData(other, otherWindow.key)).toBeNull();
+    expect(visibleHistoryData(ready, key)).toBe(ready.load.data);
   });
 
   it('keeps the error with its window so retry asks again', () => {

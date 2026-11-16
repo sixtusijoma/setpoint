@@ -115,9 +115,9 @@ export function localWindowData(
 
 export type HistoryLoad =
   | { status: 'off'; request: number }
-  | { status: 'loading'; request: number; window: HistoryWindow }
+  | { status: 'loading'; request: number; window: HistoryWindow; previous: HistoryWindowData | null }
   | { status: 'ready'; request: number; window: HistoryWindow; data: HistoryWindowData }
-  | { status: 'error'; request: number; window: HistoryWindow; message: string };
+  | { status: 'error'; request: number; window: HistoryWindow; message: string; previous: HistoryWindowData | null };
 
 export type HistoryView = {
   span: HistorySpan;
@@ -165,6 +165,20 @@ function earliestFrom(firstAt: string | null, today: string): string {
   return firstAt === null || !Number.isFinite(Date.parse(firstAt)) ? today : etDay(firstAt);
 }
 
+function carried(load: HistoryLoad, key: string): HistoryWindowData | null {
+  if (load.status === 'ready' && load.window.key === key) {
+    return load.data;
+  }
+  if ((load.status === 'loading' || load.status === 'error') && load.window.key === key) {
+    return load.previous;
+  }
+  return null;
+}
+
+export function visibleHistoryData(view: HistoryView, key: string): HistoryWindowData | null {
+  return carried(view.load, key);
+}
+
 export function reduceHistoryView(view: HistoryView, event: HistoryViewEvent): HistoryView {
   switch (event.type) {
     case 'span':
@@ -192,7 +206,12 @@ export function reduceHistoryView(view: HistoryView, event: HistoryViewEvent): H
     case 'fetch':
       return {
         ...view,
-        load: { status: 'loading', request: view.load.request + 1, window: event.window },
+        load: {
+          status: 'loading',
+          request: view.load.request + 1,
+          window: event.window,
+          previous: carried(view.load, event.window.key),
+        },
       };
     case 'off':
       return view.load.status === 'off' ? view : { ...view, load: { status: 'off', request: view.load.request + 1 } };
@@ -214,7 +233,13 @@ export function reduceHistoryView(view: HistoryView, event: HistoryViewEvent): H
       }
       return {
         ...view,
-        load: { status: 'error', request: view.load.request, window: view.load.window, message: event.message },
+        load: {
+          status: 'error',
+          request: view.load.request,
+          window: view.load.window,
+          message: event.message,
+          previous: view.load.previous,
+        },
       };
   }
 }

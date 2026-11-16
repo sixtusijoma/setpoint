@@ -6,10 +6,11 @@ import { chipFor, currentTarget, nextOccurrence } from '@/domain/schedule';
 import { formatRoom, setpointAccent } from '@/domain/temperature';
 import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
+import { refreshSpinner } from '@/domain/refresh';
 import { suggestedTarget, useApp } from '@/state/store';
 import { accentColor, colors, fonts, toneColor } from '@/theme';
 import { useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export default function HomeScreen() {
@@ -53,7 +54,7 @@ export default function HomeScreen() {
       return;
     }
     lastPull.current = now;
-    void refreshRef.current();
+    void refreshRef.current('user');
   }
 
   useEffect(() => {
@@ -129,6 +130,8 @@ export default function HomeScreen() {
     now: app.clock,
   });
 
+  const pulling = refreshSpinner(app.refresh);
+
   return (
     <ScrollView
       ref={(node) => {
@@ -138,9 +141,9 @@ export default function HomeScreen() {
       contentContainerStyle={[styles.content, { paddingTop: Math.max(insets.top, 12) }]}
       refreshControl={
         <RefreshControl
-          refreshing={app.refreshing}
+          refreshing={pulling}
           onRefresh={() => {
-            void app.refreshClimate();
+            void app.refreshClimate('user');
           }}
           tintColor={colors.text}
         />
@@ -156,7 +159,12 @@ export default function HomeScreen() {
         finishPull(event.nativeEvent.pageY);
       }}
     >
-      <View style={styles.header}>
+      {Platform.OS === 'web' && pulling ? (
+        <View pointerEvents="none" testID="refresh-spinner" style={styles.pullSpinner}>
+          <ActivityIndicator color={colors.text} />
+        </View>
+      ) : null}
+      <View style={styles.header} testID={`home-refresh-${app.refresh}`}>
         <View>
           <Text style={styles.kicker}>
             {app.state.mode === 'demo' ? 'Demo' : 'Live'} · {app.state.roomLabel}
@@ -233,8 +241,8 @@ export default function HomeScreen() {
           <Stat
             label="CO2"
             value={reading ? `${Math.round(reading.co2Ppm)} ppm` : '-'}
-            detail={band?.label}
-            detailColor={band ? toneColor(band.tone) : colors.muted}
+            detail={band?.label ?? '\u00a0'}
+            detailColor={band ? toneColor(band.tone) : 'transparent'}
             testID="co2-label"
           />
         </View>
@@ -441,6 +449,14 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: colors.bg,
+  },
+  pullSpinner: {
+    position: 'absolute',
+    top: 8,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 2,
   },
   content: {
     paddingHorizontal: 20,
