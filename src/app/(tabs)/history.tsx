@@ -22,6 +22,7 @@ import {
   localWindowData,
   reduceHistoryView,
   viewWindow,
+  visibleHistoryData,
   windowLabel,
   type HistoryWindow,
 } from '@/domain/historyWindow';
@@ -99,15 +100,11 @@ export default function HistoryScreen() {
       dispatchView({ type: 'bounds', firstAt: localFirstAt, today });
     }
   }, [liveServer, localFirstAt, today]);
-  const data = liveServer
-    ? view.load.status === 'ready' && view.load.window.key === period.key
-      ? view.load.data
-      : null
-    : localData;
+  const data = liveServer ? visibleHistoryData(view, period.key) : localData;
   const samples = data?.samples ?? [];
   const changes = data?.changes ?? [];
   const domain = useMemo(() => ({ startMs: period.startMs, endMs: period.endMs }), [period]);
-  const waiting = liveServer && (view.load.status === 'loading' || (view.load.status === 'ready' && data === null));
+  const waiting = liveServer && data === null && (view.load.status === 'loading' || view.load.status === 'ready');
   const failed = liveServer && view.load.status === 'error' ? view.load.message : null;
 
   const source = liveServer ? 'server' : 'local';

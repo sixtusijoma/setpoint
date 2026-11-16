@@ -8,6 +8,7 @@ import {
   type Connection,
   type ConnectionEvent,
 } from '@/domain/connection';
+import { initialRefresh, reduceRefresh, type Refresh, type RefreshEvent, type RefreshPhase } from '@/domain/refresh';
 import { deriveLink, mapRejection } from '@/domain/link';
 import { lifecycleEventForAppState, reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
 import { pushMessage, type AppMessage } from '@/domain/messages';
@@ -126,7 +127,7 @@ type AppContextValue = {
   clock: Date;
   command: CommandProgress | null;
   banner: string | null;
-  refreshing: boolean;
+  refresh: RefreshPhase;
   devices: SwitchBotDevice[];
   deviceMessage: string | null;
   hasCredentials: boolean;
@@ -152,7 +153,7 @@ type AppContextValue = {
   setTo: (target: number) => Promise<CommandResult>;
   applyPreset: (preset: Preset) => Promise<void>;
   cancelCommand: () => void;
-  refreshClimate: () => Promise<void>;
+  refreshClimate: (source?: 'user' | 'background') => Promise<void>;
   setCo2Band: (tone: Co2Tone) => void;
   setFailNext: (value: boolean) => void;
   setLoseNext: (value: boolean) => void;
@@ -231,7 +232,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [command, setCommand] = useState<CommandProgress | null>(null);
   const [message, setMessage] = useState<AppMessage>(null);
   const [connection, setConnection] = useState<Connection>(initialConnection);
-  const [refreshing, setRefreshing] = useState(false);
+  const [refresh, setRefresh] = useState<Refresh>(initialRefresh);
   const [devices, setDevices] = useState<SwitchBotDevice[]>([]);
   const [deviceMessage, setDeviceMessage] = useState<string | null>(null);
   const [hasCredentials, setHasCredentials] = useState(false);
@@ -247,11 +248,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const meterImportRef = useRef<MeterImportState>(idleMeterImport());
   const messageRef = useRef<AppMessage>(null);
   const connectionRef = useRef<Connection>(initialConnection());
+  const refreshStateRef = useRef<Refresh>(initialRefresh());
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
   const sessionRef = useRef<PressSession>(idleSession());
   const resumeAfterRef = useRef(false);
-  const refreshingRef = useRef(false);
   const tickLock = useRef(false);
   const tickImpl = useRef<(now: Date) => Promise<void>>(async () => undefined);
   const lifecycleRef = useRef<Lifecycle>({ kind: 'boot' });
@@ -276,6 +277,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
     connectionRef.current = next;
     setConnection(next);
+  }, []);
+
+  const applyRefresh = useCallback((event: RefreshEvent): Refresh => {
+    const next = reduceRefresh(refreshStateRef.current, event);
+    if (next === refreshStateRef.current) {
+      return next;
+    }
+    refreshStateRef.current = next;
+    setRefresh(next);
+    return next;
   }, []);
 
   const applyAccess = useCallback((event: AppAccessEvent) => {
@@ -1090,12 +1101,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [noteAuth, sessionAuth]);
 
-  const refreshClimate = useCallback(async () => {
-    if (refreshingRef.current) {
+  const refreshClimate = useCallback(async (source: 'user' | 'background' = 'background') => {
+    const current = refreshStateRef.current;
+    if (current.phase !== 'idle') {
+      applyRefresh({ type: 'start', source });
       return;
     }
-    refreshingRef.current = true;
-    setRefreshing(true);
+    const started = applyRefresh({ type: 'start', source });
+    const epoch = started.epoch;
     try {
       const snapshot = stateRef.current;
       const nowIso = new Date().toISOString();
@@ -1176,10 +1189,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       noteTransportFailure(error);
     } finally {
-      refreshingRef.current = false;
-      setRefreshing(false);
+      applyRefresh({ type: 'settle', epoch });
     }
-  }, [applyConnection, commit, noteTransportFailure, noteTransportSuccess, sessionAuth]);
+  }, [applyConnection, applyRefresh, commit, noteTransportFailure, noteTransportSuccess, sessionAuth]);
 
   const refreshRef = useRef(refreshClimate);
   refreshRef.current = refreshClimate;
@@ -1191,7 +1203,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       clock,
       command,
       banner: message?.text ?? connectionBanner(connection),
-      refreshing,
+      refresh: refresh.phase,
       devices,
       deviceMessage,
       hasCredentials,
@@ -1785,7 +1797,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     command,
     message,
     connection,
-    refreshing,
+    refresh,
     devices,
     deviceMessage,
     hasCredentials,
