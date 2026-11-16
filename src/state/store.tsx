@@ -1,7 +1,15 @@
 import { BROWSER_BLOCKED, CHECK_THERMOSTAT } from '@/copy';
 import { co2ForBand, type Co2Tone } from '@/domain/co2';
+import {
+  connectionBanner,
+  CONNECTION_DOWN_AFTER_MS,
+  initialConnection,
+  reduceConnection,
+  type Connection,
+  type ConnectionEvent,
+} from '@/domain/connection';
 import { deriveLink, mapRejection } from '@/domain/link';
-import { reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
+import { lifecycleEventForAppState, reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
 import { pushMessage, type AppMessage } from '@/domain/messages';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '@/domain/occurrences';
 import { nearestTarget, planSetTo } from '@/domain/planSetTo';
@@ -50,6 +58,7 @@ import {
   fetchRemoteDevices,
   fetchRemoteSession,
   fetchState,
+  isTransientNetworkError,
   readServerConfig,
   recalibrateRemote,
   requestRemoteMeter,
@@ -95,6 +104,7 @@ import { AppState, Platform, type AppStateStatus } from 'react-native';
 
 const FIRST_ARM_MS = 800;
 const DEMO_PRESS_MS = 1200;
+const FOREGROUND_REFRESH_MS = 500;
 
 export type CommandProgress = {
   index: number;
@@ -176,7 +186,7 @@ function explainError(error: unknown, secret = ''): string {
   let text = 'Something went wrong.';
   if (error instanceof ServerAuthError) {
     text = error.message;
-  } else if (Platform.OS === 'web' && (error instanceof TransportError || isFetchFailure(error))) {
+  } else if (Platform.OS === 'web' && (error instanceof TransportError || isTransientNetworkError(error))) {
     text = BROWSER_BLOCKED;
   } else if (error instanceof Error && error.message) {
     text = error.message;
@@ -187,11 +197,12 @@ function explainError(error: unknown, secret = ''): string {
   return text;
 }
 
-function isFetchFailure(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
+function connectionFailure(error: unknown, secret: string): ConnectionEvent {
+  const text = explainError(error, secret);
+  if (error instanceof TransportError || isTransientNetworkError(error)) {
+    return { type: 'transient-failure', error: text, at: Date.now() };
   }
-  return /failed to fetch|network request failed|load failed/i.test(error.message);
+  return { type: 'hard-failure', error: text };
 }
 
 function changeMark(source: CommandSource, setpoint: number): { source: string; label: string } {
@@ -219,6 +230,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [clock, setClock] = useState(() => new Date());
   const [command, setCommand] = useState<CommandProgress | null>(null);
   const [message, setMessage] = useState<AppMessage>(null);
+  const [connection, setConnection] = useState<Connection>(initialConnection);
   const [refreshing, setRefreshing] = useState(false);
   const [devices, setDevices] = useState<SwitchBotDevice[]>([]);
   const [deviceMessage, setDeviceMessage] = useState<string | null>(null);
@@ -234,6 +246,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const accessRef = useRef<AppAccess>({ status: 'unused' });
   const meterImportRef = useRef<MeterImportState>(idleMeterImport());
   const messageRef = useRef<AppMessage>(null);
+  const connectionRef = useRef<Connection>(initialConnection());
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
   const sessionRef = useRef<PressSession>(idleSession());
@@ -247,12 +260,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const pushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncRef = useRef<SharedSync>(createSharedSync());
   const pullSharedRef = useRef<() => Promise<void>>(async () => undefined);
+  const pullFlight = useRef<Promise<void> | null>(null);
   const pushSharedRef = useRef<() => void>(() => undefined);
 
   const showMessage = useCallback((next: AppMessage) => {
     const merged = next === null ? null : pushMessage(messageRef.current, next);
     messageRef.current = merged;
     setMessage(merged);
+  }, []);
+
+  const applyConnection = useCallback((event: ConnectionEvent) => {
+    const next = reduceConnection(connectionRef.current, event);
+    if (next === connectionRef.current) {
+      return;
+    }
+    connectionRef.current = next;
+    setConnection(next);
   }, []);
 
   const applyAccess = useCallback((event: AppAccessEvent) => {
@@ -287,6 +310,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [applyAccess],
   );
 
+  const noteTransportSuccess = useCallback(() => {
+    applyConnection({ type: 'success' });
+  }, [applyConnection]);
+
+  const noteTransportFailure = useCallback(
+    (error: unknown) => {
+      if (noteAuth(error)) {
+        return;
+      }
+      applyConnection(connectionFailure(error, appKeyRef.current));
+    },
+    [applyConnection, noteAuth],
+  );
+
   const commit = useCallback((recipe: (prev: Persisted) => Persisted) => {
     const next = recipe(stateRef.current);
     stateRef.current = next;
@@ -314,6 +351,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       void saveState(auth.config, auth.appKey, patch)
         .then((saved) => {
           settlePush(sync, { ok: true, saved });
+          noteTransportSuccess();
           commit((prev) => mergePulled(sync, prev, saved) ?? prev);
           if (sync.dirty.size > 0) {
             pushSharedRef.current();
@@ -329,10 +367,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
             void pullSharedRef.current();
             return;
           }
-          showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
+          noteTransportFailure(error);
         });
     }, 250);
-  }, [commit, noteAuth, sessionAuth, showMessage]);
+  }, [commit, noteAuth, noteTransportFailure, noteTransportSuccess, sessionAuth]);
 
   pushSharedRef.current = pushShared;
 
@@ -444,33 +482,46 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const pullShared = useCallback(async () => {
+    if (pullFlight.current) {
+      return pullFlight.current;
+    }
     const auth = sessionAuth();
     const sync = syncRef.current;
     if (!auth || stateRef.current.mode !== 'live' || isRunning(sessionRef.current) || !canPull(sync)) {
       return;
     }
+    const flight = (async () => {
+      try {
+        const snap = await fetchState(auth.config, auth.appKey);
+        if (!canPull(sync)) {
+          noteTransportSuccess();
+          return;
+        }
+        if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+          acceptVersion(sync, snap.version);
+          const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, sync.version));
+          acceptVersion(sync, saved.version);
+          noteTransportSuccess();
+          return;
+        }
+        commit((prev) => mergePulled(sync, prev, snap) ?? prev);
+        noteTransportSuccess();
+        if (sync.dirty.size > 0 && sync.sending.size === 0 && !pushTimer.current) {
+          pushSharedRef.current();
+        }
+      } catch (error) {
+        noteTransportFailure(error);
+      }
+    })();
+    pullFlight.current = flight;
     try {
-      const snap = await fetchState(auth.config, auth.appKey);
-      if (!canPull(sync)) {
-        return;
+      await flight;
+    } finally {
+      if (pullFlight.current === flight) {
+        pullFlight.current = null;
       }
-      if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
-        acceptVersion(sync, snap.version);
-        const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, sync.version));
-        acceptVersion(sync, saved.version);
-        return;
-      }
-      commit((prev) => mergePulled(sync, prev, snap) ?? prev);
-      if (sync.dirty.size > 0 && sync.sending.size === 0 && !pushTimer.current) {
-        pushSharedRef.current();
-      }
-    } catch (error) {
-      if (noteAuth(error)) {
-        return;
-      }
-      showMessage({ source: 'link', text: explainError(error, appKeyRef.current) });
     }
-  }, [commit, noteAuth, sessionAuth, showMessage]);
+  }, [commit, noteTransportFailure, noteTransportSuccess, sessionAuth]);
 
   pullSharedRef.current = pullShared;
 
@@ -595,21 +646,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (link.kind === 'live' && link.phase === 'needs-credentials') {
         const reason = 'Add a SwitchBot token and secret in Settings.';
         if (source.kind !== 'schedule') {
-          showMessage({ source: 'link', text: reason });
+          showMessage({ source: 'press', text: reason });
         }
         return { status: 'refused', stoppedAt: current, wanted: target, reason };
       }
       if (link.kind === 'live' && link.phase === 'needs-bots') {
         const reason = 'Map the up bot and the down bot in Settings before sending presses.';
         if (source.kind !== 'schedule') {
-          showMessage({ source: 'link', text: reason });
+          showMessage({ source: 'press', text: reason });
         }
         return { status: 'refused', stoppedAt: current, wanted: target, reason };
       }
       if (link.kind === 'live' && link.phase === 'ready' && link.cloud === 'off') {
         const reason = 'Cloud service is off. Turn it on in the SwitchBot app. Setpoint does not fall back to Bluetooth.';
         if (source.kind !== 'schedule') {
-          showMessage({ source: 'link', text: reason });
+          showMessage({ source: 'press', text: reason });
         }
         return { status: 'refused', stoppedAt: current, wanted: target, reason };
       }
@@ -625,7 +676,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (!auth) {
           const reason = 'Enter the app key before sending a press.';
           if (source.kind !== 'schedule') {
-            showMessage({ source: 'link', text: reason });
+            showMessage({ source: 'press', text: reason });
           }
           return { status: 'refused', stoppedAt: current, wanted: target, reason };
         }
@@ -865,6 +916,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
   tickImpl.current = tick;
 
   useEffect(() => {
+    if (connection.status !== 'flaky') {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = () => {
+      const current = connectionRef.current;
+      if (current.status !== 'flaky') {
+        return;
+      }
+      const wait = current.since + CONNECTION_DOWN_AFTER_MS - Date.now();
+      timer = setTimeout(() => {
+        const latest = connectionRef.current;
+        if (latest.status !== 'flaky') {
+          return;
+        }
+        const now = Date.now();
+        if (now - latest.since >= CONNECTION_DOWN_AFTER_MS) {
+          applyConnection({ type: 'foreground', at: now });
+          return;
+        }
+        arm();
+      }, Math.max(0, wait));
+    };
+    arm();
+    return () => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [applyConnection, connection]);
+
+  useEffect(() => {
     if (!ready || state.virtualSetpoint === null) {
       return;
     }
@@ -873,32 +956,58 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const timer = setInterval(() => {
       void tickImpl.current(new Date());
     }, 5000);
-    const onAppState = (status: AppStateStatus) => {
-      if (status === 'active') {
-        lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'foreground');
-        commit((prev) => (prev.schedulePhase === 'armed' ? prev : { ...prev, schedulePhase: 'armed' }));
-        void tickImpl.current(new Date());
-        void refreshRef.current();
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    const pause = () => {
+      if (resumeTimer) {
+        clearTimeout(resumeTimer);
+        resumeTimer = null;
+      }
+      const event = lifecycleEventForAppState(lifecycleRef.current, 'background');
+      if (!event) {
         return;
       }
-      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'background');
+      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, event);
       if (isRunning(sessionRef.current)) {
         interruptRef.current = true;
         lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'press-interrupted');
       }
     };
+    const resume = () => {
+      if (lifecycleEventForAppState(lifecycleRef.current, 'active') !== 'foreground') {
+        return;
+      }
+      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'foreground');
+      commit((prev) => (prev.schedulePhase === 'armed' ? prev : { ...prev, schedulePhase: 'armed' }));
+      if (resumeTimer) {
+        clearTimeout(resumeTimer);
+      }
+      resumeTimer = setTimeout(() => {
+        resumeTimer = null;
+        void (async () => {
+          await tickImpl.current(new Date());
+          await refreshRef.current();
+          applyConnection({ type: 'foreground', at: Date.now() });
+        })();
+      }, FOREGROUND_REFRESH_MS);
+    };
+    const onAppState = (status: AppStateStatus) => {
+      const event = lifecycleEventForAppState(lifecycleRef.current, status);
+      if (event === 'foreground') {
+        resume();
+        return;
+      }
+      if (event === 'background') {
+        pause();
+      }
+    };
     const subscription = AppState.addEventListener('change', onAppState);
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
-        lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'foreground');
-        commit((prev) => (prev.schedulePhase === 'armed' ? prev : { ...prev, schedulePhase: 'armed' }));
-        void tickImpl.current(new Date());
-        void refreshRef.current();
+        resume();
         return;
       }
-      lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'background');
-      if (isRunning(sessionRef.current)) {
-        interruptRef.current = true;
+      if (document.visibilityState === 'hidden') {
+        pause();
       }
     };
     if (Platform.OS === 'web') {
@@ -906,12 +1015,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
     return () => {
       clearInterval(timer);
+      if (resumeTimer) {
+        clearTimeout(resumeTimer);
+      }
       subscription.remove();
       if (Platform.OS === 'web') {
         document.removeEventListener('visibilitychange', onVisible);
       }
     };
-  }, [commit, ready, state.virtualSetpoint === null]);
+  }, [applyConnection, commit, ready, state.virtualSetpoint === null]);
 
   useEffect(() => {
     return watchNotificationOpen(() => {
@@ -1007,6 +1119,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           return;
         }
         const meter = await requestRemoteMeter(auth.config, auth.appKey);
+        noteTransportSuccess();
         if (meter.sample) {
           commit((prev) => ({
             ...prev,
@@ -1026,11 +1139,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       const creds = await loadCredentials();
       if (!creds) {
-        showMessage({ source: 'link', text: 'Add a SwitchBot token and secret in Settings.' });
+        applyConnection({ type: 'hard-failure', error: 'Add a SwitchBot token and secret in Settings.' });
         return;
       }
       if (!snapshot.deviceMap.meter) {
-        showMessage({ source: 'meter', text: 'Map the Meter in Settings to read the room.' });
+        applyConnection({ type: 'hard-failure', error: 'Map the Meter in Settings to read the room.' });
         return;
       }
       const meter = await readMeter(creds, snapshot.deviceMap.meter.id);
@@ -1059,15 +1172,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
           { at: nowIso, temperatureF: meter.temperatureF, humidity: meter.humidity, co2Ppm: meter.co2Ppm },
         ].slice(-LOCAL_HISTORY_CAP),
       }));
+      noteTransportSuccess();
     } catch (error) {
-      if (!noteAuth(error)) {
-        showMessage({ source: 'meter', text: explainError(error, appKeyRef.current) });
-      }
+      noteTransportFailure(error);
     } finally {
       refreshingRef.current = false;
       setRefreshing(false);
     }
-  }, [commit, noteAuth, sessionAuth, showMessage]);
+  }, [applyConnection, commit, noteTransportFailure, noteTransportSuccess, sessionAuth]);
 
   const refreshRef = useRef(refreshClimate);
   refreshRef.current = refreshClimate;
@@ -1078,7 +1190,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       state,
       clock,
       command,
-      banner: message?.text ?? null,
+      banner: message?.text ?? connectionBanner(connection),
       refreshing,
       devices,
       deviceMessage,
@@ -1128,7 +1240,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setGateNote(null);
         applyAccess({ type: 'change' });
       },
-      clearBanner: () => showMessage(null),
+      clearBanner: () => {
+        showMessage(null);
+        if (connectionRef.current.status === 'down') {
+          applyConnection({ type: 'dismiss' });
+        }
+      },
       setMode: (mode) => {
         if (isRunning(sessionRef.current)) {
           showMessage({ source: 'press', text: 'Finish the press before changing mode.' });
@@ -1667,6 +1784,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     clock,
     command,
     message,
+    connection,
     refreshing,
     devices,
     deviceMessage,
@@ -1678,6 +1796,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     gateNote,
     meterImport,
     applyAccess,
+    applyConnection,
     applyMeterImport,
     sessionAuth,
     noteAuth,

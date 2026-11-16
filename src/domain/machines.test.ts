@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { initialClimate } from '@/devices/simulator';
 import { deriveLink, mapRejection } from '@/domain/link';
-import { reduceLifecycle } from '@/domain/lifecycle';
+import { lifecycleEventForAppState, reduceLifecycle } from '@/domain/lifecycle';
 import { pushMessage } from '@/domain/messages';
 import { deriveRoom } from '@/domain/room';
 import { writeSetpoint } from '@/domain/setpoint';
@@ -97,10 +97,23 @@ describe('link, room, lifecycle, messages, setpoint', () => {
     expect(reduceLifecycle({ kind: 'active' }, 'booted')).toEqual({ kind: 'active' });
   });
 
-  it('does not let a meter error replace a press message', () => {
+  it('does not treat inactive as background', () => {
+    const active = { kind: 'active' as const };
+    const paused = { kind: 'paused' as const, press: 'none' as const };
+    expect(lifecycleEventForAppState(active, 'inactive')).toBeNull();
+    expect(lifecycleEventForAppState(paused, 'inactive')).toBeNull();
+    expect(lifecycleEventForAppState(active, 'unknown')).toBeNull();
+    expect(lifecycleEventForAppState(active, 'extension')).toBeNull();
+    expect(lifecycleEventForAppState(active, 'active')).toBeNull();
+    expect(lifecycleEventForAppState({ kind: 'boot' }, 'background')).toBeNull();
+    expect(lifecycleEventForAppState(active, 'background')).toBe('background');
+    expect(lifecycleEventForAppState(paused, 'active')).toBe('foreground');
+  });
+
+  it('does not let a schedule note replace a press message', () => {
     const press = { source: 'press' as const, text: 'Stopped at 71°.' };
-    expect(pushMessage(press, { source: 'meter', text: 'Meter failed.' })).toEqual(press);
-    expect(pushMessage({ source: 'meter', text: 'Meter failed.' }, press)).toEqual(press);
+    expect(pushMessage(press, { source: 'schedule', text: 'Sleep did not run.' })).toEqual(press);
+    expect(pushMessage({ source: 'schedule', text: 'Sleep did not run.' }, press)).toEqual(press);
     expect(pushMessage(press, null)).toBeNull();
   });
 

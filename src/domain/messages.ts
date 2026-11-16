@@ -1,13 +1,11 @@
 export type AppMessage = {
-  source: 'press' | 'schedule' | 'meter' | 'link';
+  source: 'press' | 'schedule';
   text: string;
 } | null;
 
 const rank: Record<NonNullable<AppMessage>['source'], number> = {
-  meter: 1,
-  link: 1,
-  schedule: 2,
-  press: 3,
+  schedule: 1,
+  press: 2,
 };
 
 export function pushMessage(current: AppMessage, next: AppMessage): AppMessage {

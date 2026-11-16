@@ -51,6 +51,30 @@ export class ServerAuthError extends Error {
 }
 
 const APP_KEY_HEADER = 'x-setpoint-app-key';
+export const NETWORK_RETRY_DELAY_MS = 300;
+
+const TRANSIENT_NETWORK =
+  /network connection was lost|fetch failed|network request failed|failed to fetch|load failed|timed out|\btimeout\b/i;
+
+export function isTransientNetworkError(error: unknown): boolean {
+  if (error instanceof ServerAuthError || !error || typeof error !== 'object') {
+    return false;
+  }
+  const name = 'name' in error && typeof error.name === 'string' ? error.name : '';
+  const message = 'message' in error && typeof error.message === 'string' ? error.message : '';
+  if (name === 'TypeError' || name === 'FetchError' || name === 'AbortError' || name === 'TimeoutError') {
+    return true;
+  }
+  return TRANSIENT_NETWORK.test(message);
+}
+
+function transportFailure(error: unknown): Error {
+  if (error instanceof Error && isTransientNetworkError(error)) {
+    return error;
+  }
+  const message = error instanceof Error && error.message ? error.message : 'Network request failed';
+  return new TypeError(message);
+}
 
 export function readServerConfig(): ServerConfig | null {
   const url = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim();
@@ -68,7 +92,28 @@ function safeMessage(message: string, appKey: string): string {
   return message;
 }
 
-async function call<T>(config: ServerConfig, appKey: string, path: string, init?: RequestInit): Promise<T> {
+async function call<T>(
+  config: ServerConfig,
+  appKey: string,
+  path: string,
+  init?: RequestInit,
+  idempotent = false,
+): Promise<T> {
+  if (!idempotent) {
+    return attempt(config, appKey, path, init);
+  }
+  try {
+    return await attempt(config, appKey, path, init);
+  } catch (error) {
+    if (!isTransientNetworkError(error)) {
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, NETWORK_RETRY_DELAY_MS));
+    return attempt(config, appKey, path, init);
+  }
+}
+
+async function attempt<T>(config: ServerConfig, appKey: string, path: string, init?: RequestInit): Promise<T> {
   if (!appKey) {
     throw new ServerAuthError();
   }
@@ -77,11 +122,21 @@ async function call<T>(config: ServerConfig, appKey: string, path: string, init?
   headers.set('apikey', config.publishableKey);
   headers.set('Authorization', `Bearer ${config.publishableKey}`);
   headers.set(APP_KEY_HEADER, appKey);
-  const response = await fetch(`${config.url}/functions/v1/${path}`, {
-    ...init,
-    headers,
-  });
-  const text = await response.text();
+  let response: Response;
+  try {
+    response = await fetch(`${config.url}/functions/v1/${path}`, {
+      ...init,
+      headers,
+    });
+  } catch (error) {
+    throw transportFailure(error);
+  }
+  let text = '';
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw transportFailure(error);
+  }
   if (response.status === 401) {
     throw new ServerAuthError();
   }
@@ -104,7 +159,7 @@ async function call<T>(config: ServerConfig, appKey: string, path: string, init?
 }
 
 export function fetchState(config: ServerConfig, appKey: string): Promise<SharedSnapshot> {
-  return call(config, appKey, 'state');
+  return call(config, appKey, 'state', undefined, true);
 }
 
 export function saveState(
@@ -136,7 +191,7 @@ export function cancelRemotePress(config: ServerConfig, appKey: string): Promise
 }
 
 export function fetchRemoteSession(config: ServerConfig, appKey: string): Promise<{ progress: RemoteProgress | null }> {
-  return call(config, appKey, 'session');
+  return call(config, appKey, 'session', undefined, true);
 }
 
 export const OLD_HISTORY_FUNCTION =
@@ -157,7 +212,7 @@ export async function fetchHistoryWindow(
     changes?: SetpointChange[];
     bucketSeconds?: number;
     firstAt?: string | null;
-  }>(config, appKey, `history?${params.toString()}`);
+  }>(config, appKey, `history?${params.toString()}`, undefined, true);
   const samples = Array.isArray(payload?.samples) ? payload.samples : [];
   const changes = Array.isArray(payload?.changes) ? payload.changes : [];
   if (typeof payload?.bucketSeconds === 'number') {
@@ -183,7 +238,13 @@ export async function fetchChangePage(
   if (cursor) {
     params.set('cursor', cursor);
   }
-  const payload = await call<{ changes?: unknown; nextCursor?: unknown }>(config, appKey, `history?${params.toString()}`);
+  const payload = await call<{ changes?: unknown; nextCursor?: unknown }>(
+    config,
+    appKey,
+    `history?${params.toString()}`,
+    undefined,
+    true,
+  );
   return readChangePage(payload ?? {});
 }
 
@@ -218,5 +279,5 @@ export function fetchRemoteDevices(config: ServerConfig, appKey: string): Promis
 }
 
 export function requestRemoteMeter(config: ServerConfig, appKey: string): Promise<{ sample: HistorySample | null }> {
-  return call(config, appKey, 'meter', { method: 'POST', body: '{}' });
+  return call(config, appKey, 'meter', { method: 'POST', body: '{}' }, true);
 }

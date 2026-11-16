@@ -5,6 +5,18 @@ export type Lifecycle =
 
 export type LifecycleEvent = 'booted' | 'foreground' | 'background' | 'press-interrupted' | 'press-cleared';
 
+export type AppActivity = 'active' | 'background' | 'inactive' | 'unknown' | 'extension';
+
+export function lifecycleEventForAppState(state: Lifecycle, status: AppActivity): LifecycleEvent | null {
+  if (status === 'background') {
+    return state.kind === 'boot' ? null : 'background';
+  }
+  if (status === 'active' && state.kind === 'paused') {
+    return 'foreground';
+  }
+  return null;
+}
+
 export function reduceLifecycle(state: Lifecycle, event: LifecycleEvent): Lifecycle {
   if (event === 'booted') {
     if (state.kind === 'boot') {
