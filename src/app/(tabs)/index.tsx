@@ -1,6 +1,7 @@
 import { SetpointDial } from '@/components/dial';
 import { Banner, CircleButton, ConfirmDialog, PillButton, Sheet, Stepper } from '@/components/ui';
 import { co2Band } from '@/domain/co2';
+import { commandLocks, shownProgressTarget } from '@/domain/pendingTarget';
 import { planSetTo } from '@/domain/planSetTo';
 import { chipFor, currentTarget, nextOccurrence } from '@/domain/schedule';
 import { formatRoom, setpointAccent } from '@/domain/temperature';
@@ -22,7 +23,8 @@ export default function HomeScreen() {
   const accent = accentColor(setpointAccent(setpoint, room ?? setpoint));
   const next = nextOccurrence(app.state.events, app.clock);
   const activeTarget = currentTarget(app.state.events, app.clock);
-  const busy = app.command !== null;
+  const locks = commandLocks({ commandVisible: app.command !== null, desired: app.desiredSetpoint });
+  const busy = locks.replacements;
   const ratio = app.command
     ? app.command.index / app.command.total
     : (setpoint - app.state.settings.minF) / Math.max(1, app.state.settings.maxF - app.state.settings.minF);
@@ -205,6 +207,7 @@ export default function HomeScreen() {
         {chip.kind === 'off-schedule' ? (
           <Pressable
             testID="retry-schedule"
+            disabled={busy}
             onPress={() => {
               void app.retrySchedule();
             }}
@@ -258,7 +261,7 @@ export default function HomeScreen() {
           label="−"
           testID="press-down"
           accessibilityLabel="Decrease setpoint"
-          disabled={busy}
+          disabled={locks.adjustments}
           onPress={() => {
             void app.bump(-1);
           }}
@@ -267,7 +270,7 @@ export default function HomeScreen() {
           label="+"
           testID="press-up"
           accessibilityLabel="Increase setpoint"
-          disabled={busy}
+          disabled={locks.adjustments}
           onPress={() => {
             void app.bump(1);
           }}
@@ -289,7 +292,9 @@ export default function HomeScreen() {
               ]}
             />
           </View>
-          <Text style={styles.progressBody}>Setting to {app.command.target}°</Text>
+          <Text testID="command-target" style={styles.progressBody}>
+            Setting to {shownProgressTarget(app.desiredSetpoint, app.command.target)}°
+          </Text>
           <PillButton label="Cancel" testID="cancel-command" tone="ghost" onPress={app.cancelCommand} />
         </View>
       ) : (

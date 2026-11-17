@@ -332,6 +332,31 @@ export function sessionProgress(session: PressSession): {
   };
 }
 
+export function beginRunningSession(input: {
+  target: number;
+  startedFrom: number;
+  actions: PressAction[];
+  source: CommandSource;
+  mode: Mode;
+}): { session: RunningSession; progress: NonNullable<ReturnType<typeof sessionProgress>> } | null {
+  const session = reduceSession(idleSession(), {
+    type: 'start',
+    target: input.target,
+    startedFrom: input.startedFrom,
+    actions: input.actions,
+    source: input.source,
+    mode: input.mode,
+  });
+  if (!isRunning(session)) {
+    return null;
+  }
+  const progress = sessionProgress(session);
+  if (!progress) {
+    return null;
+  }
+  return { session, progress };
+}
+
 export function shouldStartHold(source: CommandSource, settled: SettledSession): boolean {
   if (source.kind !== 'manual' && source.kind !== 'set-to' && source.kind !== 'preset') {
     return false;

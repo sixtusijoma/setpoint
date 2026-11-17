@@ -13,8 +13,21 @@ import { deriveLink, mapRejection } from '@/domain/link';
 import { lifecycleEventForAppState, reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
 import { pushMessage, type AppMessage } from '@/domain/messages';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '@/domain/occurrences';
-import { nearestTarget, planSetTo } from '@/domain/planSetTo';
 import {
+  commandContinuation,
+  desiredSetpoint,
+  dropsDesiredOnBusy,
+  idlePending,
+  reducePendingTarget,
+  schedulerBlocked,
+  type PendingEvent,
+  type PendingStep,
+  type PendingTarget,
+  type StepLimits,
+} from '@/domain/pendingTarget';
+import { nearestTarget, planSetTo, type PressAction } from '@/domain/planSetTo';
+import {
+  beginRunningSession,
   idleSession,
   isRunning,
   PressOutcomeError,
@@ -126,6 +139,7 @@ type AppContextValue = {
   state: Persisted;
   clock: Date;
   command: CommandProgress | null;
+  desiredSetpoint: number | null;
   banner: string | null;
   refresh: RefreshPhase;
   devices: SwitchBotDevice[];
@@ -230,6 +244,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [clock, setClock] = useState(() => new Date());
   const [command, setCommand] = useState<CommandProgress | null>(null);
+  const [desired, setDesired] = useState<number | null>(null);
   const [message, setMessage] = useState<AppMessage>(null);
   const [connection, setConnection] = useState<Connection>(initialConnection);
   const [refresh, setRefresh] = useState<Refresh>(initialRefresh);
@@ -252,6 +267,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
   const sessionRef = useRef<PressSession>(idleSession());
+  const pendingRef = useRef<PendingTarget>(idlePending());
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushRef = useRef<() => void>(() => undefined);
+  const runOnServerRef = useRef<
+    (
+      auth: { config: ServerConfig; appKey: string },
+      target: number,
+      source: CommandSource,
+      actions: PressAction[],
+    ) => Promise<CommandResult>
+  >(async () => ({ status: 'failed', stoppedAt: 0, wanted: 0 }));
   const resumeAfterRef = useRef(false);
   const tickLock = useRef(false);
   const tickImpl = useRef<(now: Date) => Promise<void>>(async () => undefined);
@@ -492,6 +518,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (debounceTimer.current) {
+        clearTimeout(debounceTimer.current);
+      }
+    };
+  }, []);
+
   const pullShared = useCallback(async () => {
     if (pullFlight.current) {
       return pullFlight.current;
@@ -612,24 +646,149 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [commitShared]);
 
-  const runTargetRef = useRef<(target: number, source: CommandSource) => Promise<CommandResult>>(async () => ({
+  const runTargetRef = useRef<
+    (target: number, source: CommandSource, options?: { wakeFirst?: boolean }) => Promise<CommandResult>
+  >(async () => ({
     status: 'refused',
     stoppedAt: 0,
     wanted: 0,
   }));
 
+  const clearDebounceTimer = useCallback(() => {
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+    }
+  }, []);
+
+  const applyPending = useCallback(
+    (event: PendingEvent): PendingStep => {
+      const step = reducePendingTarget(pendingRef.current, event);
+      pendingRef.current = step.state;
+      const nextDesired = desiredSetpoint(step.state);
+      setDesired((current) => (current === nextDesired ? current : nextDesired));
+      if (step.effect.type === 'arm-timer') {
+        clearDebounceTimer();
+        debounceTimer.current = setTimeout(() => {
+          debounceTimer.current = null;
+          flushRef.current();
+        }, step.effect.ms);
+      } else if (step.effect.type !== 'none') {
+        clearDebounceTimer();
+      }
+      return step;
+    },
+    [clearDebounceTimer],
+  );
+
+  const flushPending = useCallback(() => {
+    if (pendingRef.current.status !== 'pending') {
+      return;
+    }
+    if (isRunning(sessionRef.current)) {
+      applyPending({ type: 'defer', inflight: sessionRef.current.target });
+      return;
+    }
+    const snapshot = stateRef.current;
+    const from = snapshot.virtualSetpoint;
+    if (from === null) {
+      applyPending({ type: 'cancel' });
+      return;
+    }
+    const step = applyPending({
+      type: 'debounce-elapsed',
+      from,
+      limits: {
+        step: snapshot.settings.step,
+        min: snapshot.settings.minF,
+        max: snapshot.settings.maxF,
+        pressCap: snapshot.settings.pressCap,
+      },
+    });
+    if (step.effect.type === 'send') {
+      void runTargetRef.current(step.effect.target, { kind: 'manual' }, { wakeFirst: step.effect.wake });
+      return;
+    }
+    if (step.effect.type === 'refuse') {
+      showMessage({ source: 'press', text: step.effect.reason });
+      errorFeedback();
+    }
+  }, [applyPending, showMessage]);
+
+  useEffect(() => {
+    flushRef.current = flushPending;
+  }, [flushPending]);
+
+  const finishCommand = useCallback(async (result: CommandResult, resume: boolean): Promise<CommandResult> => {
+    if (result.status === 'busy') {
+      if (dropsDesiredOnBusy('foreign')) {
+        applyPending({ type: 'foreign-busy' });
+      }
+      setCommand(null);
+      return result;
+    }
+    const settings = stateRef.current.settings;
+    const step = resume
+      ? null
+      : applyPending({
+          type: 'settled',
+          stoppedAt: result.stoppedAt,
+          status: result.status,
+          limits: {
+            step: settings.step,
+            min: settings.minF,
+            max: settings.maxF,
+            pressCap: settings.pressCap,
+          },
+        });
+    const continuation = commandContinuation({
+      resumeQueued: resume,
+      follow: step?.effect.type === 'send',
+    });
+    if (continuation === 'resume') {
+      applyPending({ type: 'cancel' });
+      resumeAfterRef.current = false;
+      setCommand(null);
+      await finishResume();
+      return result;
+    }
+    if (continuation === 'follow' && step?.effect.type === 'send') {
+      void runTargetRef.current(step.effect.target, { kind: 'manual' }, { wakeFirst: step.effect.wake }).catch(
+        () => undefined,
+      );
+      return result;
+    }
+    if (step?.effect.type === 'refuse') {
+      showMessage({ source: 'press', text: step.effect.reason });
+      errorFeedback();
+    }
+    setCommand(null);
+    return result;
+  }, [applyPending, finishResume, showMessage]);
+
   const runTarget = useCallback(
-    async (target: number, source: CommandSource): Promise<CommandResult> => {
+    async (target: number, source: CommandSource, options?: { wakeFirst?: boolean }): Promise<CommandResult> => {
       if (isRunning(sessionRef.current)) {
         const stoppedAt = stateRef.current.virtualSetpoint ?? target;
-        showMessage({ source: 'press', text: 'A command is already running.' });
-        return { status: 'busy', stoppedAt, wanted: target, reason: 'A command is already running.' };
+        const reason = 'A command is already running.';
+        showMessage({ source: 'press', text: reason });
+        if (dropsDesiredOnBusy('self')) {
+          applyPending({ type: 'foreign-busy' });
+        }
+        return { status: 'busy', stoppedAt, wanted: target, reason };
       }
       const snapshot = stateRef.current;
       if (snapshot.virtualSetpoint === null) {
         return { status: 'refused', stoppedAt: target, wanted: target, reason: 'Set the virtual setpoint first.' };
       }
+      const machine = pendingRef.current;
+      const alreadyArmed =
+        (machine.status === 'running' || machine.status === 'running-with-newer') && machine.inflight === target;
+      if (!alreadyArmed) {
+        applyPending({ type: 'arm-external', target });
+      }
       const current = snapshot.virtualSetpoint;
+      const wakeFirst = options?.wakeFirst ?? snapshot.settings.wakeFirst;
       const plan = planSetTo({
         current,
         target,
@@ -637,14 +796,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
         minF: snapshot.settings.minF,
         maxF: snapshot.settings.maxF,
         pressCap: snapshot.settings.pressCap,
-        wakeFirst: snapshot.settings.wakeFirst,
+        wakeFirst,
       });
+      const finish = (result: CommandResult) => finishCommand(result, false);
       if (!plan.ok) {
         if (source.kind !== 'schedule') {
           showMessage({ source: 'press', text: plan.reason });
           errorFeedback();
         }
-        return { status: 'refused', stoppedAt: current, wanted: target, reason: plan.reason };
+        return finish({ status: 'refused', stoppedAt: current, wanted: target, reason: plan.reason });
       }
       const link = deriveLink({
         mode: snapshot.mode,
@@ -659,28 +819,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (source.kind !== 'schedule') {
           showMessage({ source: 'press', text: reason });
         }
-        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+        return finish({ status: 'refused', stoppedAt: current, wanted: target, reason });
       }
       if (link.kind === 'live' && link.phase === 'needs-bots') {
         const reason = 'Map the up bot and the down bot in Settings before sending presses.';
         if (source.kind !== 'schedule') {
           showMessage({ source: 'press', text: reason });
         }
-        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+        return finish({ status: 'refused', stoppedAt: current, wanted: target, reason });
       }
       if (link.kind === 'live' && link.phase === 'ready' && link.cloud === 'off') {
         const reason = 'Cloud service is off. Turn it on in the SwitchBot app. Setpoint does not fall back to Bluetooth.';
         if (source.kind !== 'schedule') {
           showMessage({ source: 'press', text: reason });
         }
-        return { status: 'refused', stoppedAt: current, wanted: target, reason };
+        return finish({ status: 'refused', stoppedAt: current, wanted: target, reason });
       }
       if (plan.actions.length === 0) {
         if (source.kind !== 'schedule') {
           const at = new Date().toISOString();
           commit((prev) => appendLog(prev, 'schedule', `Already at ${target}°. No presses sent.`, at));
         }
-        return { status: 'already', stoppedAt: current, wanted: target };
+        return finish({ status: 'already', stoppedAt: current, wanted: target });
       }
       const auth = sessionAuth();
       if (snapshot.mode === 'live' && readServerConfig()) {
@@ -689,67 +849,86 @@ export function AppProvider({ children }: { children: ReactNode }) {
           if (source.kind !== 'schedule') {
             showMessage({ source: 'press', text: reason });
           }
-          return { status: 'refused', stoppedAt: current, wanted: target, reason };
+          return finish({ status: 'refused', stoppedAt: current, wanted: target, reason });
         }
-        return runOnServer(auth, target, source);
+        return finish(await runOnServerRef.current(auth, target, source, plan.actions));
       }
       cancelRef.current = false;
       interruptRef.current = false;
       if (source.kind !== 'schedule') {
         showMessage(null);
       }
-      const settled = await runPressSession({
-        current,
-        target,
-        source,
-        mode: snapshot.mode,
-        plan,
-        delayMs: snapshot.settings.delayMs,
-        press: (direction, signal) => pressRole(direction, signal),
-        sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
-        beforeSend: async (index, isCancelled) => {
-          if (index === 0) {
-            return sleepUnless(FIRST_ARM_MS, isCancelled);
-          }
-          return isCancelled();
-        },
-        isCancelled: () => cancelRef.current,
-        isInterrupted: () => interruptRef.current,
-        onSession: (session) => {
-          sessionRef.current = session;
-          setCommand(sessionProgress(session));
-        },
-        onCommitted: (action, setpoint) => {
-          const at = new Date().toISOString();
-          if (action.kind === 'wake') {
+      let settled: Awaited<ReturnType<typeof runPressSession>>;
+      try {
+        settled = await runPressSession({
+          current,
+          target,
+          source,
+          mode: snapshot.mode,
+          plan,
+          delayMs: snapshot.settings.delayMs,
+          press: (direction, signal) => pressRole(direction, signal),
+          sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
+          beforeSend: async (index, isCancelled) => {
+            if (index === 0) {
+              return sleepUnless(FIRST_ARM_MS, isCancelled);
+            }
+            return isCancelled();
+          },
+          isCancelled: () => cancelRef.current,
+          isInterrupted: () => interruptRef.current,
+          onSession: (session) => {
+            sessionRef.current = session;
+            const progress = sessionProgress(session);
+            if (progress) {
+              setCommand(progress);
+            }
+          },
+          onCommitted: (action, setpoint) => {
+            const at = new Date().toISOString();
+            if (action.kind === 'wake') {
+              commit((prev) =>
+                appendLog(
+                  prev,
+                  'wake',
+                  `Wake press on the ${action.direction} bot. The setpoint stayed at ${prev.virtualSetpoint}°.`,
+                  at,
+                ),
+              );
+              return;
+            }
+            const mark = changeMark(source, setpoint);
             commit((prev) =>
               appendLog(
-                prev,
-                'wake',
-                `Wake press on the ${action.direction} bot. The setpoint stayed at ${prev.virtualSetpoint}°.`,
+                {
+                  ...prev,
+                  virtualSetpoint: setpoint,
+                  changes: [...prev.changes, { at, setpoint, source: mark.source, label: mark.label }].slice(-400),
+                },
+                'press',
+                `${action.direction === 'up' ? 'Up bot' : 'Down bot'} press. Setpoint ${setpoint}°.`,
                 at,
               ),
             );
-            return;
-          }
-          const mark = changeMark(source, setpoint);
-          commit((prev) =>
-            appendLog(
-              {
-                ...prev,
-                virtualSetpoint: setpoint,
-                changes: [...prev.changes, { at, setpoint, source: mark.source, label: mark.label }].slice(-400),
-              },
-              'press',
-              `${action.direction === 'up' ? 'Up bot' : 'Down bot'} press. Setpoint ${setpoint}°.`,
-              at,
-            ),
-          );
-          pressFeedback();
-        },
-      });
+            pressFeedback();
+          },
+        });
+      } catch (error) {
+        sessionRef.current = idleSession();
+        const reason = explainError(error);
+        showMessage({ source: 'press', text: reason });
+        errorFeedback();
+        return finishCommand(
+          {
+            status: 'failed',
+            stoppedAt: stateRef.current.virtualSetpoint ?? target,
+            wanted: target,
+            reason,
+          },
+          false,
+        );
+      }
       sessionRef.current = idleSession();
-      setCommand(null);
       const at = new Date().toISOString();
       if (settled.status === 'ambiguous') {
         showMessage({ source: 'press', text: CHECK_THERMOSTAT });
@@ -790,41 +969,41 @@ export function AppProvider({ children }: { children: ReactNode }) {
           return appendLog({ ...prev, hold }, 'hold', text, at);
         });
       }
-      if (resumeAfterRef.current) {
-        resumeAfterRef.current = false;
-        await finishResume();
-      }
-      return {
-        status: settled.status === 'busy' ? 'busy' : settled.status,
-        stoppedAt: settled.stoppedAt,
-        wanted: settled.wanted,
-        reason: settled.reason,
-      };
+      return finishCommand(
+        {
+          status: settled.status === 'busy' ? 'busy' : settled.status,
+          stoppedAt: settled.stoppedAt,
+          wanted: settled.wanted,
+          reason: settled.reason,
+        },
+        resumeAfterRef.current,
+      );
     },
-    [commit, commitShared, finishResume, hasCredentials, pressRole, serverConfigured, sessionAuth, showMessage],
+    [applyPending, commit, commitShared, finishCommand, hasCredentials, pressRole, serverConfigured, sessionAuth, showMessage],
   );
 
-  async function runOnServer(
+  const runOnServer = useCallback(async function runOnServer(
     auth: { config: ServerConfig; appKey: string },
     target: number,
     source: CommandSource,
+    actions: PressAction[],
   ): Promise<CommandResult> {
-    sessionRef.current = {
-      phase: 'armed',
+    let closed = false;
+    const opened = beginRunningSession({
       target,
       startedFrom: stateRef.current.virtualSetpoint ?? target,
-      setpoint: stateRef.current.virtualSetpoint ?? target,
-      actionIndex: 0,
-      actions: [],
+      actions,
       source,
       mode: 'live',
-      committedAdjusts: 0,
-      cancelRequested: false,
-    };
+    });
+    if (opened) {
+      sessionRef.current = opened.session;
+      setCommand(opened.progress);
+    }
     const poll = setInterval(() => {
       void fetchRemoteSession(auth.config, auth.appKey)
         .then((remote) => {
-          if (remote.progress) {
+          if (!closed && remote.progress) {
             setCommand(remote.progress);
           }
         })
@@ -838,6 +1017,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       } else if (result.reason && result.status !== 'done' && result.status !== 'already') {
         showMessage({ source: 'press', text: result.reason });
       }
+      sessionRef.current = idleSession();
       await pullShared();
       return {
         status: result.status,
@@ -856,17 +1036,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
         reason,
       };
     } finally {
+      closed = true;
       clearInterval(poll);
       sessionRef.current = idleSession();
-      setCommand(null);
     }
-  }
+  }, [noteAuth, pullShared, showMessage]);
+
+  useEffect(() => {
+    runOnServerRef.current = runOnServer;
+  }, [runOnServer]);
 
   runTargetRef.current = runTarget;
 
   const tick = useCallback(
     async (now: Date) => {
-      if (isRunning(sessionRef.current) || tickLock.current) {
+      if (schedulerBlocked(pendingRef.current) || isRunning(sessionRef.current) || tickLock.current) {
         return;
       }
       const snapshot = stateRef.current;
@@ -1202,6 +1386,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       state,
       clock,
       command,
+      desiredSetpoint: desired,
       banner: message?.text ?? connectionBanner(connection),
       refresh: refresh.phase,
       devices,
@@ -1416,17 +1601,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       },
       bump: async (direction) => {
-        const current = stateRef.current.virtualSetpoint;
-        if (current === null) {
+        const snapshot = stateRef.current;
+        const setpoint = snapshot.virtualSetpoint;
+        if (setpoint === null) {
           return;
         }
-        await runTarget(current + direction * stateRef.current.settings.step, { kind: 'manual' });
+        const limits: StepLimits = {
+          step: snapshot.settings.step,
+          min: snapshot.settings.minF,
+          max: snapshot.settings.maxF,
+          pressCap: snapshot.settings.pressCap,
+          wakeFirst: snapshot.settings.wakeFirst,
+        };
+        applyPending({ type: 'bump', direction, setpoint, limits });
       },
       setTo: (target) => runTarget(target, { kind: 'set-to' }),
       applyPreset: async (preset) => {
         await runTarget(preset.tempF, { kind: 'preset', label: preset.label });
       },
       cancelCommand: () => {
+        applyPending({ type: 'cancel' });
         cancelRef.current = true;
         const auth = sessionAuth();
         if (auth && stateRef.current.mode === 'live') {
@@ -1691,6 +1885,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         commitShared((prev) => ({ ...prev, records: applied.records, hold: null }));
       },
       retrySchedule: async () => {
+        if (schedulerBlocked(pendingRef.current) || isRunning(sessionRef.current)) {
+          return;
+        }
         const now = new Date();
         const snapshot = stateRef.current;
         if (snapshot.virtualSetpoint === null) {
@@ -1795,6 +1992,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     state,
     clock,
     command,
+    desired,
     message,
     connection,
     refresh,
@@ -1818,6 +2016,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     pullShared,
     refreshDevices,
     refreshClimate,
+    applyPending,
     runTarget,
     finishResume,
   ]);
