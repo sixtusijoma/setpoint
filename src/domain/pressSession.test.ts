@@ -10,6 +10,7 @@ import {
   pressGapMs,
   reduceSession,
   runPressSession,
+  beginRunningSession,
   sessionProgress,
   shouldStartHold,
   type PressSession,
@@ -46,6 +47,18 @@ describe('press session reducer', () => {
     expect(session.setpoint).toBe(70);
     expect(session.committedAdjusts).toBe(0);
     expect(sessionProgress(session)?.label).toBe('press');
+  });
+
+  it('publishes press 1 of N as soon as the session is armed', () => {
+    const opened = beginRunningSession({
+      target: 73,
+      startedFrom: 70,
+      actions,
+      source,
+      mode: 'live',
+    });
+    expect(opened?.progress).toEqual({ index: 1, total: 3, target: 73, label: 'press' });
+    expect(beginRunningSession({ target: 70, startedFrom: 70, actions: [], source, mode: 'demo' })).toBeNull();
   });
 
   it('cancels an armed press before it is sent, including the first one', () => {
