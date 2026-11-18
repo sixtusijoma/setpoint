@@ -10,7 +10,8 @@ import { formatRoom, setpointAccent } from '@/domain/temperature';
 import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
 import { refreshSpinner } from '@/domain/refresh';
-import { isKnownMode, modeLabel, type KnownMode } from '@/domain/systemMode';
+import { openDraft, pickMode, planRecalibrate, unknownModeNote, type RecalibrateDraft } from '@/domain/recalibrateDraft';
+import { isKnownMode, modeLabel } from '@/domain/systemMode';
 import { suggestedTarget, useApp } from '@/state/store';
 import { accentColor, colors, fonts, toneColor } from '@/theme';
 import { useEffect, useRef, useState } from 'react';
@@ -36,10 +37,9 @@ export default function HomeScreen() {
   const [recalError, setRecalError] = useState<string | null>(null);
   const [recalSaving, setRecalSaving] = useState(false);
   const [draft, setDraft] = useState(setpoint);
-  const [recal, setRecal] = useState(setpoint);
+  const [recal, setRecal] = useState<RecalibrateDraft>({ mode: null, degrees: setpoint });
+  const [recalNote, setRecalNote] = useState<string | null>(null);
   const [resumeOpen, setResumeOpen] = useState(false);
-  const [modeRecalOpen, setModeRecalOpen] = useState(false);
-  const [modeDraft, setModeDraft] = useState<KnownMode>('heat');
   const pullStart = useRef<number | null>(null);
   const atTop = useRef(true);
   const lastPull = useRef(0);
@@ -129,10 +129,39 @@ export default function HomeScreen() {
     setSetToOpen(true);
   }
 
-  function openRecalibrate() {
-    setRecal(setpoint);
+  const recalContext = {
+    systemMode: app.state.systemMode,
+    heatSetpoint: app.state.heatSetpoint,
+    coolSetpoint: app.state.coolSetpoint,
+    fallbackDegrees: app.state.virtualSetpoint ?? app.state.heatSetpoint ?? app.state.coolSetpoint ?? 70,
+  };
+
+  function openRecalibrate(note: string | null = null) {
+    setRecal(openDraft(recalContext));
+    setRecalNote(note);
     setRecalError(null);
     setRecalOpen(true);
+  }
+
+  async function saveRecalibrate() {
+    const plan = planRecalibrate(recal, recalContext);
+    if (!plan.ok) {
+      setRecalError(plan.reason);
+      return;
+    }
+    setRecalSaving(true);
+    let reason: string | null = null;
+    if (plan.setMode) {
+      reason = await app.recalibrateSystemMode(plan.setMode);
+    }
+    if (!reason && plan.setDegrees !== null) {
+      reason = await app.recalibrate(plan.setDegrees);
+    }
+    setRecalSaving(false);
+    setRecalError(reason);
+    if (!reason) {
+      setRecalOpen(false);
+    }
   }
 
   const dialValue = app.state.systemMode === 'off' ? 'Off' : app.state.virtualSetpoint === null ? '—' : app.state.virtualSetpoint;
@@ -203,7 +232,7 @@ export default function HomeScreen() {
         <Pressable
           testID="recalibrate"
           disabled={busy}
-          onPress={openRecalibrate}
+          onPress={() => openRecalibrate()}
           style={[styles.recal, busy && styles.dim]}
           accessibilityRole="button"
         >
@@ -303,8 +332,7 @@ export default function HomeScreen() {
             disabled={busy}
             onPress={() => {
               if (app.state.systemMode === 'unknown') {
-                setModeDraft(mode);
-                setModeRecalOpen(true);
+                openRecalibrate(unknownModeNote(mode));
                 return;
               }
               void app.setSystemMode(mode);
@@ -317,19 +345,9 @@ export default function HomeScreen() {
       </View>
       {app.state.systemMode === 'unknown' ? (
         <Text testID="mode-unknown" style={styles.modeHint}>
-          Mode is unknown. Tap Heat, Off, or Cool to say which one is showing. Setpoint will not press the Mode bot until then.
+          Mode is unknown. Tap Recalibrate and pick the mode the display shows. Setpoint will not press the Mode bot until then.
         </Text>
-      ) : (
-        <Pressable
-          testID="recalibrate-mode"
-          onPress={() => {
-            setModeDraft(app.state.systemMode === 'unknown' ? 'heat' : app.state.systemMode);
-            setModeRecalOpen(true);
-          }}
-        >
-          <Text style={styles.modeHint}>Mode is wrong</Text>
-        </Pressable>
-      )}
+      ) : null}
 
       <View style={styles.pads}>
         <CircleButton
@@ -445,59 +463,57 @@ export default function HomeScreen() {
       <Sheet visible={recalOpen} onClose={() => setRecalOpen(false)}>
         <Text style={styles.sheetTitle}>Recalibrate</Text>
         <Text style={styles.sheetBody}>
-          What does the thermostat display show right now? Saving replaces the active Heat or Cool setpoint. It does not
-          press any buttons.
+          What does the thermostat display show right now? Saving records it. It does not press any buttons.
         </Text>
-        <Stepper
-          testID="recalibrate-value"
-          value={`${recal}°`}
-          onMinus={() => setRecal((value) => Math.max(app.state.settings.minF, value - 1))}
-          onPlus={() => setRecal((value) => Math.min(app.state.settings.maxF, value + 1))}
-        />
+        {recalNote ? (
+          <Text testID="recalibrate-note" style={[styles.sheetBody, styles.recalNote]}>
+            {recalNote}
+          </Text>
+        ) : null}
+        <Text style={styles.sheetLabel}>Mode</Text>
+        <View style={styles.modeRow}>
+          {(['heat', 'off', 'cool'] as const).map((mode) => (
+            <Pressable
+              key={`recal-${mode}`}
+              testID={`recalibrate-mode-${mode}`}
+              accessibilityRole="button"
+              accessibilityState={{ selected: recal.mode === mode }}
+              onPress={() => {
+                setRecalError(null);
+                setRecal((draft) => pickMode(draft, mode, recalContext));
+              }}
+              style={[styles.modeItem, recal.mode === mode && styles.modeOn]}
+            >
+              <Text style={styles.modeText}>{modeLabel(mode)}</Text>
+            </Pressable>
+          ))}
+        </View>
+        {recal.mode === 'heat' || recal.mode === 'cool' ? (
+          <>
+            <Text style={styles.sheetLabel}>{recal.mode === 'heat' ? 'Heat setpoint' : 'Cool setpoint'}</Text>
+            <Stepper
+              testID="recalibrate-value"
+              value={`${recal.degrees}°`}
+              onMinus={() => setRecal((draft) => ({ ...draft, degrees: Math.max(app.state.settings.minF, draft.degrees - 1) }))}
+              onPlus={() => setRecal((draft) => ({ ...draft, degrees: Math.min(app.state.settings.maxF, draft.degrees + 1) }))}
+            />
+          </>
+        ) : recal.mode === 'off' ? (
+          <Text testID="recalibrate-off" style={styles.sheetBody}>
+            Off has no setpoint.
+          </Text>
+        ) : null}
         {recalError ? (
           <Text testID="recalibrate-error" style={[styles.sheetBody, styles.recalError]}>
             {recalError}
           </Text>
         ) : null}
         <PillButton
-          label={recalSaving ? 'Saving…' : 'Save setpoint'}
+          label={recalSaving ? 'Saving…' : 'Save'}
           testID="recalibrate-save"
           disabled={recalSaving}
           onPress={() => {
-            void (async () => {
-              setRecalSaving(true);
-              const reason = await app.recalibrate(recal);
-              setRecalSaving(false);
-              setRecalError(reason);
-              if (!reason) {
-                setRecalOpen(false);
-              }
-            })();
-          }}
-        />
-      </Sheet>
-
-      <Sheet visible={modeRecalOpen} onClose={() => setModeRecalOpen(false)}>
-        <Text style={styles.sheetTitle}>Which mode is on the display?</Text>
-        <Text style={styles.sheetBody}>This records the mode the thermostat is actually in. It does not press the Mode bot.</Text>
-        <View style={styles.modeRow}>
-          {(['heat', 'off', 'cool'] as const).map((mode) => (
-            <Pressable
-              key={`draft-${mode}`}
-              testID={`mode-draft-${mode}`}
-              onPress={() => setModeDraft(mode)}
-              style={[styles.modeItem, modeDraft === mode && styles.modeOn]}
-            >
-              <Text style={styles.modeText}>{modeLabel(mode)}</Text>
-            </Pressable>
-          ))}
-        </View>
-        <PillButton
-          label="Save mode"
-          testID="recalibrate-mode-save"
-          onPress={() => {
-            void app.recalibrateSystemMode(modeDraft);
-            setModeRecalOpen(false);
+            void saveRecalibrate();
           }}
         />
       </Sheet>
@@ -799,5 +815,15 @@ const styles = StyleSheet.create({
   },
   recalError: {
     color: colors.poor,
+  },
+  recalNote: {
+    color: colors.text,
+  },
+  sheetLabel: {
+    color: colors.muted,
+    fontFamily: fonts.body,
+    fontSize: 12,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
   },
 });

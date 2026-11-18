@@ -59,7 +59,8 @@ import {
 } from '@/domain/schedule';
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
-import { modeLabel, type KnownMode } from '@/domain/systemMode';
+import { isKnownMode, modeLabel, type KnownMode } from '@/domain/systemMode';
+import { alreadyInMode } from '@/domain/recalibrateDraft';
 import { formatClock } from '@/domain/time';
 import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage } from '@/domain/history';
 import { localWindowData, type HistoryWindow, type HistoryWindowData } from '@/domain/historyWindow';
@@ -1095,11 +1096,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       const snapshot = stateRef.current;
-      if (snapshot.virtualSetpoint === null) {
+      if (snapshot.mode === 'live' && readServerConfig()) {
+        // Live mode always pulls, including while the thermostat is Off or the
+        // mode is unknown (both have no active setpoint).
+        await pullShared();
         return;
       }
-      if (snapshot.mode === 'live' && readServerConfig()) {
-        await pullShared();
+      if (snapshot.virtualSetpoint === null) {
         return;
       }
       tickLock.current = true;
@@ -1184,7 +1187,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [applyConnection, connection]);
 
   useEffect(() => {
-    if (!ready || state.virtualSetpoint === null) {
+    if (!ready || (state.virtualSetpoint === null && state.mode !== 'live')) {
       return;
     }
     void tickImpl.current(new Date());
@@ -1259,7 +1262,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         document.removeEventListener('visibilitychange', onVisible);
       }
     };
-  }, [applyConnection, commit, ready, state.virtualSetpoint === null]);
+  }, [applyConnection, commit, ready, state.virtualSetpoint === null && state.mode !== 'live']);
 
   useEffect(() => {
     return watchNotificationOpen(() => {
@@ -1516,6 +1519,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       const snapshot = stateRef.current;
       if (snapshot.systemMode === target) {
+        showMessage({ source: 'press', text: alreadyInMode(target) });
         return;
       }
       if (snapshot.systemMode === 'unknown') {
@@ -1546,6 +1550,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }, 400);
         try {
           const result = await runRemoteMode(auth.config, auth.appKey, target);
+          closed = true;
+          clearInterval(poll);
+          // The server already saved the mode it reached. Show it now, then let the
+          // pull below bring the rest. The mode session has to be idle first or
+          // pullShared skips the pull and Home keeps the old mode.
+          modeSessionRef.current = idleModeSession();
+          if (isKnownMode(result.systemMode) && result.systemMode !== stateRef.current.systemMode) {
+            const reached = result.systemMode;
+            const at = new Date().toISOString();
+            commit((prev) => {
+              const climate = reduceClimate(climateOf(prev), { type: 'recalibrate-mode', mode: reached });
+              return appendLog(applyClimate(prev, climate.state), 'press', `Mode bot press. The thermostat is ${modeLabel(reached)}.`, at);
+            });
+          }
+          if (result.status === 'done') {
+            successFeedback();
+          } else if (result.status === 'failed' || result.status === 'refused' || result.status === 'ambiguous') {
+            errorFeedback();
+          }
           if (result.notifyCheck || result.status === 'ambiguous') {
             showMessage({ source: 'press', text: CHECK_THERMOSTAT });
             void notifyCheckThermostat(CHECK_THERMOSTAT);
