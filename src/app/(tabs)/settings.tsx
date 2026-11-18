@@ -1,6 +1,7 @@
 import { PillButton, Sheet, Stepper } from '@/components/ui';
 import { HUB_COPY, TOKEN_PATH, WAKE_HELP, WEB_SECRET_COPY } from '@/copy';
 import { deviceNotes, type SwitchBotDevice } from '@/devices/switchbot';
+import { displayBatteries, lowBatterySentence } from '@/domain/batteryFetch';
 import type { Co2Tone } from '@/domain/co2';
 import { PRESS_SPACING_MS } from '@/domain/pressSession';
 import { useApp } from '@/state/store';
@@ -20,6 +21,8 @@ export default function SettingsScreen() {
   const [recalSaving, setRecalSaving] = useState(false);
   const [recal, setRecal] = useState(app.state.virtualSetpoint ?? 70);
   const settings = app.state.settings;
+  const batteries = displayBatteries(app.state);
+  const batteryWarning = lowBatterySentence(batteries);
   const outside =
     app.state.virtualSetpoint !== null &&
     (app.state.virtualSetpoint < settings.minF || app.state.virtualSetpoint > settings.maxF);
@@ -167,11 +170,34 @@ export default function SettingsScreen() {
         onPick={(device) => app.mapRole('down', device)}
       />
       <Mapper
+        label="Mode bot"
+        testID="mode-bot"
+        selected={app.state.deviceMap.mode}
+        devices={app.devices}
+        onPick={(device) => app.mapRole('mode', device)}
+      />
+      <Mapper
         label="Meter"
         selected={app.state.deviceMap.meter}
         devices={app.devices}
         onPick={(device) => app.mapRole('meter', device)}
       />
+
+      <Text style={styles.section}>Batteries</Text>
+      {batteryWarning ? (
+        <Text testID="low-battery" style={styles.warning}>
+          {batteryWarning}
+        </Text>
+      ) : null}
+      <Text testID="battery-up" style={styles.body}>
+        Up bot · {batteryPercent(batteries.up)}
+      </Text>
+      <Text testID="battery-down" style={styles.body}>
+        Down bot · {batteryPercent(batteries.down)}
+      </Text>
+      <Text testID="battery-mode" style={styles.body}>
+        Mode bot · {batteryPercent(batteries.mode)}
+      </Text>
 
       <Text style={styles.section}>Thermostat</Text>
       <Adjust
@@ -188,6 +214,26 @@ export default function SettingsScreen() {
       />
       <Text style={styles.body}>
         {`Presses wait at least ${PRESS_SPACING_MS.down / 1000} s going down and ${PRESS_SPACING_MS.up / 1000} s going up so the thermostat catches each one. A longer delay here wins.`}
+      </Text>
+      <Text style={styles.rowLabel}>Each press moves</Text>
+      <View style={styles.segment}>
+        <Pressable
+          testID="mode-step-1"
+          style={[styles.segmentItem, settings.modeStep === 1 && styles.segmentOn]}
+          onPress={() => app.updateSettings({ modeStep: 1 })}
+        >
+          <Text style={styles.segmentText}>1 mode forward</Text>
+        </Pressable>
+        <Pressable
+          testID="mode-step-2"
+          style={[styles.segmentItem, settings.modeStep === 2 && styles.segmentOn]}
+          onPress={() => app.updateSettings({ modeStep: 2 })}
+        >
+          <Text style={styles.segmentText}>2 modes forward</Text>
+        </Pressable>
+      </View>
+      <Text style={styles.body}>
+        The Emerson button cycles Heat, Off, Cool. This bot over-presses, so the default is two modes forward. Use one mode forward if a later bot presses cleanly.
       </Text>
       <Adjust
         label="Minimum"
@@ -360,13 +406,19 @@ function Adjust({
   );
 }
 
+function batteryPercent(value: number | null): string {
+  return typeof value === 'number' ? `${Math.round(value)}%` : '—';
+}
+
 function Mapper({
   label,
+  testID,
   selected,
   devices,
   onPick,
 }: {
   label: string;
+  testID?: string;
   selected: { name: string; enableCloudService: boolean | null; hubDeviceId: string } | null;
   devices: SwitchBotDevice[];
   onPick: (device: SwitchBotDevice) => void;
@@ -379,7 +431,7 @@ function Mapper({
       })
     : [];
   return (
-    <View style={styles.block}>
+    <View style={styles.block} testID={testID}>
       <Text style={styles.rowLabel}>
         {label} · {selected?.name ?? 'Not mapped'}
       </Text>
@@ -405,6 +457,7 @@ const styles = StyleSheet.create({
   title: { color: colors.text, fontFamily: fonts.displayStrong, fontSize: 36 },
   section: { color: colors.text, fontFamily: fonts.semibold, fontSize: 18, marginTop: 8 },
   body: { color: colors.muted, fontFamily: fonts.body, fontSize: 14, lineHeight: 20 },
+  warning: { color: colors.poor, fontFamily: fonts.medium, fontSize: 14, lineHeight: 20 },
   mask: { color: colors.text, fontFamily: fonts.medium, fontSize: 16 },
   input: {
     backgroundColor: colors.card,

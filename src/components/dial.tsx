@@ -13,16 +13,19 @@ export function SetpointDial({
   ratio,
   color,
   caption,
+  showDegree = true,
 }: {
-  setpoint: number;
+  setpoint: number | string;
   ratio: number;
   color: string;
   caption: string;
+  showDegree?: boolean;
 }) {
   const clamped = Math.min(1, Math.max(0, ratio));
   const dash = ARC * clamped;
+  const label = typeof setpoint === 'number' ? `Setpoint ${setpoint} degrees` : `Setpoint ${setpoint}`;
   return (
-    <View style={styles.wrap} accessibilityLabel={`Setpoint ${setpoint} degrees`}>
+    <View style={styles.wrap} accessibilityLabel={label}>
       <View style={styles.arc} pointerEvents="none">
         <Svg width={SIZE} height={SIZE} viewBox={`0 0 ${SIZE} ${SIZE}`}>
           <Circle
@@ -35,16 +38,18 @@ export function SetpointDial({
             strokeDasharray={`${ARC} ${CIRC - ARC}`}
             strokeLinecap="round"
           />
-          <Circle
-            cx={SIZE / 2}
-            cy={SIZE / 2}
-            r={RADIUS}
-            stroke={color}
-            strokeWidth={STROKE}
-            fill="none"
-            strokeDasharray={`${dash} ${CIRC - dash}`}
-            strokeLinecap="round"
-          />
+          {dash > 0 ? (
+            <Circle
+              cx={SIZE / 2}
+              cy={SIZE / 2}
+              r={RADIUS}
+              stroke={color}
+              strokeWidth={STROKE}
+              fill="none"
+              strokeDasharray={`${dash} ${CIRC - dash}`}
+              strokeLinecap="round"
+            />
+          ) : null}
         </Svg>
       </View>
       <View style={styles.center} pointerEvents="none">
@@ -52,7 +57,7 @@ export function SetpointDial({
           <Text testID="setpoint-value" style={styles.number}>
             {setpoint}
           </Text>
-          <Text style={[styles.degree, { color }]}>°</Text>
+          {showDegree ? <Text style={[styles.degree, { color }]}>°</Text> : null}
         </View>
         <Text style={styles.caption}>{caption}</Text>
       </View>

@@ -1,3 +1,5 @@
+import { activeDegrees } from '@/domain/modeSetpoint';
+import { isSystemMode, modeStepOf } from '@/domain/systemMode';
 import type { SharedSnapshot } from '@/server/appClient';
 import type { Persisted } from '@/state/model';
 
@@ -36,6 +38,10 @@ export function snapshotFrom(state: Persisted, version: number): SharedSnapshot 
   return {
     version,
     virtualSetpoint: state.virtualSetpoint,
+    systemMode: state.systemMode,
+    heatSetpoint: state.heatSetpoint,
+    coolSetpoint: state.coolSetpoint,
+    batteryCache: state.batteryCache,
     catchupFrom: state.catchupFrom,
     mode: 'live',
     hold: state.hold,
@@ -51,13 +57,25 @@ export function snapshotFrom(state: Persisted, version: number): SharedSnapshot 
 }
 
 export function applySnapshot(prev: Persisted, snap: SharedSnapshot): Persisted {
+  const systemMode = isSystemMode(snap.systemMode) ? snap.systemMode : prev.systemMode;
+  const heatSetpoint = snap.heatSetpoint === undefined ? prev.heatSetpoint : snap.heatSetpoint;
+  const coolSetpoint = snap.coolSetpoint === undefined ? prev.coolSetpoint : snap.coolSetpoint;
   return {
     ...prev,
-    virtualSetpoint: snap.virtualSetpoint,
+    systemMode,
+    heatSetpoint,
+    coolSetpoint,
+    virtualSetpoint: activeDegrees(systemMode, { heat: heatSetpoint, cool: coolSetpoint }),
+    batteryCache: snap.batteryCache === undefined ? prev.batteryCache : snap.batteryCache,
     catchupFrom: snap.catchupFrom,
     hold: snap.hold,
-    settings: { ...prev.settings, ...snap.settings },
-    deviceMap: snap.deviceMap,
+    settings: { ...prev.settings, ...snap.settings, modeStep: modeStepOf(snap.settings?.modeStep ?? prev.settings.modeStep) },
+    deviceMap: {
+      up: snap.deviceMap?.up ?? null,
+      down: snap.deviceMap?.down ?? null,
+      mode: snap.deviceMap?.mode ?? null,
+      meter: snap.deviceMap?.meter ?? null,
+    },
     presets: snap.presets,
     events: snap.events,
     records: snap.records,

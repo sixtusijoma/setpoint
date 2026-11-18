@@ -1,7 +1,20 @@
+import { lowBatteries } from '../domain/batteryFetch';
 import { historyQuery } from '../domain/history';
+import { refusalFor, resolveActive } from '../domain/modeSetpoint';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
 import type { Occurrence } from '../domain/schedule';
-import { deviceIds, editScheduleEvent, executeSharedPress, recalibrateShared, storeMeterRead, type PressTiming } from './engine';
+import { isKnownMode } from '../domain/systemMode';
+import {
+  deviceIds,
+  editScheduleEvent,
+  executeModePress,
+  executeSharedPress,
+  recalibrateModeShared,
+  recalibrateShared,
+  refreshBatteryCache,
+  storeMeterRead,
+  type PressTiming,
+} from './engine';
 import { importMeterCsv } from './importMeter';
 import type { SetpointDb } from './sqlDb';
 import type { CommandSource } from './types';
@@ -81,8 +94,27 @@ export const MCP_TOOLS = [
     inputSchema: { type: 'object', properties: { eventId: { type: 'string' } }, required: ['eventId'] },
   },
   {
+    name: 'set_mode',
+    description:
+      'Press the Mode bot until the thermostat reaches heat, off, or cool. One press moves the configured number of modes (2 by default). Refuses when the tracked mode is unknown.',
+    inputSchema: {
+      type: 'object',
+      properties: { mode: { type: 'string', enum: ['heat', 'off', 'cool'] } },
+      required: ['mode'],
+    },
+  },
+  {
+    name: 'recalibrate_mode',
+    description: 'Set the tracked thermostat mode to what it is actually in right now. Presses nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: { mode: { type: 'string', enum: ['heat', 'off', 'cool'] } },
+      required: ['mode'],
+    },
+  },
+  {
     name: 'recalibrate',
-    description: 'Correct the tracked setpoint to what the thermostat display shows right now. Presses nothing.',
+    description: 'Correct the active mode setpoint to what the thermostat display shows right now. Presses nothing. Refuses when the thermostat is Off or the mode is unknown.',
     inputSchema: {
       type: 'object',
       properties: { temperatureF: { type: 'number', description: 'What the thermostat display shows right now, in whole degrees F.' } },
@@ -91,7 +123,8 @@ export const MCP_TOOLS = [
   },
   {
     name: 'status',
-    description: 'Show the shared setpoint, mode, hold, and press lock.',
+    description:
+      'Show the shared app mode, thermostat system mode, Heat and Cool setpoints, bot batteries, hold, and press lock.',
     inputSchema: { type: 'object', properties: {} },
   },
 ] as const;
@@ -101,7 +134,9 @@ type ToolDeps = {
   armMs?: number;
   timing?: PressTiming;
   press?: (direction: 'up' | 'down', signal: AbortSignal) => Promise<void>;
+  pressMode?: (signal: AbortSignal) => Promise<void>;
   readMeter?: () => Promise<{ temperatureF: number; humidity: number; co2Ppm: number }>;
+  readBattery?: (deviceId: string) => Promise<number | null>;
 };
 
 export async function handleMcp(db: SetpointDb, body: unknown, deps: ToolDeps = {}): Promise<Record<string, unknown>> {
@@ -136,13 +171,22 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
   if (name === 'status') {
     const state = await db.readState();
     const lease = await db.readLease();
+    const batteries = deps.readBattery
+      ? await refreshBatteryCache(db, { now: now(), readBattery: deps.readBattery })
+      : state.batteryCache;
+    const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
     return JSON.stringify({
-      setpoint: state.virtualSetpoint,
+      setpoint: active.status === 'active' ? active.degrees : null,
+      systemMode: state.systemMode,
+      heatSetpoint: state.heatSetpoint,
+      coolSetpoint: state.coolSetpoint,
       mode: state.mode,
       hold: state.hold,
       phase: state.schedulePhase,
       note: state.catchupNote,
       lease: lease.phase,
+      batteries,
+      lowBattery: lowBatteries(batteries ?? { up: null, down: null, mode: null }).map((item) => item.slot),
     });
   }
   if (name === 'show_schedule') {
@@ -193,14 +237,35 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     const saved = await recalibrateShared(db, { temperatureF: args.temperatureF, now });
     return JSON.stringify({ previous: saved.previous, setpoint: saved.setpoint });
   }
+  if (name === 'recalibrate_mode') {
+    const saved = await recalibrateModeShared(db, { mode: args.mode });
+    return JSON.stringify({ previous: saved.previous, systemMode: saved.systemMode, setpoint: saved.setpoint });
+  }
+  if (name === 'set_mode') {
+    if (!isKnownMode(args.mode)) {
+      throw new Error('Mode must be heat, off, or cool.');
+    }
+    const result = await executeModePress(db, {
+      target: args.mode,
+      source: { kind: 'mcp' },
+      owner: 'mcp',
+      now,
+      timing: deps.timing,
+      press: deps.pressMode ?? (async () => {
+        throw new Error('Map the mode bot before changing the thermostat mode.');
+      }),
+    });
+    return JSON.stringify(result);
+  }
   if (name === 'set_to' || name === 'nudge') {
     const state = await db.readState();
-    if (state.virtualSetpoint === null) {
-      throw new Error('Set the virtual setpoint first.');
+    const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
+    if (active.status !== 'active') {
+      throw new Error(refusalFor(active) ?? 'Set the virtual setpoint first.');
     }
     const target = name === 'set_to'
       ? Number(args.temperatureF)
-      : state.virtualSetpoint + (args.direction === 'down' ? -state.settings.step : state.settings.step);
+      : active.degrees + (args.direction === 'down' ? -state.settings.step : state.settings.step);
     const source: CommandSource = name === 'set_to' ? { kind: 'set-to' } : { kind: 'manual' };
     const result = await executeSharedPress(db, { target, source, owner: 'mcp', now, armMs: deps.armMs ?? 400, timing: deps.timing, press });
     return JSON.stringify(result);
@@ -257,8 +322,9 @@ async function runNowTool(
 ): Promise<unknown> {
   const state = await db.readState();
   const event = state.events.find((item) => item.id === eventId);
-  if (!event || state.virtualSetpoint === null) {
-    throw new Error('That schedule cannot run right now.');
+  const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
+  if (!event || active.status !== 'active') {
+    throw new Error(active.status === 'active' ? 'That schedule cannot run right now.' : (refusalFor(active) ?? 'That schedule cannot run right now.'));
   }
   const when = occurrenceForRunNow(state.events, eventId, now());
   if (!when) {
@@ -283,7 +349,7 @@ async function runNowTool(
     when,
     { type: 'run-now', when: timing },
     now().toISOString(),
-    { via: 'run-now', previousSetpoint: state.virtualSetpoint },
+    { via: 'run-now', previousSetpoint: active.degrees },
   );
   if (!('error' in moved)) {
     await db.patchState(latest.version, { records: moved.records, hold: null });

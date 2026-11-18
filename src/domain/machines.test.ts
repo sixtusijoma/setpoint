@@ -53,10 +53,10 @@ describe('link, room, lifecycle, messages, setpoint', () => {
   });
 
   it('rejects a shared id and a meter mapped as a bot', () => {
-    const map = { up: bot('up'), down: null, meter: null };
+    const map = { up: bot('up'), down: null, mode: null, meter: null };
     expect(mapRejection('down', { deviceId: 'up', deviceType: 'Bot', deviceName: 'Up' }, map)).toMatch(/different/);
     expect(mapRejection('meter', { deviceId: 'm', deviceType: 'Bot', deviceName: 'Bot' }, map)).toMatch(/not a meter/);
-    expect(mapRejection('up', { deviceId: 'm', deviceType: 'MeterPro(CO2)', deviceName: 'Meter' }, { up: null, down: null, meter: null })).toMatch(
+    expect(mapRejection('up', { deviceId: 'm', deviceType: 'MeterPro(CO2)', deviceName: 'Meter' }, { up: null, down: null, mode: null, meter: null })).toMatch(
       /not a bot/,
     );
   });
@@ -70,6 +70,7 @@ describe('link, room, lifecycle, messages, setpoint', () => {
       updatedAt: '2026-11-11T00:00:00.000Z',
       batteryUp: 80,
       batteryDown: 80,
+      batteryMode: 80,
       batteryMeter: 80,
     };
     const loading = deriveRoom({ mode: 'live', climate, lastLive: null, refreshing: true, error: null });

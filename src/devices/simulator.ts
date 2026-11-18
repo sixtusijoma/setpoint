@@ -7,6 +7,7 @@ export type ClimateState = {
   updatedAt: string;
   batteryUp: number | null;
   batteryDown: number | null;
+  batteryMode: number | null;
   batteryMeter: number | null;
   co2Lock: Co2Tone | null;
   failNextPress: boolean;
@@ -21,6 +22,7 @@ export function initialClimate(nowIso: string): ClimateState {
     updatedAt: nowIso,
     batteryUp: 86,
     batteryDown: 74,
+    batteryMode: 18,
     batteryMeter: 91,
     co2Lock: null,
     failNextPress: false,

@@ -1,6 +1,8 @@
 import { SetpointDial } from '@/components/dial';
 import { Banner, CircleButton, ConfirmDialog, PillButton, Sheet, Stepper } from '@/components/ui';
+import { displayBatteries, lowBatterySentence } from '@/domain/batteryFetch';
 import { co2Band } from '@/domain/co2';
+import { refusalFor, resolveActive } from '@/domain/modeSetpoint';
 import { commandLocks, shownProgressTarget } from '@/domain/pendingTarget';
 import { planSetTo } from '@/domain/planSetTo';
 import { chipFor, currentTarget, nextOccurrence } from '@/domain/schedule';
@@ -8,6 +10,7 @@ import { formatRoom, setpointAccent } from '@/domain/temperature';
 import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
 import { refreshSpinner } from '@/domain/refresh';
+import { isKnownMode, modeLabel, type KnownMode } from '@/domain/systemMode';
 import { suggestedTarget, useApp } from '@/state/store';
 import { accentColor, colors, fonts, toneColor } from '@/theme';
 import { useEffect, useRef, useState } from 'react';
@@ -35,6 +38,8 @@ export default function HomeScreen() {
   const [draft, setDraft] = useState(setpoint);
   const [recal, setRecal] = useState(setpoint);
   const [resumeOpen, setResumeOpen] = useState(false);
+  const [modeRecalOpen, setModeRecalOpen] = useState(false);
+  const [modeDraft, setModeDraft] = useState<KnownMode>('heat');
   const pullStart = useRef<number | null>(null);
   const atTop = useRef(true);
   const lastPull = useRef(0);
@@ -102,15 +107,22 @@ export default function HomeScreen() {
     };
   }, []);
 
-  const plan = planSetTo({
-    current: setpoint,
-    target: draft,
-    step: app.state.settings.step,
-    minF: app.state.settings.minF,
-    maxF: app.state.settings.maxF,
-    pressCap: app.state.settings.pressCap,
-    wakeFirst: app.state.settings.wakeFirst,
+  const activeSetpoint = resolveActive(app.state.systemMode, {
+    heat: app.state.heatSetpoint,
+    cool: app.state.coolSetpoint,
   });
+  const plan =
+    activeSetpoint.status === 'active'
+      ? planSetTo({
+          current: activeSetpoint.degrees,
+          target: draft,
+          step: app.state.settings.step,
+          minF: app.state.settings.minF,
+          maxF: app.state.settings.maxF,
+          pressCap: app.state.settings.pressCap,
+          wakeFirst: app.state.settings.wakeFirst,
+        })
+      : { ok: false as const, reason: refusalFor(activeSetpoint) ?? 'Set the virtual setpoint first.' };
 
   function openSetTo() {
     setDraft(suggestedTarget(app.state));
@@ -123,14 +135,30 @@ export default function HomeScreen() {
     setRecalOpen(true);
   }
 
+  const dialValue = app.state.systemMode === 'off' ? 'Off' : app.state.virtualSetpoint === null ? '—' : app.state.virtualSetpoint;
+  const dialCaption =
+    app.state.systemMode === 'heat'
+      ? 'Heat setpoint'
+      : app.state.systemMode === 'cool'
+        ? 'Cool setpoint'
+        : app.state.systemMode === 'off'
+          ? 'Off'
+          : 'Mode unknown';
+  const batteries = displayBatteries(app.state);
+  const batteryWarning = lowBatterySentence(batteries);
   const band = reading ? co2Band(reading.co2Ppm) : null;
-  const chip = chipFor({
-    setpoint,
-    hold: app.state.hold,
-    events: app.state.events,
-    records: app.state.records,
-    now: app.clock,
-  });
+  const chip =
+    app.state.virtualSetpoint === null
+      ? app.state.hold
+        ? { kind: 'holding' as const, text: 'Holding. There is no active setpoint until Heat or Cool is on.' }
+        : { kind: 'following' as const, text: 'Schedule waits until Heat or Cool is on.' }
+      : chipFor({
+          setpoint: app.state.virtualSetpoint,
+          hold: app.state.hold,
+          events: app.state.events,
+          records: app.state.records,
+          now: app.clock,
+        });
 
   const pulling = refreshSpinner(app.refresh);
 
@@ -194,7 +222,7 @@ export default function HomeScreen() {
           <Pressable
             testID="resume-schedule"
             onPress={() => {
-              if (activeTarget && activeTarget.targetF !== setpoint) {
+              if (activeTarget && app.state.virtualSetpoint !== null && activeTarget.targetF !== app.state.virtualSetpoint) {
                 setResumeOpen(true);
                 return;
               }
@@ -223,6 +251,11 @@ export default function HomeScreen() {
       ) : null}
 
       {app.banner ? <Banner message={app.banner} onDismiss={app.clearBanner} /> : null}
+      {batteryWarning ? (
+        <Text testID="low-battery" style={styles.warning}>
+          {batteryWarning}
+        </Text>
+      ) : null}
 
       {app.state.mode === 'live' && !app.hasCredentials ? (
         <View style={styles.notice}>
@@ -254,7 +287,49 @@ export default function HomeScreen() {
         </Text>
       </View>
 
-      <SetpointDial setpoint={setpoint} ratio={ratio} color={accent} caption="Setpoint" />
+      <SetpointDial
+        setpoint={dialValue}
+        ratio={ratio}
+        color={accent}
+        caption={dialCaption}
+        showDegree={typeof dialValue === 'number'}
+      />
+
+      <View style={styles.modeRow}>
+        {(['heat', 'off', 'cool'] as const).map((mode) => (
+          <Pressable
+            key={mode}
+            testID={`system-${mode}`}
+            disabled={busy}
+            onPress={() => {
+              if (app.state.systemMode === 'unknown') {
+                setModeDraft(mode);
+                setModeRecalOpen(true);
+                return;
+              }
+              void app.setSystemMode(mode);
+            }}
+            style={[styles.modeItem, app.state.systemMode === mode && styles.modeOn, busy && styles.dim]}
+          >
+            <Text style={styles.modeText}>{modeLabel(mode)}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {app.state.systemMode === 'unknown' ? (
+        <Text testID="mode-unknown" style={styles.modeHint}>
+          Mode is unknown. Tap Heat, Off, or Cool to say which one is showing. Setpoint will not press the Mode bot until then.
+        </Text>
+      ) : (
+        <Pressable
+          testID="recalibrate-mode"
+          onPress={() => {
+            setModeDraft(app.state.systemMode === 'unknown' ? 'heat' : app.state.systemMode);
+            setModeRecalOpen(true);
+          }}
+        >
+          <Text style={styles.modeHint}>Mode is wrong</Text>
+        </Pressable>
+      )}
 
       <View style={styles.pads}>
         <CircleButton
@@ -293,7 +368,9 @@ export default function HomeScreen() {
             />
           </View>
           <Text testID="command-target" style={styles.progressBody}>
-            Setting to {shownProgressTarget(app.desiredSetpoint, app.command.target)}°
+            {app.command.kind === 'mode' && isKnownMode(app.command.systemMode)
+              ? `Setting mode to ${modeLabel(app.command.systemMode)}`
+              : `Setting to ${shownProgressTarget(app.desiredSetpoint, app.command.target)}°`}
           </Text>
           <PillButton label="Cancel" testID="cancel-command" tone="ghost" onPress={app.cancelCommand} />
         </View>
@@ -330,7 +407,7 @@ export default function HomeScreen() {
       </View>
 
       <Text testID="updated-at" style={styles.meta}>
-        Up bot {battery(reading?.batteryUp)} · Down bot {battery(reading?.batteryDown)} · Meter{' '}
+        Up bot {battery(batteries.up)} · Down bot {battery(batteries.down)} · Mode bot {battery(batteries.mode)} · Meter{' '}
         {battery(reading?.batteryMeter)}
         {'\n'}
         Updated {reading ? formatStamp(reading.updatedAt) : '-'}
@@ -368,8 +445,8 @@ export default function HomeScreen() {
       <Sheet visible={recalOpen} onClose={() => setRecalOpen(false)}>
         <Text style={styles.sheetTitle}>Recalibrate</Text>
         <Text style={styles.sheetBody}>
-          What does the thermostat display show right now? Saving replaces the virtual setpoint. It does not press any
-          buttons.
+          What does the thermostat display show right now? Saving replaces the active Heat or Cool setpoint. It does not
+          press any buttons.
         </Text>
         <Stepper
           testID="recalibrate-value"
@@ -396,6 +473,31 @@ export default function HomeScreen() {
                 setRecalOpen(false);
               }
             })();
+          }}
+        />
+      </Sheet>
+
+      <Sheet visible={modeRecalOpen} onClose={() => setModeRecalOpen(false)}>
+        <Text style={styles.sheetTitle}>Which mode is on the display?</Text>
+        <Text style={styles.sheetBody}>This records the mode the thermostat is actually in. It does not press the Mode bot.</Text>
+        <View style={styles.modeRow}>
+          {(['heat', 'off', 'cool'] as const).map((mode) => (
+            <Pressable
+              key={`draft-${mode}`}
+              testID={`mode-draft-${mode}`}
+              onPress={() => setModeDraft(mode)}
+              style={[styles.modeItem, modeDraft === mode && styles.modeOn]}
+            >
+              <Text style={styles.modeText}>{modeLabel(mode)}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <PillButton
+          label="Save mode"
+          testID="recalibrate-mode-save"
+          onPress={() => {
+            void app.recalibrateSystemMode(modeDraft);
+            setModeRecalOpen(false);
           }}
         />
       </Sheet>
@@ -601,6 +703,40 @@ const styles = StyleSheet.create({
   },
   fill: {
     height: 6,
+  },
+  warning: {
+    color: colors.poor,
+    fontFamily: fonts.medium,
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  modeRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  modeItem: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: colors.card,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modeOn: {
+    borderWidth: 1,
+    borderColor: colors.neutral,
+  },
+  modeText: {
+    color: colors.text,
+    fontFamily: fonts.medium,
+    fontSize: 15,
+  },
+  modeHint: {
+    color: colors.muted,
+    fontFamily: fonts.body,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
   },
   presets: {
     flexDirection: 'row',

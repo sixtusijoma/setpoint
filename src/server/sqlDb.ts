@@ -1,9 +1,47 @@
+import type { BatteryReading } from '../domain/batteryFetch';
 import type { ChangeCursor, HistorySample, SetpointChange } from '../domain/history';
+import { activeDegrees } from '../domain/modeSetpoint';
+import { isSystemMode, modeStepOf } from '../domain/systemMode';
 import type { LeaseView, SharedSnapshot } from './types';
 
 type Query = <T>(sql: string, params?: unknown[]) => Promise<T[]>;
 
 export type StoredChange = SetpointChange & { id: number };
+
+function normalizeSnapshot(raw: SharedSnapshot): SharedSnapshot {
+  const deviceMap = {
+    up: raw.deviceMap?.up ?? null,
+    down: raw.deviceMap?.down ?? null,
+    mode: raw.deviceMap?.mode ?? null,
+    meter: raw.deviceMap?.meter ?? null,
+  };
+  const settings = { ...raw.settings, modeStep: modeStepOf(raw.settings?.modeStep) };
+  const batteryCache = raw.batteryCache ?? null;
+  if (!isSystemMode(raw.systemMode)) {
+    return {
+      ...raw,
+      systemMode: 'unknown',
+      heatSetpoint: raw.heatSetpoint ?? null,
+      coolSetpoint: raw.coolSetpoint ?? null,
+      batteryCache,
+      deviceMap,
+      settings,
+      virtualSetpoint: raw.virtualSetpoint ?? null,
+    };
+  }
+  const heatSetpoint = raw.heatSetpoint ?? null;
+  const coolSetpoint = raw.coolSetpoint ?? null;
+  return {
+    ...raw,
+    systemMode: raw.systemMode,
+    heatSetpoint,
+    coolSetpoint,
+    batteryCache,
+    deviceMap,
+    settings,
+    virtualSetpoint: activeDegrees(raw.systemMode, { heat: heatSetpoint, cool: coolSetpoint }),
+  };
+}
 
 function asJson<T>(value: unknown): T {
   if (typeof value === 'string') {
@@ -29,6 +67,7 @@ export type SetpointDb = {
   listChangesPage: (before: ChangeCursor | null, limit: number) => Promise<{ changes: StoredChange[]; more: boolean }>;
   readBounds: () => Promise<{ firstAt: string | null; lastAt: string | null }>;
   pruneReads: () => Promise<{ rolled: number; deleted: number }>;
+  saveBatteryCache: (cache: BatteryReading) => Promise<void>;
   saveCredentials: (token: string, secret: string) => Promise<void>;
   readCredentials: () => Promise<{ token: string; secret: string } | null>;
 };
@@ -37,7 +76,7 @@ export function createSqlDb(query: Query): SetpointDb {
   return {
     async readState() {
       const rows = await query<{ read_shared_state: unknown }>('select public.read_shared_state() as read_shared_state');
-      return asJson<SharedSnapshot>(rows[0]?.read_shared_state);
+      return normalizeSnapshot(asJson<SharedSnapshot>(rows[0]?.read_shared_state));
     },
     async patchState(version, patch) {
       const rows = await query<{ patch_shared_state: unknown }>(
@@ -48,7 +87,7 @@ export function createSqlDb(query: Query): SetpointDb {
       if (value === null || value === undefined) {
         return null;
       }
-      return asJson<SharedSnapshot>(value);
+      return normalizeSnapshot(asJson<SharedSnapshot>(value));
     },
     async acquireLease(owner, ttlSeconds) {
       const rows = await query<{ acquire_press_lease: boolean }>(
@@ -140,6 +179,9 @@ export function createSqlDb(query: Query): SetpointDb {
     async pruneReads() {
       const rows = await query<{ prune_meter_reads: unknown }>('select public.prune_meter_reads() as prune_meter_reads');
       return asJson<{ rolled: number; deleted: number }>(rows[0]?.prune_meter_reads);
+    },
+    async saveBatteryCache(cache) {
+      await query('select public.save_battery_cache($1::jsonb)', [JSON.stringify(cache)]);
     },
     async saveCredentials(token, secret) {
       await query('select public.save_switchbot_credentials($1::text, $2::text)', [token, secret]);

@@ -5,6 +5,8 @@ import type { SwitchBotDevice } from '@/devices/switchbot';
 import { readChangePage, withinRange, type ChangePage, type HistorySample, type SetpointChange } from '@/domain/history';
 import type { HistoryWindow, HistoryWindowData } from '@/domain/historyWindow';
 import { chunkMeterCsv, combineSummaries, emptySummary, type MeterImportSummary } from '@/domain/meterCsv';
+import type { BatteryReading } from '@/domain/batteryFetch';
+import type { SystemMode } from '@/domain/systemMode';
 import type { DeviceMap, Preset, Settings } from '@/state/model';
 
 export type ServerConfig = {
@@ -15,6 +17,10 @@ export type ServerConfig = {
 export type SharedSnapshot = {
   version: number;
   virtualSetpoint: number | null;
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+  batteryCache: BatteryReading | null;
   catchupFrom: string | null;
   mode: 'demo' | 'live';
   hold: HoldState;
@@ -33,6 +39,8 @@ export type RemoteProgress = {
   total: number;
   target: number;
   label: 'press' | 'finishing';
+  kind?: 'setpoint' | 'mode';
+  systemMode?: SystemMode;
 };
 
 export type RemoteCommandResult = {
@@ -278,6 +286,25 @@ export function fetchRemoteDevices(config: ServerConfig, appKey: string): Promis
   return call(config, appKey, 'devices', { method: 'POST', body: '{}' });
 }
 
-export function requestRemoteMeter(config: ServerConfig, appKey: string): Promise<{ sample: HistorySample | null }> {
+export function requestRemoteMeter(
+  config: ServerConfig,
+  appKey: string,
+): Promise<{ sample: HistorySample | null; batteries?: BatteryReading | null }> {
   return call(config, appKey, 'meter', { method: 'POST', body: '{}' }, true);
+}
+
+export function runRemoteMode(
+  config: ServerConfig,
+  appKey: string,
+  mode: 'heat' | 'off' | 'cool',
+): Promise<{ status: string; systemMode: SystemMode; wanted: string; reason?: string; notifyCheck?: boolean }> {
+  return call(config, appKey, 'set-mode', { method: 'POST', body: JSON.stringify({ mode }) });
+}
+
+export function recalibrateModeRemote(
+  config: ServerConfig,
+  appKey: string,
+  mode: 'heat' | 'off' | 'cool',
+): Promise<{ previous: SystemMode; systemMode: SystemMode; setpoint: number | null; version: number }> {
+  return call(config, appKey, 'recalibrate-mode', { method: 'POST', body: JSON.stringify({ mode }) });
 }

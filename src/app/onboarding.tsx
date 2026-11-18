@@ -111,7 +111,7 @@ export default function OnboardingScreen() {
         <View style={styles.block}>
           <Text style={styles.title}>Map the devices</Text>
           <Text style={styles.body}>
-            Choose the heat-up bot, the heat-down bot, and the Meter Pro CO2. You can change this later in Settings.
+            Choose the heat-up bot, the heat-down bot, and the Meter Pro CO2. The Mode bot is optional and can be mapped later in Settings.
           </Text>
           {message ? <Text style={styles.note}>{message}</Text> : null}
           <RolePicker
@@ -125,6 +125,12 @@ export default function OnboardingScreen() {
             selected={app.state.deviceMap.down?.name ?? 'Not mapped'}
             devices={app.devices}
             onPick={(device) => app.mapRole('down', device)}
+          />
+          <RolePicker
+            label="Mode bot"
+            selected={app.state.deviceMap.mode?.name ?? 'Not mapped'}
+            devices={app.devices}
+            onPick={(device) => app.mapRole('mode', device)}
           />
           <RolePicker
             label="Meter"
@@ -149,8 +155,8 @@ export default function OnboardingScreen() {
           <Text style={styles.kicker}>Once</Text>
           <Text style={styles.title}>What's on the display?</Text>
           <Text style={styles.body}>
-            Read the thermostat. Saving records the virtual setpoint and does not press any buttons. Setpoint keeps this
-            number the next time you open the app.
+            Read the thermostat. Saving stores this number for both Heat and Cool and does not press any buttons. The
+            mode stays unknown until you say which one is showing.
           </Text>
           <Stepper
             testID="calibration-value"

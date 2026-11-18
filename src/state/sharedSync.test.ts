@@ -14,7 +14,14 @@ import {
 } from './sharedSync';
 
 function live(setpoint: number): Persisted {
-  return { ...createDefaultState('2026-11-12T14:00:00.000Z'), mode: 'live', virtualSetpoint: setpoint };
+  return {
+    ...createDefaultState('2026-11-12T14:00:00.000Z'),
+    mode: 'live',
+    systemMode: 'heat',
+    heatSetpoint: setpoint,
+    coolSetpoint: setpoint,
+    virtualSetpoint: setpoint,
+  };
 }
 
 function server(state: Persisted, version: number, patch: Partial<SharedSnapshot> = {}): SharedSnapshot {
@@ -35,7 +42,7 @@ describe('shared sync', () => {
 
     // The server takes the recalibrate at version 11.
     acceptVersion(sync, 11);
-    local = { ...local, virtualSetpoint: 66 };
+    local = { ...local, virtualSetpoint: 66, heatSetpoint: 66 };
     sync.recalibrating = false;
 
     expect(mergePulled(sync, local, stale)).toBeNull();
@@ -50,7 +57,7 @@ describe('shared sync', () => {
     const sync = createSharedSync();
     acceptVersion(sync, 4);
     const prev = live(70);
-    const next = { ...prev, roomLabel: 'Office', virtualSetpoint: 60 };
+    const next = { ...prev, roomLabel: 'Office', virtualSetpoint: 60, heatSetpoint: 60 };
     noteLocalChange(sync, prev, next);
     const patch = takePatch(sync, next);
     expect(patch).toEqual({ version: 4, roomLabel: 'Office' });
@@ -70,7 +77,7 @@ describe('shared sync', () => {
     expect([...sync.dirty]).toEqual(['roomLabel']);
     expect(sync.conflicts).toBe(1);
 
-    const pulled = mergePulled(sync, local, server(prev, 5, { roomLabel: 'Home', virtualSetpoint: 71 }));
+    const pulled = mergePulled(sync, local, server(prev, 5, { roomLabel: 'Home', virtualSetpoint: 71, heatSetpoint: 71 }));
     expect(pulled?.roomLabel).toBe('Office');
     expect(pulled?.virtualSetpoint).toBe(71);
 

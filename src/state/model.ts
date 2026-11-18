@@ -1,8 +1,11 @@
+import type { BatteryReading } from '@/domain/batteryFetch';
 import type { HistorySample, SetpointChange } from '@/domain/history';
 import type { MeterImportSummary } from '@/domain/meterCsv';
+import { activeDegrees, type ModeSetpoints } from '@/domain/modeSetpoint';
 import type { CommandSource } from '@/domain/pressSession';
 import { defaultEvents, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import type { SchedulePhase } from '@/domain/scheduleRunner';
+import type { ModeStep, SystemMode } from '@/domain/systemMode';
 import { initialClimate, type ClimateState } from '@/devices/simulator';
 
 export type { CommandSource };
@@ -16,6 +19,7 @@ export type Settings = {
   maxF: number;
   pressCap: number;
   wakeFirst: boolean;
+  modeStep: ModeStep;
 };
 
 export type DeviceRef = {
@@ -26,9 +30,12 @@ export type DeviceRef = {
   hubDeviceId: string;
 };
 
+export type DeviceRole = 'up' | 'down' | 'mode' | 'meter';
+
 export type DeviceMap = {
   up: DeviceRef | null;
   down: DeviceRef | null;
+  mode: DeviceRef | null;
   meter: DeviceRef | null;
 };
 
@@ -63,12 +70,17 @@ export type LiveReading = {
   updatedAt: string;
   batteryUp: number | null;
   batteryDown: number | null;
+  batteryMode: number | null;
   batteryMeter: number | null;
 };
 
 export type Persisted = {
   version: 1;
   virtualSetpoint: number | null;
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+  batteryCache: BatteryReading | null;
   catchupFrom: string | null;
   mode: Mode;
   roomLabel: string;
@@ -110,6 +122,10 @@ export function createDefaultState(nowIso: string): Persisted {
     catchupFrom: null,
     mode: 'demo',
     roomLabel: 'Home',
+    systemMode: 'unknown',
+    heatSetpoint: null,
+    coolSetpoint: null,
+    batteryCache: null,
     settings: {
       step: 1,
       delayMs: 1000,
@@ -117,8 +133,9 @@ export function createDefaultState(nowIso: string): Persisted {
       maxF: 85,
       pressCap: 15,
       wakeFirst: false,
+      modeStep: 2,
     },
-    deviceMap: { up: null, down: null, meter: null },
+    deviceMap: { up: null, down: null, mode: null, meter: null },
     presets: defaultPresets(),
     events: defaultEvents(),
     records: [],
@@ -258,6 +275,31 @@ export function reduceMeterImport(state: MeterImportState, event: MeterImportEve
     return state;
   }
   return state;
+}
+
+export function applyClimate<T extends { systemMode: SystemMode; heatSetpoint: number | null; coolSetpoint: number | null; virtualSetpoint: number | null }>(
+  prev: T,
+  next: { systemMode: SystemMode; setpoints: ModeSetpoints },
+): T {
+  return { ...prev, ...projectSetpoints(next.systemMode, next.setpoints) };
+}
+
+export function projectSetpoints(mode: SystemMode, points: ModeSetpoints): {
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+  virtualSetpoint: number | null;
+} {
+  return {
+    systemMode: mode,
+    heatSetpoint: points.heat,
+    coolSetpoint: points.cool,
+    virtualSetpoint: activeDegrees(mode, points),
+  };
+}
+
+export function hasCalibration(state: { heatSetpoint: number | null; coolSetpoint: number | null }): boolean {
+  return state.heatSetpoint !== null || state.coolSetpoint !== null;
 }
 
 export function deviceFromApi(device: {

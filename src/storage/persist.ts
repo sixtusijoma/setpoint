@@ -3,6 +3,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LOCAL_HISTORY_CAP, type HistorySample, type SetpointChange } from '@/domain/history';
 import { defaultEvents, normalizeStatus, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import { initialClimate } from '@/devices/simulator';
+import { isSystemMode, modeStepOf } from '@/domain/systemMode';
+import { activeDegrees } from '@/domain/modeSetpoint';
 import {
   createDefaultState,
   defaultPresets,
@@ -46,7 +48,7 @@ function sanitizeState(raw: unknown, nowIso: string): Persisted | null {
   }
   return {
     ...base,
-    virtualSetpoint: typeof record.virtualSetpoint === 'number' ? Math.round(record.virtualSetpoint) : null,
+    ...cleanClimate(record),
     catchupFrom: typeof record.catchupFrom === 'string' ? record.catchupFrom : null,
     mode: record.mode === 'live' ? 'live' : 'demo',
     roomLabel: typeof record.roomLabel === 'string' && record.roomLabel.trim() ? record.roomLabel.trim() : 'Home',
@@ -57,10 +59,12 @@ function sanitizeState(raw: unknown, nowIso: string): Persisted | null {
       maxF,
       pressCap: clampInt(settings.pressCap, 1, 40, 15),
       wakeFirst: Boolean(settings.wakeFirst),
+      modeStep: modeStepOf(settings.modeStep),
     },
     deviceMap: {
       up: cleanDevice(record.deviceMap?.up),
       down: cleanDevice(record.deviceMap?.down),
+      mode: cleanDevice(record.deviceMap?.mode),
       meter: cleanDevice(record.deviceMap?.meter),
     },
     presets: cleanPresets(record.presets, defaultPresets()),
@@ -71,14 +75,56 @@ function sanitizeState(raw: unknown, nowIso: string): Persisted | null {
     demoClimate: {
       ...initialClimate(nowIso),
       ...(record.demoClimate ?? {}),
+      batteryMode:
+        typeof record.demoClimate?.batteryMode === 'number' ? record.demoClimate.batteryMode : initialClimate(nowIso).batteryMode,
       loseNextResponse: Boolean(record.demoClimate?.loseNextResponse),
       failNextPress: Boolean(record.demoClimate?.failNextPress),
     },
-    lastLive: record.lastLive && typeof record.lastLive.temperatureF === 'number' ? record.lastLive : null,
+    lastLive:
+      record.lastLive && typeof record.lastLive.temperatureF === 'number'
+        ? {
+            ...record.lastLive,
+            batteryMode: typeof record.lastLive.batteryMode === 'number' ? record.lastLive.batteryMode : null,
+          }
+        : null,
     catchupNote: typeof record.catchupNote === 'string' ? record.catchupNote : null,
     schedulePhase: record.schedulePhase === 'paused-after-failure' ? 'paused-after-failure' : 'armed',
     history: cleanHistory(record.history),
     changes: cleanChanges(record.changes),
+  };
+}
+
+function cleanClimate(record: Partial<Persisted>): Pick<
+  Persisted,
+  'systemMode' | 'heatSetpoint' | 'coolSetpoint' | 'virtualSetpoint' | 'batteryCache'
+> {
+  const legacy = typeof record.virtualSetpoint === 'number' ? Math.round(record.virtualSetpoint) : null;
+  const heat = 'heatSetpoint' in record ? whole(record.heatSetpoint) : legacy;
+  const cool = 'coolSetpoint' in record ? whole(record.coolSetpoint) : legacy;
+  const systemMode = isSystemMode(record.systemMode) ? record.systemMode : 'unknown';
+  return {
+    systemMode,
+    heatSetpoint: heat,
+    coolSetpoint: cool,
+    virtualSetpoint: activeDegrees(systemMode, { heat, cool }),
+    batteryCache: cleanCache(record.batteryCache),
+  };
+}
+
+function whole(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null;
+}
+
+function cleanCache(value: Persisted['batteryCache'] | undefined): Persisted['batteryCache'] {
+  if (!value || typeof value.fetchedAt !== 'string') {
+    return null;
+  }
+  return {
+    up: whole(value.up),
+    down: whole(value.down),
+    mode: whole(value.mode),
+    fetchedAt: value.fetchedAt,
+    ...(typeof value.failedAt === 'string' ? { failedAt: value.failedAt } : {}),
   };
 }
 

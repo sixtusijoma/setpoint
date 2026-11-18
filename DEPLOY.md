@@ -15,7 +15,7 @@ supabase link --project-ref rdyjczebydnmfvbgylya
 supabase db push
 ```
 
-That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, `supabase/migrations/20261112180000_setpoint_change_pages.sql`, and `supabase/migrations/20261113090000_history_windows.sql`. The first creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. The second adds an `origin` column (`live` or `import`) on meter reads, the `import_meter_reads` function, and `since` / `until` arguments on the history functions. The third adds an index on setpoint changes by time and the `list_setpoint_changes_page` function that the History list pages through. The fourth makes `list_meter_reads` start daily (86400 second) buckets at midnight Eastern Time instead of midnight UTC, and adds `meter_read_bounds`, which returns the first and last stored reading times. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
+That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, `supabase/migrations/20261112180000_setpoint_change_pages.sql`, `supabase/migrations/20261113090000_history_windows.sql`, and `supabase/migrations/20261118120000_system_mode.sql`. The first creates the shared state row, the press lease, meter reads, setpoint changes, and the private credential table. The second adds an `origin` column (`live` or `import`) on meter reads, the `import_meter_reads` function, and `since` / `until` arguments on the history functions. The third adds an index on setpoint changes by time and the `list_setpoint_changes_page` function that the History list pages through. The fourth makes `list_meter_reads` start daily (86400 second) buckets at midnight Eastern Time instead of midnight UTC, and adds `meter_read_bounds`, which returns the first and last stored reading times. The fifth adds the thermostat mode, separate Heat and Cool setpoints, the mode-bot device slot, the press-step setting, and the bot battery cache. It copies the old single setpoint onto both modes and leaves the mode unknown. Row level security is on and there are no anon policies. The functions run as the owner and are granted to `service_role` only.
 
 ## 2. Set function secrets
 
@@ -63,9 +63,13 @@ supabase functions deploy credentials
 supabase functions deploy devices
 supabase functions deploy prune
 supabase functions deploy mcp
+supabase functions deploy set-mode
+supabase functions deploy recalibrate-mode
 ```
 
 ### Upgrading a project that already runs
+
+Thermostat mode and bot batteries need `supabase db push` first, for `20261118120000_system_mode.sql`. It adds `system_mode`, `heat_setpoint`, `cool_setpoint`, and `battery_cache`, copies the existing setpoint onto both Heat and Cool, and leaves the mode `unknown` until someone names it. Then redeploy `state`, `press`, `recalibrate`, `tick`, `meter`, `mcp`, `set-mode`, and `recalibrate-mode`. `set-mode` and `recalibrate-mode` are new. The others changed because presses, the scheduler, meter reads, and MCP status now use the active mode's setpoint and the battery cache. `session`, `credentials`, `devices`, `history`, `import-meter`, and `prune` do not need a redeploy for this change. An old `press` function, talking to the new database while the mode is still unknown, writes a temperature change onto both Heat and Cool and then clears the mirrored active setpoint. The numbers stay. After the new `press` is deployed, temperature changes refuse until the mode is Heat or Cool.
 
 Browsing older History windows (the arrows, the date picker, and the Year span) needs `supabase db push` (for `20261113090000_history_windows.sql`), then `supabase functions deploy history` and `supabase functions deploy mcp`. Run the migration first: `history` and `mcp` call `meter_read_bounds` and the Eastern Time daily buckets. `mcp` changed because `room_history` now takes `span: "year"` and its long ranges use the same Eastern Time days. The other functions bundle the shared code but their behavior did not change, so they do not need a redeploy. An app build with these windows still works against an older `history` function for the current day, week, and month. Older windows and the Year span show an error that asks for the redeploy.
 

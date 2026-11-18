@@ -1,4 +1,5 @@
 import { AppKeyScreen } from '@/components/app-key-screen';
+import { hasCalibration } from '@/state/model';
 import { AppProvider, useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
 import {
@@ -56,7 +57,7 @@ function Frame({ fontsReady }: { fontsReady: boolean }) {
   if (open && needsKey) {
     body = <AppKeyScreen />;
   } else if (open) {
-    body = <RootStack hasSetpoint={state.virtualSetpoint !== null} />;
+    body = <RootStack hasSetpoint={hasCalibration(state)} />;
   }
   return (
     <View style={styles.outer}>

@@ -37,6 +37,7 @@ export function readingFromRoom(room: RoomState): {
   updatedAt: string;
   batteryUp: number | null;
   batteryDown: number | null;
+  batteryMode: number | null;
   batteryMeter: number | null;
 } | null {
   if (room.kind === 'demo') {

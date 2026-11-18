@@ -20,6 +20,7 @@ const RPC: Record<string, string> = {
   list_setpoint_changes_page: 'list_setpoint_changes_page',
   meter_read_bounds: 'meter_read_bounds',
   prune_meter_reads: 'prune_meter_reads',
+  save_battery_cache: 'save_battery_cache',
   save_switchbot_credentials: 'save_switchbot_credentials',
   service_switchbot_credentials: 'service_switchbot_credentials',
 };
@@ -93,6 +94,9 @@ function argsFor(name: string, params: unknown[]): Record<string, unknown> {
   }
   if (name === 'list_setpoint_changes_page') {
     return { p_before_at: params[0] ?? null, p_before_id: params[1] ?? null, p_limit: params[2] };
+  }
+  if (name === 'save_battery_cache') {
+    return { p_cache: typeof params[0] === 'string' ? JSON.parse(params[0]) : params[0] };
   }
   if (name === 'save_switchbot_credentials') {
     return { p_token: params[0], p_secret: params[1] };

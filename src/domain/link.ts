@@ -1,4 +1,4 @@
-import type { DeviceRef, Mode } from '@/state/model';
+import type { DeviceMap, DeviceRef, DeviceRole, Mode } from '@/state/model';
 
 export type CloudFlag = 'on' | 'off' | 'unknown';
 
@@ -63,23 +63,25 @@ export function isBotType(deviceType: string): boolean {
 }
 
 export function mapRejection(
-  role: 'up' | 'down' | 'meter',
+  role: DeviceRole,
   device: { deviceId: string; deviceType: string; deviceName: string },
-  map: { up: DeviceRef | null; down: DeviceRef | null; meter: DeviceRef | null },
+  map: DeviceMap,
 ): string | null {
   if (role === 'meter') {
     if (!isMeterType(device.deviceType)) {
       return `${device.deviceName} is not a meter. Choose the Meter Pro for the room reading.`;
     }
   } else if (!isBotType(device.deviceType)) {
-    return `${device.deviceName} is not a bot. Up and down need two different SwitchBot Bots.`;
+    return role === 'mode'
+      ? `${device.deviceName} is not a bot. The mode control needs a SwitchBot Bot.`
+      : `${device.deviceName} is not a bot. Up, down, and mode need SwitchBot Bots.`;
   }
-  const otherIds = (['up', 'down', 'meter'] as const)
+  const otherIds = (['up', 'down', 'mode', 'meter'] as const)
     .filter((item) => item !== role)
     .map((item) => map[item]?.id)
     .filter((id): id is string => Boolean(id));
   if (otherIds.includes(device.deviceId)) {
-    return 'Up, down, and the meter have to be three different devices.';
+    return 'Up, down, mode, and the meter have to be four different devices.';
   }
   return null;
 }

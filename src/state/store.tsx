@@ -1,4 +1,5 @@
 import { BROWSER_BLOCKED, CHECK_THERMOSTAT } from '@/copy';
+import { reduceBatteryFetch, shouldFetchBatteries, stateFromCache } from '@/domain/batteryFetch';
 import { co2ForBand, type Co2Tone } from '@/domain/co2';
 import {
   connectionBanner,
@@ -9,7 +10,8 @@ import {
   type ConnectionEvent,
 } from '@/domain/connection';
 import { initialRefresh, reduceRefresh, type Refresh, type RefreshEvent, type RefreshPhase } from '@/domain/refresh';
-import { deriveLink, mapRejection } from '@/domain/link';
+import { chooseDevice, idleDeviceList, reduceDeviceList, type DeviceList } from '@/domain/devicePick';
+import { deriveLink } from '@/domain/link';
 import { lifecycleEventForAppState, reduceLifecycle, type Lifecycle } from '@/domain/lifecycle';
 import { pushMessage, type AppMessage } from '@/domain/messages';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '@/domain/occurrences';
@@ -25,6 +27,15 @@ import {
   type PendingTarget,
   type StepLimits,
 } from '@/domain/pendingTarget';
+import { climateOf, reduceClimate, refusalFor, resolveActive, UNKNOWN_MODE_REASON } from '@/domain/modeSetpoint';
+import {
+  beginModeSession,
+  idleModeSession,
+  isModeRunning,
+  modeProgress,
+  runModeSession,
+  type ModeSession,
+} from '@/domain/modePress';
 import { nearestTarget, planSetTo, type PressAction } from '@/domain/planSetTo';
 import {
   beginRunningSession,
@@ -48,6 +59,7 @@ import {
 } from '@/domain/schedule';
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
+import { modeLabel, type KnownMode } from '@/domain/systemMode';
 import { formatClock } from '@/domain/time';
 import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage } from '@/domain/history';
 import { localWindowData, type HistoryWindow, type HistoryWindowData } from '@/domain/historyWindow';
@@ -74,12 +86,15 @@ import {
   fetchState,
   isTransientNetworkError,
   readServerConfig,
+  recalibrateModeRemote,
   recalibrateRemote,
   requestRemoteMeter,
+  runRemoteMode,
   runRemotePress,
   saveRemoteCredentials,
   saveState,
   ServerAuthError,
+  type RemoteProgress,
   type ServerConfig,
 } from '@/server/appClient';
 import { deleteAppKey, loadAppKey, saveAppKey } from '@/storage/appKey';
@@ -87,9 +102,11 @@ import { clearCredentials, loadCredentials, maskSecret, saveCredentials } from '
 import { loadPersisted, savePersisted } from '@/storage/persist';
 import {
   appendLog,
+  applyClimate,
   createDefaultState,
   createId,
   deviceFromApi,
+  hasCalibration,
   idleMeterImport,
   reduceAppAccess,
   reduceMeterImport,
@@ -120,12 +137,7 @@ const FIRST_ARM_MS = 800;
 const DEMO_PRESS_MS = 1200;
 const FOREGROUND_REFRESH_MS = 500;
 
-export type CommandProgress = {
-  index: number;
-  total: number;
-  target: number;
-  label: 'press' | 'finishing';
-};
+export type CommandProgress = RemoteProgress;
 
 export type CommandResult = {
   status: 'done' | 'already' | 'cancelled' | 'failed' | 'refused' | 'busy' | 'ambiguous';
@@ -160,9 +172,11 @@ type AppContextValue = {
   saveAndLoadDevices: (token: string, secret: string) => Promise<string | null>;
   reloadDevices: () => Promise<string | null>;
   forgetCredentials: () => Promise<void>;
-  mapRole: (role: 'up' | 'down' | 'meter', device: SwitchBotDevice | null) => void;
+  mapRole: (role: 'up' | 'down' | 'mode' | 'meter', device: SwitchBotDevice | null) => void;
   completeCalibration: (temp: number) => void;
   recalibrate: (temp: number) => Promise<string | null>;
+  setSystemMode: (mode: KnownMode) => Promise<void>;
+  recalibrateSystemMode: (mode: KnownMode) => Promise<string | null>;
   bump: (direction: 1 | -1) => Promise<void>;
   setTo: (target: number) => Promise<CommandResult>;
   applyPreset: (preset: Preset) => Promise<void>;
@@ -267,6 +281,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const cancelRef = useRef(false);
   const interruptRef = useRef(false);
   const sessionRef = useRef<PressSession>(idleSession());
+  const modeSessionRef = useRef<ModeSession>(idleModeSession());
+  const deviceListRef = useRef<DeviceList>(idleDeviceList());
   const pendingRef = useRef<PendingTarget>(idlePending());
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushRef = useRef<() => void>(() => undefined);
@@ -437,7 +453,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       if (stored) {
         let next = stored;
-        if (next.virtualSetpoint !== null && !next.catchupFrom) {
+        if (hasCalibration(next) && !next.catchupFrom) {
           next = { ...next, catchupFrom: new Date().toISOString() };
         }
         stateRef.current = next;
@@ -468,7 +484,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           acceptVersion(syncRef.current, snap.version);
           applyAccess({ type: 'accepted' });
           if (stateRef.current.mode === 'live') {
-            if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+            if (serverClimateEmpty(snap) && hasCalibration(stateRef.current)) {
               const saved = await saveState(config, key, snapshotFrom(stateRef.current, syncRef.current.version));
               acceptVersion(syncRef.current, saved.version);
             } else {
@@ -532,7 +548,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
     const auth = sessionAuth();
     const sync = syncRef.current;
-    if (!auth || stateRef.current.mode !== 'live' || isRunning(sessionRef.current) || !canPull(sync)) {
+    if (
+      !auth ||
+      stateRef.current.mode !== 'live' ||
+      isRunning(sessionRef.current) ||
+      isModeRunning(modeSessionRef.current) ||
+      !canPull(sync)
+    ) {
       return;
     }
     const flight = (async () => {
@@ -542,7 +564,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           noteTransportSuccess();
           return;
         }
-        if (snap.virtualSetpoint === null && stateRef.current.virtualSetpoint !== null) {
+        if (serverClimateEmpty(snap) && hasCalibration(stateRef.current)) {
           acceptVersion(sync, snap.version);
           const saved = await saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, sync.version));
           acceptVersion(sync, saved.version);
@@ -685,6 +707,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (pendingRef.current.status !== 'pending') {
       return;
     }
+    if (isModeRunning(modeSessionRef.current)) {
+      clearDebounceTimer();
+      debounceTimer.current = setTimeout(() => {
+        debounceTimer.current = null;
+        flushRef.current();
+      }, 500);
+      return;
+    }
     if (isRunning(sessionRef.current)) {
       applyPending({ type: 'defer', inflight: sessionRef.current.target });
       return;
@@ -768,7 +798,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const runTarget = useCallback(
     async (target: number, source: CommandSource, options?: { wakeFirst?: boolean }): Promise<CommandResult> => {
-      if (isRunning(sessionRef.current)) {
+      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
         const stoppedAt = stateRef.current.virtualSetpoint ?? target;
         const reason = 'A command is already running.';
         showMessage({ source: 'press', text: reason });
@@ -778,8 +808,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return { status: 'busy', stoppedAt, wanted: target, reason };
       }
       const snapshot = stateRef.current;
-      if (snapshot.virtualSetpoint === null) {
-        return { status: 'refused', stoppedAt: target, wanted: target, reason: 'Set the virtual setpoint first.' };
+      const active = resolveActive(snapshot.systemMode, { heat: snapshot.heatSetpoint, cool: snapshot.coolSetpoint });
+      if (active.status !== 'active') {
+        const reason = refusalFor(active) ?? 'Set the virtual setpoint first.';
+        if (source.kind !== 'schedule') {
+          showMessage({ source: 'press', text: reason });
+        }
+        return { status: 'refused', stoppedAt: target, wanted: target, reason };
       }
       const machine = pendingRef.current;
       const alreadyArmed =
@@ -787,7 +822,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (!alreadyArmed) {
         applyPending({ type: 'arm-external', target });
       }
-      const current = snapshot.virtualSetpoint;
+      const current = active.degrees;
       const wakeFirst = options?.wakeFirst ?? snapshot.settings.wakeFirst;
       const plan = planSetTo({
         current,
@@ -898,18 +933,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
               return;
             }
             const mark = changeMark(source, setpoint);
-            commit((prev) =>
-              appendLog(
+            commit((prev) => {
+              const climate = reduceClimate(climateOf(prev), { type: 'set-active', kind: 'adjust', degrees: setpoint });
+              const next = climate.reason ? prev : applyClimate(prev, climate.state);
+              return appendLog(
                 {
-                  ...prev,
-                  virtualSetpoint: setpoint,
-                  changes: [...prev.changes, { at, setpoint, source: mark.source, label: mark.label }].slice(-400),
+                  ...next,
+                  changes: [...next.changes, { at, setpoint, source: mark.source, label: mark.label }].slice(-400),
                 },
                 'press',
                 `${action.direction === 'up' ? 'Up bot' : 'Down bot'} press. Setpoint ${setpoint}°.`,
                 at,
-              ),
-            );
+              );
+            });
             pressFeedback();
           },
         });
@@ -1050,7 +1086,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const tick = useCallback(
     async (now: Date) => {
-      if (schedulerBlocked(pendingRef.current) || isRunning(sessionRef.current) || tickLock.current) {
+      if (
+        schedulerBlocked(pendingRef.current) ||
+        isRunning(sessionRef.current) ||
+        isModeRunning(modeSessionRef.current) ||
+        tickLock.current
+      ) {
         return;
       }
       const snapshot = stateRef.current;
@@ -1162,7 +1203,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       lifecycleRef.current = reduceLifecycle(lifecycleRef.current, event);
-      if (isRunning(sessionRef.current)) {
+      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
         interruptRef.current = true;
         lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'press-interrupted');
       }
@@ -1236,14 +1277,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshDevices = useCallback(async (): Promise<string | null> => {
     const auth = sessionAuth();
+    const beginList = () => {
+      deviceListRef.current = reduceDeviceList(deviceListRef.current, { type: 'start' });
+    };
+    const finishList = (devices: SwitchBotDevice[]) => {
+      deviceListRef.current = reduceDeviceList(deviceListRef.current, {
+        type: 'loaded',
+        devices: devices.map((device) => ({
+          deviceId: device.deviceId,
+          deviceName: device.deviceName,
+          deviceType: device.deviceType,
+          enableCloudService: device.enableCloudService,
+          hubDeviceId: device.hubDeviceId,
+        })),
+      });
+    };
+    const failList = (message: string) => {
+      deviceListRef.current = reduceDeviceList(deviceListRef.current, { type: 'fail', message });
+    };
     if (readServerConfig()) {
       if (!auth) {
         const note = 'Enter the app key before loading devices.';
         setDeviceMessage(note);
         return note;
       }
+      beginList();
       try {
         const listed = await fetchRemoteDevices(auth.config, auth.appKey);
+        finishList(listed.devices);
         setDevices(listed.devices);
         if (listed.devices.length === 0) {
           const note =
@@ -1257,6 +1318,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       } catch (error) {
         noteAuth(error);
         const note = explainError(error, appKeyRef.current);
+        failList(note);
         setDeviceMessage(note);
         return note;
       }
@@ -1266,8 +1328,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setDeviceMessage('Add a token and secret before loading devices.');
       return 'Add a token and secret before loading devices.';
     }
+    beginList();
     try {
       const list = await listDevices(creds);
+      finishList(list);
       setDevices(list);
       if (list.length === 0) {
         const note =
@@ -1280,6 +1344,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return null;
     } catch (error) {
       const note = explainError(error, appKeyRef.current);
+      failList(note);
       setDeviceMessage(note);
       return note;
     }
@@ -1317,16 +1382,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
         const meter = await requestRemoteMeter(auth.config, auth.appKey);
         noteTransportSuccess();
-        if (meter.sample) {
+        if (meter.sample || meter.batteries) {
           commit((prev) => ({
             ...prev,
+            batteryCache: meter.batteries ?? prev.batteryCache,
             lastLive: {
               temperatureF: meter.sample?.temperatureF ?? prev.lastLive?.temperatureF ?? 0,
-              humidity: meter.sample?.humidity ?? 0,
-              co2Ppm: meter.sample?.co2Ppm ?? 0,
+              humidity: meter.sample?.humidity ?? prev.lastLive?.humidity ?? 0,
+              co2Ppm: meter.sample?.co2Ppm ?? prev.lastLive?.co2Ppm ?? 0,
               updatedAt: meter.sample?.at ?? nowIso,
-              batteryUp: prev.lastLive?.batteryUp ?? null,
-              batteryDown: prev.lastLive?.batteryDown ?? null,
+              batteryUp: meter.batteries?.up ?? prev.lastLive?.batteryUp ?? null,
+              batteryDown: meter.batteries?.down ?? prev.lastLive?.batteryDown ?? null,
+              batteryMode: meter.batteries?.mode ?? prev.lastLive?.batteryMode ?? null,
               batteryMeter: prev.lastLive?.batteryMeter ?? null,
             },
             history: meter.sample ? [...prev.history, meter.sample].slice(-LOCAL_HISTORY_CAP) : prev.history,
@@ -1344,17 +1411,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       const meter = await readMeter(creds, snapshot.deviceMap.meter.id);
-      let batteryUp: number | null = null;
-      let batteryDown: number | null = null;
-      try {
-        batteryUp = snapshot.deviceMap.up ? await readBotBattery(creds, snapshot.deviceMap.up.id) : null;
-        batteryDown = snapshot.deviceMap.down ? await readBotBattery(creds, snapshot.deviceMap.down.id) : null;
-      } catch {
-        batteryUp = snapshot.lastLive?.batteryUp ?? null;
-        batteryDown = snapshot.lastLive?.batteryDown ?? null;
+      const nowMs = Date.now();
+      const cached = stateFromCache(snapshot.batteryCache, nowMs);
+      let batteryUp = snapshot.batteryCache?.up ?? snapshot.lastLive?.batteryUp ?? null;
+      let batteryDown = snapshot.batteryCache?.down ?? snapshot.lastLive?.batteryDown ?? null;
+      let batteryMode = snapshot.batteryCache?.mode ?? snapshot.lastLive?.batteryMode ?? null;
+      let batteryCache = snapshot.batteryCache;
+      if (shouldFetchBatteries(cached, nowMs)) {
+        const loading = reduceBatteryFetch(cached, { type: 'start' });
+        try {
+          batteryUp = snapshot.deviceMap.up ? await readBotBattery(creds, snapshot.deviceMap.up.id) : null;
+          batteryDown = snapshot.deviceMap.down ? await readBotBattery(creds, snapshot.deviceMap.down.id) : null;
+          batteryMode = snapshot.deviceMap.mode ? await readBotBattery(creds, snapshot.deviceMap.mode.id) : null;
+          const reading = { up: batteryUp, down: batteryDown, mode: batteryMode, fetchedAt: nowIso };
+          reduceBatteryFetch(loading, { type: 'succeed', reading });
+          batteryCache = reading;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Battery read failed.';
+          reduceBatteryFetch(loading, { type: 'fail', error: message, at: nowIso });
+          batteryCache = snapshot.batteryCache
+            ? { ...snapshot.batteryCache, failedAt: nowIso }
+            : { up: batteryUp, down: batteryDown, mode: batteryMode, fetchedAt: nowIso, failedAt: nowIso };
+        }
       }
       commit((prev) => ({
         ...prev,
+        batteryCache,
         lastLive: {
           temperatureF: meter.temperatureF,
           humidity: meter.humidity,
@@ -1362,6 +1444,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           updatedAt: nowIso,
           batteryUp,
           batteryDown,
+          batteryMode,
           batteryMeter: meter.battery,
         },
         history: [
@@ -1379,6 +1462,213 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshRef = useRef(refreshClimate);
   refreshRef.current = refreshClimate;
+
+  const pressMode = useCallback(async (signal: AbortSignal) => {
+    const snapshot = stateRef.current;
+    if (snapshot.mode === 'demo') {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, DEMO_PRESS_MS);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new PressOutcomeError('The press was interrupted.', 'ambiguous'));
+        };
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      return;
+    }
+    const creds = await loadCredentials();
+    if (!creds) {
+      throw new PressOutcomeError('Add a SwitchBot token and secret in Settings.', 'rejected');
+    }
+    const device = snapshot.deviceMap.mode;
+    if (!device) {
+      throw new PressOutcomeError('Map the mode bot before changing the thermostat mode.', 'rejected');
+    }
+    if (device.enableCloudService === false) {
+      throw new PressOutcomeError(`${device.name} has cloud service turned off.`, 'rejected');
+    }
+    try {
+      await pressBot(creds, device.id, fetch, signal);
+    } catch (error) {
+      if (Platform.OS === 'web') {
+        throw new PressOutcomeError(BROWSER_BLOCKED, 'rejected');
+      }
+      if (error instanceof TransportError || error instanceof PressOutcomeError) {
+        throw error;
+      }
+      throw new PressOutcomeError(explainError(error), 'rejected');
+    }
+  }, []);
+
+  const showModeProgress = useCallback((progress: { index: number; total: number; target: KnownMode; label: 'press' | 'finishing' }) => {
+    setCommand(modeCommandProgress(progress));
+  }, []);
+
+  const setSystemMode = useCallback(
+    async (target: KnownMode) => {
+      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
+        showMessage({ source: 'press', text: 'A command is already running.' });
+        return;
+      }
+      const snapshot = stateRef.current;
+      if (snapshot.systemMode === target) {
+        return;
+      }
+      if (snapshot.systemMode === 'unknown') {
+        showMessage({ source: 'press', text: UNKNOWN_MODE_REASON });
+        return;
+      }
+      const auth = sessionAuth();
+      if (auth && snapshot.mode === 'live') {
+        const opened = beginModeSession({
+          from: snapshot.systemMode,
+          target,
+          step: snapshot.settings.modeStep,
+          source: { kind: 'set-mode' },
+        });
+        if (opened) {
+          modeSessionRef.current = opened.session;
+          showModeProgress(opened.progress);
+        }
+        let closed = false;
+        const poll = setInterval(() => {
+          void fetchRemoteSession(auth.config, auth.appKey)
+            .then((remote) => {
+              if (!closed && remote.progress?.kind === 'mode') {
+                setCommand(remote.progress);
+              }
+            })
+            .catch(() => undefined);
+        }, 400);
+        try {
+          const result = await runRemoteMode(auth.config, auth.appKey, target);
+          if (result.notifyCheck || result.status === 'ambiguous') {
+            showMessage({ source: 'press', text: CHECK_THERMOSTAT });
+            void notifyCheckThermostat(CHECK_THERMOSTAT);
+          } else if (result.reason && result.status !== 'done' && result.status !== 'already') {
+            showMessage({ source: 'press', text: result.reason });
+          }
+          await pullShared();
+        } catch (error) {
+          noteAuth(error);
+          showMessage({ source: 'press', text: explainError(error, appKeyRef.current) });
+        } finally {
+          closed = true;
+          clearInterval(poll);
+          modeSessionRef.current = idleModeSession();
+          setCommand(null);
+        }
+        return;
+      }
+      cancelRef.current = false;
+      interruptRef.current = false;
+      showMessage(null);
+      try {
+        const settled = await runModeSession({
+          from: snapshot.systemMode,
+          target,
+          step: snapshot.settings.modeStep,
+          source: { kind: 'set-mode' },
+          delayMs: snapshot.settings.delayMs,
+          press: pressMode,
+          sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
+          beforeSend: async (index, isCancelled) => {
+            if (index === 0) {
+              return sleepUnless(FIRST_ARM_MS, isCancelled);
+            }
+            return isCancelled();
+          },
+          isCancelled: () => cancelRef.current,
+          isInterrupted: () => interruptRef.current,
+          onSession: (session) => {
+            modeSessionRef.current = session;
+            const progress = modeProgress(session);
+            if (progress) {
+              showModeProgress(progress);
+            }
+          },
+          onCommitted: (mode) => {
+            const at = new Date().toISOString();
+            commit((prev) => {
+              const climate = reduceClimate(climateOf(prev), { type: 'recalibrate-mode', mode });
+              return appendLog(
+                applyClimate(prev, climate.state),
+                'press',
+                `Mode bot press. The thermostat is ${modeLabel(mode)}.`,
+                at,
+              );
+            });
+            pressFeedback();
+          },
+        });
+        if (settled.status === 'ambiguous') {
+          showMessage({ source: 'press', text: CHECK_THERMOSTAT });
+          errorFeedback();
+        } else if (settled.reason && settled.status !== 'done' && settled.status !== 'already') {
+          showMessage({ source: 'press', text: settled.reason });
+          if (settled.status === 'failed' || settled.status === 'refused') {
+            errorFeedback();
+          }
+        } else if (settled.status === 'done') {
+          successFeedback();
+        }
+      } catch (error) {
+        showMessage({ source: 'press', text: explainError(error) });
+        errorFeedback();
+      } finally {
+        modeSessionRef.current = idleModeSession();
+        setCommand(null);
+      }
+    },
+    [commit, noteAuth, pressMode, pullShared, sessionAuth, showMessage, showModeProgress],
+  );
+
+  const recalibrateSystemMode = useCallback(
+    async (mode: KnownMode): Promise<string | null> => {
+      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
+        return 'Wait for the press to finish before changing the mode.';
+      }
+      const apply = (nextMode: KnownMode) => {
+        const at = new Date().toISOString();
+        commit((prev) => {
+          const climate = reduceClimate(climateOf(prev), { type: 'recalibrate-mode', mode: nextMode });
+          return appendLog(
+            applyClimate(prev, climate.state),
+            'calibration',
+            `The thermostat is ${modeLabel(nextMode)}. No buttons were pressed.`,
+            at,
+          );
+        });
+      };
+      const auth = sessionAuth();
+      if (!auth || stateRef.current.mode !== 'live') {
+        apply(mode);
+        return null;
+      }
+      const sync = syncRef.current;
+      sync.recalibrating = true;
+      try {
+        const saved = await recalibrateModeRemote(auth.config, auth.appKey, mode);
+        acceptVersion(sync, saved.version);
+        if (saved.systemMode === 'heat' || saved.systemMode === 'off' || saved.systemMode === 'cool') {
+          apply(saved.systemMode);
+        }
+        return null;
+      } catch (error) {
+        if (noteAuth(error)) {
+          return 'The app key was rejected.';
+        }
+        return explainError(error, appKeyRef.current);
+      } finally {
+        sync.recalibrating = false;
+      }
+    },
+    [commit, noteAuth, sessionAuth],
+  );
 
   const value = useMemo<AppContextValue>(() => {
     return {
@@ -1444,7 +1734,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       },
       setMode: (mode) => {
-        if (isRunning(sessionRef.current)) {
+        if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
           showMessage({ source: 'press', text: 'Finish the press before changing mode.' });
           return;
         }
@@ -1524,9 +1814,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }));
           return;
         }
-        const rejection = mapRejection(role, device, stateRef.current.deviceMap);
-        if (rejection) {
-          setDeviceMessage(rejection);
+        const picked = chooseDevice(stateRef.current.deviceMap, role, {
+          deviceId: device.deviceId,
+          deviceType: device.deviceType,
+          deviceName: device.deviceName,
+        });
+        if (picked.status === 'rejected') {
+          setDeviceMessage(picked.message);
           return;
         }
         setDeviceMessage(null);
@@ -1538,11 +1832,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       completeCalibration: (temp) => {
         const at = new Date().toISOString();
         const seeded = seedDemoHistory(new Date());
-        commit((prev) =>
-          appendLog(
+        commit((prev) => {
+          const climate = reduceClimate(climateOf(prev), { type: 'seed', degrees: temp });
+          const next = climate.reason ? prev : applyClimate(prev, climate.state);
+          return appendLog(
             {
-              ...prev,
-              virtualSetpoint: temp,
+              ...next,
               catchupFrom: at,
               history: prev.history.length > 0 ? prev.history : seeded.history,
               changes:
@@ -1551,14 +1846,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
                   : [...seeded.changes, { at, setpoint: temp, source: 'manual', label: `Calibrated · ${temp}°` }],
             },
             'calibration',
-            `Calibrated the virtual setpoint to ${temp}°. No buttons were pressed.`,
+            `Saved ${temp}° for both Heat and Cool. No buttons were pressed. Tell Setpoint which mode the thermostat is in.`,
             at,
-          ),
-        );
+          );
+        });
+        const auth = sessionAuth();
+        if (auth && stateRef.current.mode === 'live') {
+          void saveState(auth.config, auth.appKey, snapshotFrom(stateRef.current, syncRef.current.version))
+            .then((saved) => {
+              acceptVersion(syncRef.current, saved.version);
+            })
+            .catch((error) => {
+              noteAuth(error);
+            });
+        }
       },
       recalibrate: async (temp) => {
+        const active = resolveActive(stateRef.current.systemMode, {
+          heat: stateRef.current.heatSetpoint,
+          cool: stateRef.current.coolSetpoint,
+        });
+        if (active.status === 'off' || active.status === 'unknown') {
+          return refusalFor(active);
+        }
         const session = sessionRef.current;
-        const written = writeSetpoint(stateRef.current.virtualSetpoint, { degrees: temp, source: 'recalibrated' }, session);
+        const written = writeSetpoint(active.status === 'active' ? active.degrees : null, { degrees: temp, source: 'recalibrated' }, session);
         if (!written.ok) {
           return written.reason;
         }
@@ -1567,18 +1879,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
           return `${temp}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
         }
         const recalibrated = (setpoint: number, at: string) =>
-          commit((prev) =>
-            appendLog(
+          commit((prev) => {
+            const climate = reduceClimate(climateOf(prev), { type: 'set-active', kind: 'recalibrate', degrees: setpoint });
+            const next = climate.reason ? prev : applyClimate(prev, climate.state);
+            return appendLog(
               {
-                ...prev,
-                virtualSetpoint: setpoint,
-                changes: [...prev.changes, { at, setpoint, source: 'manual', label: `Recalibrated · ${setpoint}°` }].slice(-400),
+                ...next,
+                changes: [...next.changes, { at, setpoint, source: 'manual', label: `Recalibrated · ${setpoint}°` }].slice(-400),
               },
               'calibration',
-              `Recalibrated the virtual setpoint to ${setpoint}°. No buttons were pressed.`,
+              `Recalibrated the ${modeLabel(active.mode)} setpoint to ${setpoint}°. No buttons were pressed.`,
               at,
-            ),
-          );
+            );
+          });
         const auth = sessionAuth();
         if (!auth || stateRef.current.mode !== 'live') {
           recalibrated(temp, new Date().toISOString());
@@ -1602,10 +1915,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       bump: async (direction) => {
         const snapshot = stateRef.current;
-        const setpoint = snapshot.virtualSetpoint;
-        if (setpoint === null) {
+        const active = resolveActive(snapshot.systemMode, { heat: snapshot.heatSetpoint, cool: snapshot.coolSetpoint });
+        if (active.status !== 'active') {
+          showMessage({ source: 'press', text: refusalFor(active) ?? 'Set the virtual setpoint first.' });
           return;
         }
+        const setpoint = active.degrees;
         const limits: StepLimits = {
           step: snapshot.settings.step,
           min: snapshot.settings.minF,
@@ -1619,6 +1934,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       applyPreset: async (preset) => {
         await runTarget(preset.tempF, { kind: 'preset', label: preset.label });
       },
+      setSystemMode: (mode) => setSystemMode(mode),
+      recalibrateSystemMode: (mode) => recalibrateSystemMode(mode),
       cancelCommand: () => {
         applyPending({ type: 'cancel' });
         cancelRef.current = true;
@@ -1734,7 +2051,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         );
       },
       resumeSchedule: async () => {
-        if (isRunning(sessionRef.current)) {
+        if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
           resumeAfterRef.current = true;
           showMessage({ source: 'schedule', text: 'Resume will apply when this press finishes.' });
           return;
@@ -1885,7 +2202,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         commitShared((prev) => ({ ...prev, records: applied.records, hold: null }));
       },
       retrySchedule: async () => {
-        if (schedulerBlocked(pendingRef.current) || isRunning(sessionRef.current)) {
+        if (schedulerBlocked(pendingRef.current) || isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
           return;
         }
         const now = new Date();
@@ -2019,6 +2336,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     applyPending,
     runTarget,
     finishResume,
+    setSystemMode,
+    recalibrateSystemMode,
   ]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -2050,6 +2369,21 @@ export function useApp(): AppContextValue {
     throw new Error('useApp must be used inside AppProvider');
   }
   return value;
+}
+
+function serverClimateEmpty(snap: { heatSetpoint: number | null; coolSetpoint: number | null }): boolean {
+  return snap.heatSetpoint === null && snap.coolSetpoint === null;
+}
+
+function modeCommandProgress(progress: { index: number; total: number; target: KnownMode; label: 'press' | 'finishing' }): CommandProgress {
+  return {
+    index: progress.index,
+    total: progress.total,
+    target: 0,
+    label: progress.label,
+    kind: 'mode',
+    systemMode: progress.target,
+  };
 }
 
 export function suggestedTarget(state: Persisted): number {

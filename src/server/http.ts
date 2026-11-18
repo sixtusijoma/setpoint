@@ -1,4 +1,6 @@
-import { listDevices, pressBot, readMeter } from '../devices/switchbot';
+import { listDevices, pressBot, readBotBattery, readMeter } from '../devices/switchbot';
+import type { BatteryReading } from '../domain/batteryFetch';
+import { isKnownMode } from '../domain/systemMode';
 import {
   changePageQuery,
   encodeChangeCursor,
@@ -8,7 +10,17 @@ import {
 } from '../domain/history';
 import { PressOutcomeError } from '../domain/pressSession';
 import type { CommandSource } from '../domain/pressSession';
-import { deviceIds, executeSharedPress, RecalibrateError, recalibrateShared, runSchedulerTick, type PressTiming } from './engine';
+import {
+  deviceIds,
+  executeModePress,
+  executeSharedPress,
+  RecalibrateError,
+  recalibrateModeShared,
+  recalibrateShared,
+  refreshBatteryCache,
+  runSchedulerTick,
+  type PressTiming,
+} from './engine';
 import { importMeterCsv, MeterImportError } from './importMeter';
 import { appKeyMatches, sameSecret, type ServerEnv } from './env';
 import { handleMcp } from './mcp';
@@ -22,6 +34,7 @@ export type HandlerOptions = {
   timing?: PressTiming;
   pressDevice?: (deviceId: string, signal: AbortSignal) => Promise<void>;
   readMeterDevice?: (deviceId: string) => Promise<{ temperatureF: number; humidity: number; co2Ppm: number }>;
+  readBotBattery?: (deviceId: string) => Promise<number | null>;
   listRemoteDevices?: () => Promise<{ deviceId: string; deviceName: string; deviceType: string; enableCloudService: boolean | null; hubDeviceId: string }[]>;
 };
 
@@ -148,6 +161,9 @@ export async function handleState(request: Request, options: HandlerOptions): Pr
     const patch: Record<string, unknown> = {};
     const keys = [
       'virtualSetpoint',
+      'systemMode',
+      'heatSetpoint',
+      'coolSetpoint',
       'catchupFrom',
       'mode',
       'hold',
@@ -165,15 +181,24 @@ export async function handleState(request: Request, options: HandlerOptions): Pr
         patch[key] = body[key];
       }
     }
+    const guarded = ['virtualSetpoint', 'heatSetpoint', 'coolSetpoint', 'systemMode'] as const;
     const lease = await options.db.readLease();
     const leaseRunning = lease.phase === 'running' && lease.leaseUntil !== null && Date.parse(lease.leaseUntil) > Date.now();
     if (leaseRunning) {
-      delete patch.virtualSetpoint;
+      for (const key of guarded) {
+        delete patch[key];
+      }
     }
-    if (version === null && Object.prototype.hasOwnProperty.call(patch, 'virtualSetpoint')) {
+    if (version === null && guarded.some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
       const current = await options.db.readState();
-      if (current.virtualSetpoint !== null && current.virtualSetpoint !== patch.virtualSetpoint) {
-        delete patch.virtualSetpoint;
+      for (const key of guarded) {
+        if (!Object.prototype.hasOwnProperty.call(patch, key)) {
+          continue;
+        }
+        const existing = current[key];
+        if (existing !== null && existing !== 'unknown' && existing !== patch[key]) {
+          delete patch[key];
+        }
       }
     }
     const saved = await options.db.patchState(version, patch);
@@ -203,6 +228,78 @@ export async function handleRecalibrate(request: Request, options: HandlerOption
     }
     throw error;
   }
+}
+
+export async function handleSetMode(request: Request, options: HandlerOptions): Promise<Response> {
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
+  }
+  if (request.method !== 'POST') {
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
+  }
+  const body = (await request.json()) as { mode?: unknown };
+  if (!isKnownMode(body.mode)) {
+    return json(request, options.env, { error: 'Mode must be heat, off, or cool.' }, 400);
+  }
+  const state = await options.db.readState();
+  const modeBot = state.deviceMap.mode;
+  if (modeBot?.enableCloudService === false) {
+    return json(request, options.env, {
+      status: 'refused',
+      systemMode: state.systemMode,
+      wanted: body.mode,
+      reason: `${modeBot.name} has cloud service turned off. Setpoint does not fall back to Bluetooth.`,
+      notifyCheck: false,
+    });
+  }
+  const result = await executeModePress(options.db, {
+    target: body.mode,
+    source: { kind: 'set-mode' },
+    owner: 'app',
+    now: options.now,
+    timing: options.timing,
+    press: await pressModeWith(options, state),
+  });
+  return json(request, options.env, result);
+}
+
+export async function handleRecalibrateMode(request: Request, options: HandlerOptions): Promise<Response> {
+  const denied = await requireApp(request, options.env);
+  if (denied) {
+    return denied;
+  }
+  if (request.method !== 'POST') {
+    return json(request, options.env, { error: 'Method not allowed.' }, 405);
+  }
+  const body = (await request.json()) as { mode?: unknown };
+  try {
+    const result = await recalibrateModeShared(options.db, { mode: body.mode });
+    return json(request, options.env, result);
+  } catch (error) {
+    if (error instanceof RecalibrateError) {
+      return json(request, options.env, { error: error.message }, error.kind === 'busy' ? 409 : 400);
+    }
+    throw error;
+  }
+}
+
+async function pressModeWith(options: HandlerOptions, state: SharedSnapshot) {
+  const id = state.deviceMap.mode?.id ?? null;
+  return async (signal: AbortSignal) => {
+    if (!id) {
+      throw new PressOutcomeError('Map the mode bot before changing the thermostat mode.', 'rejected');
+    }
+    if (options.pressDevice) {
+      await options.pressDevice(id, signal);
+      return;
+    }
+    const creds = await credentials(options.db, options.env);
+    if (!creds) {
+      throw new PressOutcomeError('SwitchBot credentials are not on the server.', 'rejected');
+    }
+    await pressBot(creds, id, fetch, signal);
+  };
 }
 
 export async function handlePress(request: Request, options: HandlerOptions): Promise<Response> {
@@ -296,7 +393,25 @@ export async function handleMeter(request: Request, options: HandlerOptions): Pr
   }
   const sample = { at: now().toISOString(), ...reading };
   await options.db.insertRead(sample);
-  return json(request, options.env, { sample });
+  const batteries = await batteriesFor(options, now());
+  return json(request, options.env, { sample, batteries });
+}
+
+async function batteriesFor(options: HandlerOptions, now: Date): Promise<BatteryReading | null> {
+  if (options.readBotBattery) {
+    return refreshBatteryCache(options.db, { now, readBattery: options.readBotBattery });
+  }
+  if (options.readMeterDevice) {
+    return (await options.db.readState()).batteryCache;
+  }
+  const creds = await credentials(options.db, options.env);
+  if (!creds) {
+    return (await options.db.readState()).batteryCache;
+  }
+  return refreshBatteryCache(options.db, {
+    now,
+    readBattery: (deviceId) => readBotBattery(creds, deviceId),
+  });
 }
 
 export async function handleHistory(request: Request, options: HandlerOptions): Promise<Response> {
@@ -457,11 +572,14 @@ export async function handleMcpRequest(request: Request, options: HandlerOptions
   }
   const body = request.method === 'POST' ? await request.json() : { method: 'ping', id: null };
   const state = await options.db.readState();
+  const creds = options.readBotBattery ? null : await credentials(options.db, options.env);
   const result = await handleMcp(options.db, body, {
     now: options.now,
     timing: options.timing,
     press: await pressWith(options, state),
+    pressMode: await pressModeWith(options, state),
     readMeter: meterReader(options),
+    readBattery: options.readBotBattery ?? (creds ? (deviceId) => readBotBattery(creds, deviceId) : undefined),
   });
   return json(request, options.env, result);
 }

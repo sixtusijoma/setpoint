@@ -38,3 +38,9 @@ verify_jwt = false
 
 [functions.recalibrate]
 verify_jwt = false
+
+[functions.set-mode]
+verify_jwt = false
+
+[functions.recalibrate-mode]
+verify_jwt = false

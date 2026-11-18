@@ -113,7 +113,7 @@ Then scan the QR code. `npm start` runs `expo start`. `npm run ios` and `npm run
    supabase db push
    ```
 
-   That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, `supabase/migrations/20261112180000_setpoint_change_pages.sql`, and `supabase/migrations/20261113090000_history_windows.sql`. On a project that already runs, `supabase db push` and then `supabase functions deploy history` and `supabase functions deploy mcp` is all that browsing older History windows needs. See [DEPLOY.md](DEPLOY.md).
+   That applies `supabase/migrations/20261111120000_setpoint.sql`, `supabase/migrations/20261112120000_meter_import.sql`, `supabase/migrations/20261112180000_setpoint_change_pages.sql`, `supabase/migrations/20261113090000_history_windows.sql`, and `supabase/migrations/20261118120000_system_mode.sql`. On a project that already runs, `supabase db push` and then `supabase functions deploy history` and `supabase functions deploy mcp` is all that browsing older History windows needs. The system-mode migration is additive: it copies the old setpoint onto both Heat and Cool, leaves the thermostat mode unknown, and adds the mode-bot slot plus a battery cache. Apply it before redeploying `state`, `press`, `recalibrate`, `tick`, `meter`, `mcp`, `set-mode`, and `recalibrate-mode`. See [DEPLOY.md](DEPLOY.md).
 
 2. Set these function secret names in the project. The CLI prompts for the values. Do not put the values in the repo, in `EXPO_PUBLIC_*` variables, or in the app bundle.
 
@@ -177,7 +177,7 @@ Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The functi
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, `month`, or `year`, or both `since` and `until` as ISO timestamps, 800 days at most; ranges over 120 days come back as daily Eastern Time averages), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), and `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, `month`, or `year`, or both `since` and `until` as ISO timestamps, 800 days at most; ranges over 120 days come back as daily Eastern Time averages), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `set_mode` (presses the Mode bot until the thermostat is heat, off, or cool; refuses while the tracked mode is unknown), `recalibrate_mode` (sets the tracked mode and presses nothing), `recalibrate` (corrects the active Heat or Cool setpoint to what the display shows, presses nothing, and refuses while Off or unknown), and `status` (`mode` is demo or live; `systemMode` is the thermostat; `setpoint` is the active mode's number or null).
 
 See [DEPLOY.md](DEPLOY.md) for the rest of the server notes.
 

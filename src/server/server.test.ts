@@ -18,7 +18,9 @@ import {
   handlePress,
   handlePrune,
   handleRecalibrate,
+  handleRecalibrateMode,
   handleSession,
+  handleSetMode,
   handleState,
   handleTick,
 } from './http';
@@ -32,6 +34,7 @@ const migration = [
   'supabase/migrations/20261112120000_meter_import.sql',
   'supabase/migrations/20261112180000_setpoint_change_pages.sql',
   'supabase/migrations/20261113090000_history_windows.sql',
+  'supabase/migrations/20261118120000_system_mode.sql',
 ]
   .map((file) => readFileSync(path.join(process.cwd(), file), 'utf8'))
   .join('\n');
@@ -44,7 +47,7 @@ const bot = (id: string) => ({
   hubDeviceId: 'hub',
 });
 
-const settings = { step: 1, delayMs: 0, minF: 50, maxF: 85, pressCap: 15, wakeFirst: false };
+const settings = { step: 1, delayMs: 0, minF: 50, maxF: 85, pressCap: 15, wakeFirst: false, modeStep: 2 as const };
 const wednesdayMorning = new Date('2026-11-11T15:00:00.000Z');
 
 const gaps: number[] = [];
@@ -99,6 +102,9 @@ describe('shared server', () => {
     `);
     await db.patchState(null, {
       mode: 'live',
+      systemMode: 'heat',
+      heatSetpoint: 70,
+      coolSetpoint: 70,
       virtualSetpoint: 70,
       hold: null,
       records: [],
@@ -567,6 +573,8 @@ describe('shared server', () => {
       'edit_schedule',
       'skip_wake',
       'run_schedule_now',
+      'set_mode',
+      'recalibrate_mode',
       'recalibrate',
       'status',
     ]);
@@ -1085,6 +1093,134 @@ describe('shared server', () => {
       firstAt: '2026-11-11T23:51:00.000Z',
       lastAt: '2026-11-11T23:51:00.000Z',
     });
+  });
+
+  it('keeps separate heat and cool setpoints and refuses work while Off', async () => {
+    await db.patchState(null, { systemMode: 'unknown', virtualSetpoint: 71 });
+    const migrated = await db.readState();
+    expect(migrated.heatSetpoint).toBe(71);
+    expect(migrated.coolSetpoint).toBe(71);
+    expect(migrated.systemMode).toBe('unknown');
+    expect(migrated.virtualSetpoint).toBeNull();
+
+    const named = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'recalibrate_mode', arguments: { mode: 'cool' } },
+    });
+    expect(textOf(named)).toContain('"systemMode":"cool"');
+    expect((await db.readState()).virtualSetpoint).toBe(71);
+
+    await db.patchState(null, { coolSetpoint: 74 });
+    const cooled = await db.readState();
+    expect(cooled.heatSetpoint).toBe(71);
+    expect(cooled.virtualSetpoint).toBe(74);
+
+    const presses: string[] = [];
+    const off = await handleMcp(db, {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'recalibrate_mode', arguments: { mode: 'off' } },
+    });
+    expect(textOf(off)).toContain('"setpoint":null');
+    const refused = await handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'set_to', arguments: { temperatureF: 68 } } },
+      { press: async () => { presses.push('temp'); } },
+    );
+    expect(refused.result).toMatchObject({ isError: true });
+    expect(textOf(refused)).toMatch(/Off/);
+    expect(presses).toEqual([]);
+    expect((await db.readState()).coolSetpoint).toBe(74);
+  });
+
+  it('presses the mode bot the minimum number of times and shares the lease', async () => {
+    await db.patchState(null, {
+      settings: { ...settings, modeStep: 2 },
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+      coolSetpoint: 74,
+    });
+    const presses: string[] = [];
+    const moved = await handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_mode', arguments: { mode: 'cool' } } },
+      {
+        armMs: 0,
+        timing: fast,
+        pressMode: async () => {
+          presses.push('mode');
+        },
+      },
+    );
+    expect(presses).toEqual(['mode']);
+    expect(textOf(moved)).toContain('"status":"done"');
+    const state = await db.readState();
+    expect(state.systemMode).toBe('cool');
+    expect(state.virtualSetpoint).toBe(74);
+    expect(state.heatSetpoint).toBe(70);
+
+    expect(await db.acquireLease('other', 30)).toBe(true);
+    const busy = await handleSetMode(
+      new Request('http://local/set-mode', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ mode: 'heat' }),
+      }),
+      { db, env: appEnv(), timing: fast, pressDevice: async () => undefined },
+    );
+    expect(await busy.json()).toMatchObject({ status: 'busy' });
+    await db.releaseLease('other');
+
+    await db.patchState(null, { systemMode: 'unknown' });
+    const blocked = await handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'set_mode', arguments: { mode: 'heat' } } },
+      { timing: fast, pressMode: async () => { presses.push('blocked'); } },
+    );
+    expect(textOf(blocked)).toContain('"status":"refused"');
+    expect(presses).toEqual(['mode']);
+  });
+
+  it('reads bot batteries once and reports a low battery', async () => {
+    await db.patchState(null, {
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+    });
+    let reads = 0;
+    const readBattery = async (id: string) => {
+      reads += 1;
+      if (id === 'mode') {
+        return 18;
+      }
+      return 80;
+    };
+    const first = await handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } },
+      { readBattery },
+    );
+    const body = JSON.parse(textOf(first)) as { batteries: { mode: number }; lowBattery: string[]; systemMode: string };
+    expect(body.systemMode).toBe('heat');
+    expect(body.batteries.mode).toBe(18);
+    expect(body.lowBattery).toEqual(['mode']);
+    expect(reads).toBe(3);
+    await handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'status', arguments: {} } },
+      { readBattery, now: () => new Date() },
+    );
+    expect(reads).toBe(3);
+
+    const saved = await handleRecalibrateMode(
+      new Request('http://local/recalibrate-mode', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ mode: 'heat' }),
+      }),
+      { db, env: appEnv() },
+    );
+    expect(saved.status).toBe(200);
   });
 });
 

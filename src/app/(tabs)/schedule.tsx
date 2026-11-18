@@ -349,7 +349,9 @@ function Editor({
       />
       {aligned ? null : (
         <Text style={styles.body}>
-          {draft.targetF}° does not line up with the {step}° step from {setpoint}°.
+          {setpoint === null
+            ? `${draft.targetF}° will apply once Heat or Cool has a setpoint.`
+            : `${draft.targetF}° does not line up with the ${step}° step from ${setpoint}°.`}
         </Text>
       )}
       {error ? <Text style={styles.body}>{error}</Text> : null}
