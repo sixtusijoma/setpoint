@@ -443,6 +443,9 @@ export function scheduleEditResetsCursor(before: ScheduleEvent, after: ScheduleE
   if (before.targetF !== after.targetF) {
     return true;
   }
+  if (!before.enabled && after.enabled) {
+    return true;
+  }
   return false;
 }
 

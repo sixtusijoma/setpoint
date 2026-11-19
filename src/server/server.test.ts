@@ -455,6 +455,113 @@ describe('shared server', () => {
     });
   });
 
+  describe('enabled flag', () => {
+    const call = (name: string, args: Record<string, unknown>, deps: Record<string, unknown> = {}) =>
+      handleMcp(db, { jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name, arguments: args } }, {
+        now: () => wednesdayMorning,
+        armMs: 0,
+        timing: fast,
+        ...deps,
+      });
+    const wakeOf = async () => (await db.readState()).events.find((event) => event.id === 'default-wake');
+
+    it('lists enabled in the edit_schedule schema', async () => {
+      const listed = await handleMcp(db, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const tools = (listed.result as { tools: { name: string; inputSchema: { properties: Record<string, { type: string }> } }[] }).tools;
+      const edit = tools.find((tool) => tool.name === 'edit_schedule');
+      expect(edit?.inputSchema.properties.enabled?.type).toBe('boolean');
+    });
+
+    it('disables and re-enables an event without changing anything else or the cursor', async () => {
+      await db.patchState(null, { catchupFrom: '2026-11-01T00:00:00.000Z' });
+      const before = await wakeOf();
+      const off = await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      const offBody = JSON.parse(textOf(off)) as { events: { id: string; enabled: boolean; status: string }[]; catchupFrom: string };
+      expect(offBody.events.find((event) => event.id === 'default-wake')).toMatchObject({ enabled: false, status: 'disabled' });
+      expect(offBody.events.find((event) => event.id === 'default-sleep')).toMatchObject({ enabled: true, status: 'enabled' });
+      expect(offBody.catchupFrom).toContain('2026-11-01');
+      expect(await wakeOf()).toEqual({ ...before, enabled: false });
+      const on = await call('edit_schedule', { eventId: 'default-wake', enabled: true });
+      expect(JSON.parse(textOf(on)).catchupFrom).not.toContain('2026-11-01');
+      expect(Date.parse(JSON.parse(textOf(on)).catchupFrom)).toBe(wednesdayMorning.getTime());
+      expect(await wakeOf()).toEqual(before);
+    });
+
+    it('still rejects an empty days list', async () => {
+      const result = await call('edit_schedule', { eventId: 'default-wake', days: [] });
+      expect((result.result as { isError?: boolean }).isError).toBe(true);
+      expect(textOf(result)).toContain('Days must be');
+      expect((await wakeOf())?.days).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    });
+
+    it('shows enabled and disabled in show_schedule and status', async () => {
+      await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      const shown = JSON.parse(textOf(await call('show_schedule', {}))) as {
+        events: { id: string; enabled: boolean; status: string }[];
+        summary: string[];
+      };
+      expect(shown.events.find((event) => event.id === 'default-wake')).toMatchObject({ enabled: false, status: 'disabled' });
+      expect(shown.summary.find((line) => line.startsWith('Wake'))).toContain('DISABLED');
+      expect(shown.summary.find((line) => line.startsWith('Sleep'))).toContain('ENABLED');
+      const status = JSON.parse(textOf(await call('status', {}))) as {
+        disabledEvents: string[];
+        schedule: { id: string; enabled: boolean }[];
+      };
+      expect(status.disabledEvents).toEqual(['default-wake']);
+      expect(status.schedule.find((event) => event.id === 'default-sleep')?.enabled).toBe(true);
+    });
+
+    it('does not press a disabled event from the scheduler, even from an old cursor', async () => {
+      await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      await db.patchState(null, { virtualSetpoint: 68, catchupFrom: '2026-11-10T00:00:00.000Z' });
+      const presses: string[] = [];
+      const outcome = await runSchedulerTick(db, {
+        now: () => wednesdayMorning,
+        timing: fast,
+        press: async (direction) => {
+          presses.push(direction);
+        },
+      });
+      expect(outcome.apply).toBe('Sleep');
+      expect(presses.filter((direction) => direction === 'up')).toEqual([]);
+      const state = await db.readState();
+      expect(state.records.some((record) => record.label === 'Wake')).toBe(false);
+    });
+
+    it('does not replay occurrences that passed while an event was disabled once it is re-enabled', async () => {
+      await db.patchState(null, { virtualSetpoint: 68, catchupFrom: '2026-11-10T00:00:00.000Z' });
+      await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      await call('edit_schedule', { eventId: 'default-wake', enabled: true });
+      const outcome = await runSchedulerTick(db, {
+        now: () => wednesdayMorning,
+        timing: fast,
+        press: async () => {
+          throw new Error('should not press a Wake that passed while disabled');
+        },
+      });
+      expect(outcome.apply).toBeNull();
+    });
+
+    it('refuses run_schedule_now for a disabled event and presses nothing', async () => {
+      await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      const press = vi.fn(async () => undefined);
+      const result = await call('run_schedule_now', { eventId: 'default-wake' }, { press });
+      expect((result.result as { isError?: boolean }).isError).toBe(true);
+      expect(textOf(result)).toContain('disabled');
+      expect(press).not.toHaveBeenCalled();
+      const state = await db.readState();
+      expect(state.virtualSetpoint).toBe(70);
+      expect(state.records).toEqual([]);
+    });
+
+    it('explains skip_wake on a disabled event', async () => {
+      await call('edit_schedule', { eventId: 'default-wake', enabled: false });
+      const result = await call('skip_wake', { eventId: 'default-wake' });
+      expect((result.result as { isError?: boolean }).isError).toBe(true);
+      expect(textOf(result)).toContain('disabled');
+    });
+  });
+
   it('recalibrates the shared setpoint without pressing and logs the change', async () => {
     const env = appEnv();
     const before = await db.readState();

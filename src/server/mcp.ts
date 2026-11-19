@@ -2,8 +2,9 @@ import { lowBatteries } from '../domain/batteryFetch';
 import { historyQuery } from '../domain/history';
 import { refusalFor, resolveActive } from '../domain/modeSetpoint';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
-import type { Occurrence } from '../domain/schedule';
+import type { Occurrence, ScheduleEvent } from '../domain/schedule';
 import { isKnownMode } from '../domain/systemMode';
+import { dayNames, formatClock } from '../domain/time';
 import {
   deviceIds,
   editScheduleEvent,
@@ -61,12 +62,14 @@ export const MCP_TOOLS = [
   },
   {
     name: 'show_schedule',
-    description: 'Show the shared schedule, skips, and recent occurrence states.',
+    description:
+      'Show the shared schedule, skips, and recent occurrence states. Each event says enabled or disabled. Disabled events never run.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'edit_schedule',
-    description: 'Edit one schedule event, or create it when the id is new. Time or temperature edits reset the catch-up cursor. Days, renames, and new events do not.',
+    description:
+      'Edit one schedule event, or create it when the id is new. Pass enabled=false to turn an event off (it stays in the list and never runs) and enabled=true to turn it back on. Time or temperature edits, and re-enabling a disabled event, reset the catch-up cursor. Days, renames, disabling, and new events do not.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -75,7 +78,8 @@ export const MCP_TOOLS = [
         hour: { type: 'number' },
         minute: { type: 'number' },
         targetF: { type: 'number' },
-        days: { type: 'array', items: { type: 'number' }, description: 'Weekdays to run, Monday=1 through Sunday=7.' },
+        days: { type: 'array', items: { type: 'number' }, description: 'Weekdays to run, Monday=1 through Sunday=7. Must not be empty. To stop an event running, pass enabled=false instead.' },
+        enabled: { type: 'boolean', description: 'true runs the event on its days, false turns it off without changing anything else.' },
       },
       required: ['eventId'],
     },
@@ -90,7 +94,7 @@ export const MCP_TOOLS = [
   },
   {
     name: 'run_schedule_now',
-    description: 'Apply one schedule target now and mark that occurrence done early or late.',
+    description: 'Apply one schedule target now and mark that occurrence done early or late. Refuses a disabled event: enable it first with edit_schedule.',
     inputSchema: { type: 'object', properties: { eventId: { type: 'string' } }, required: ['eventId'] },
   },
   {
@@ -165,6 +169,14 @@ export async function handleMcp(db: SetpointDb, body: unknown, deps: ToolDeps = 
   }
 }
 
+function describeEvent(event: ScheduleEvent): ScheduleEvent & { status: 'enabled' | 'disabled' } {
+  return { ...event, status: event.enabled ? 'enabled' : 'disabled' };
+}
+
+function summaryLine(event: ScheduleEvent): string {
+  return `${event.label} (${event.id}): ${event.enabled ? 'ENABLED' : 'DISABLED, will not run'} · ${formatClock(event.hour, event.minute)} · ${event.targetF}° · ${dayNames(event.days)}`;
+}
+
 async function callTool(db: SetpointDb, name: string | undefined, args: Record<string, unknown>, deps: ToolDeps): Promise<string> {
   const now = deps.now ?? (() => new Date());
   const press = deps.press ?? (async () => undefined);
@@ -187,11 +199,18 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
       lease: lease.phase,
       batteries,
       lowBattery: lowBatteries(batteries ?? { up: null, down: null, mode: null }).map((item) => item.slot),
+      schedule: state.events.map((event) => ({ id: event.id, label: event.label, enabled: event.enabled })),
+      disabledEvents: state.events.filter((event) => !event.enabled).map((event) => event.id),
     });
   }
   if (name === 'show_schedule') {
     const state = await db.readState();
-    return JSON.stringify({ events: state.events, records: state.records.slice(-12), note: state.catchupNote });
+    return JSON.stringify({
+      events: state.events.map(describeEvent),
+      summary: state.events.map(summaryLine),
+      records: state.records.slice(-12),
+      note: state.catchupNote,
+    });
   }
   if (name === 'room_history') {
     const range = historyQuery({ span: args.span, since: args.since, until: args.until }, now());
@@ -224,8 +243,9 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
       minute: typeof args.minute === 'number' ? args.minute : undefined,
       targetF: typeof args.targetF === 'number' ? args.targetF : undefined,
       days: Array.isArray(args.days) ? args.days.map((day) => Number(day)) : undefined,
+      enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
     }, now());
-    return JSON.stringify({ events: saved.events, catchupFrom: saved.catchupFrom });
+    return JSON.stringify({ events: saved.events.map(describeEvent), catchupFrom: saved.catchupFrom });
   }
   if (name === 'skip_wake') {
     return JSON.stringify(await skipTool(db, args, now));
@@ -299,6 +319,9 @@ async function skipTool(db: SetpointDb, args: Record<string, unknown>, now: () =
   if (!event) {
     throw new Error('No schedule event with that id.');
   }
+  if (!event.enabled) {
+    throw new Error(`${event.label} is disabled, so it has nothing to skip. Enable it with edit_schedule first.`);
+  }
   const when = typeof args.date === 'string'
     ? occurrenceOnDate(state.events, eventId, args.date)
     : nextSkippable(state.events, state.records, eventId, now());
@@ -322,6 +345,9 @@ async function runNowTool(
 ): Promise<unknown> {
   const state = await db.readState();
   const event = state.events.find((item) => item.id === eventId);
+  if (event && !event.enabled) {
+    throw new Error(`${event.label} is disabled, so it was not run. Enable it with edit_schedule (enabled=true) first.`);
+  }
   const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
   if (!event || active.status !== 'active') {
     throw new Error(active.status === 'active' ? 'That schedule cannot run right now.' : (refusalFor(active) ?? 'That schedule cannot run right now.'));

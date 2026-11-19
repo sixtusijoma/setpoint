@@ -126,7 +126,7 @@ Authorization: Bearer <SETPOINT_MCP_KEY>
 
 Send JSON-RPC over HTTP `POST` with `Content-Type: application/json`. The function also accepts `Accept: application/json`. If the gateway asks for an `apikey` header, send the public anon key there. The function does not treat that header as the MCP secret.
 
-Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, `month`, or `year`, or both `since` and `until` as ISO timestamps, 800 days at most; ranges over 120 days come back as daily Eastern Time averages), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule`, `edit_schedule`, `skip_wake` (pass `undoKey` to undo), `run_schedule_now`, `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), `status`.
+Tools: `set_to`, `nudge`, `read_room`, `room_history` (`span` of `day`, `week`, `month`, or `year`, or both `since` and `until` as ISO timestamps, 800 days at most; ranges over 120 days come back as daily Eastern Time averages), `import_meter_csv` (`csv` is the CSV text; the result is the same summary as `import-meter`), `show_schedule` (each event is marked enabled or disabled), `edit_schedule` (pass `enabled` true or false to turn an event on or off without changing anything else; days can never be empty; re-enabling resets the catch-up cursor so missed occurrences are not replayed), `skip_wake` (pass `undoKey` to undo), `run_schedule_now` (refuses a disabled event), `recalibrate` (corrects the tracked setpoint to what the display shows, presses nothing), `status`.
 
 A client starts with `initialize`, then `notifications/initialized`, then `tools/list` and `tools/call`.
 

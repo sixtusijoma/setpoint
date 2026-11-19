@@ -13,9 +13,11 @@ import {
   chipFor,
   defaultEvents,
   holdFor,
+  nextOccurrence,
   planDue,
   resolveHold,
   scheduleEditResetsCursor,
+  upcomingOccurrences,
   type ScheduleEvent,
 } from '@/domain/schedule';
 import { TIME_ZONE } from '@/domain/time';
@@ -112,6 +114,24 @@ describe('schedule edits, chip, and catch-up copy', () => {
     expect(scheduleEditResetsCursor(sleep, { ...sleep, days: [1, 2, 3, 4, 5, 6] })).toBe(false);
     expect(scheduleEditResetsCursor(sleep, { ...sleep, minute: 50 })).toBe(true);
     expect(scheduleEditResetsCursor(sleep, { ...sleep, targetF: 62 })).toBe(true);
+  });
+
+  it('resets the cursor when an event is re-enabled, not when it is disabled', () => {
+    const [sleep] = defaultEvents();
+    const off = { ...sleep, enabled: false };
+    expect(scheduleEditResetsCursor(sleep, off)).toBe(false);
+    expect(scheduleEditResetsCursor(off, sleep)).toBe(true);
+    expect(scheduleEditResetsCursor(off, { ...off, label: 'Bedtime' })).toBe(false);
+  });
+
+  it('skips disabled events when listing, finding the next, and running now', () => {
+    const [sleep, wake] = defaultEvents();
+    const events = [sleep, { ...wake, enabled: false }];
+    const now = at({ year: 2026, month: 11, day: 9, hour: 6, minute: 0 });
+    expect(nextOccurrence(events, now)?.label).toBe('Sleep');
+    expect(upcomingOccurrences(events, now, 3).every((item) => item.label === 'Sleep')).toBe(true);
+    expect(occurrenceForRunNow(events, 'default-wake', now)).toBeNull();
+    expect(occurrenceOnDate(events, 'default-wake', '2026-11-09')).toBeNull();
   });
 
   it('moves a hold deadline when the event time changes', () => {
