@@ -3,7 +3,7 @@ import { Banner, CircleButton, ConfirmDialog, PillButton, Sheet, Stepper } from 
 import { displayBatteries, lowBatterySentence } from '@/domain/batteryFetch';
 import { co2Band } from '@/domain/co2';
 import { refusalFor, resolveActive } from '@/domain/modeSetpoint';
-import { commandLocks, shownProgressTarget } from '@/domain/pendingTarget';
+import { commandLocks, commandProgressCopy } from '@/domain/pendingTarget';
 import { planSetTo } from '@/domain/planSetTo';
 import { chipFor, currentTarget, nextOccurrence } from '@/domain/schedule';
 import { formatRoom, setpointAccent } from '@/domain/temperature';
@@ -11,7 +11,7 @@ import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
 import { refreshSpinner } from '@/domain/refresh';
 import { openDraft, pickMode, planRecalibrate, unknownModeNote, type RecalibrateDraft } from '@/domain/recalibrateDraft';
-import { isKnownMode, modeLabel } from '@/domain/systemMode';
+import { modeLabel } from '@/domain/systemMode';
 import { suggestedTarget, useApp } from '@/state/store';
 import { accentColor, colors, fonts, toneColor } from '@/theme';
 import { useEffect, useRef, useState } from 'react';
@@ -27,7 +27,21 @@ export default function HomeScreen() {
   const accent = accentColor(setpointAccent(setpoint, room ?? setpoint));
   const next = nextOccurrence(app.state.events, app.clock);
   const activeTarget = currentTarget(app.state.events, app.clock);
-  const locks = commandLocks({ commandVisible: app.command !== null, desired: app.desiredSetpoint });
+  const locks = commandLocks({
+    commandVisible: app.command !== null,
+    desired: app.desiredSetpoint,
+    queued: app.queuedTarget !== null || app.queuedMode !== null,
+  });
+  const progressCopy = app.command
+    ? commandProgressCopy({
+        commandKind: app.command.kind ?? 'setpoint',
+        commandSystemMode: app.command.systemMode,
+        commandTarget: app.command.target,
+        desiredSetpoint: app.desiredSetpoint,
+        queuedTarget: app.queuedTarget,
+        queuedMode: app.queuedMode,
+      })
+    : null;
   const busy = locks.replacements;
   const ratio = app.command
     ? app.command.index / app.command.total
@@ -370,7 +384,7 @@ export default function HomeScreen() {
         />
       </View>
 
-      {app.command ? (
+      {app.command && progressCopy ? (
         <View testID="command-progress" style={styles.progress}>
           <Text testID="command-label" style={styles.progressTitle}>
             {app.command.label === 'finishing'
@@ -386,14 +400,17 @@ export default function HomeScreen() {
             />
           </View>
           <Text testID="command-target" style={styles.progressBody}>
-            {app.command.kind === 'mode' && isKnownMode(app.command.systemMode)
-              ? `Setting mode to ${modeLabel(app.command.systemMode)}`
-              : `Setting to ${shownProgressTarget(app.desiredSetpoint, app.command.target)}°`}
+            {progressCopy.primary}
           </Text>
+          {progressCopy.queued ? (
+            <Text testID="command-queued" style={styles.progressQueued}>
+              {progressCopy.queued}
+            </Text>
+          ) : null}
           <PillButton label="Cancel" testID="cancel-command" tone="ghost" onPress={app.cancelCommand} />
         </View>
       ) : (
-        <PillButton label="Set to…" testID="set-to" onPress={openSetTo} />
+        <PillButton label="Set to…" testID="set-to" disabled={busy} onPress={openSetTo} />
       )}
 
       <View style={styles.presets}>
@@ -709,6 +726,12 @@ const styles = StyleSheet.create({
   progressBody: {
     color: colors.muted,
     fontFamily: fonts.body,
+    textAlign: 'center',
+  },
+  progressQueued: {
+    color: colors.text,
+    fontFamily: fonts.medium,
+    fontSize: 14,
     textAlign: 'center',
   },
   track: {

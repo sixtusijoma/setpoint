@@ -4,8 +4,13 @@ import {
   BUMP_DEBOUNCE_MS,
   boundedTarget,
   commandContinuation,
+  bumpBaseForMode,
   commandLocks,
+  commandProgressCopy,
   dropsDesiredOnBusy,
+  modeContinuation,
+  SWITCHING_TO_OFF_REASON,
+  tempContinuation,
   idlePending,
   pendingInvariant,
   reducePendingTarget,
@@ -233,5 +238,135 @@ describe('pending target', () => {
     expect(commandContinuation({ resumeQueued: true, follow: true })).toBe('resume');
     expect(commandContinuation({ resumeQueued: false, follow: true })).toBe('follow');
     expect(commandContinuation({ resumeQueued: false, follow: false })).toBe('stop');
+  });
+
+  it('resolves bumps against the in-flight target mode and refuses when switching to Off', () => {
+    expect(
+      bumpBaseForMode({
+        runningMode: 'cool',
+        systemMode: 'heat',
+        heatSetpoint: 66,
+        coolSetpoint: 70,
+      }),
+    ).toEqual({ status: 'active', mode: 'cool', degrees: 70 });
+
+    expect(
+      bumpBaseForMode({
+        runningMode: 'heat',
+        systemMode: 'off',
+        heatSetpoint: 66,
+        coolSetpoint: 70,
+      }),
+    ).toEqual({ status: 'active', mode: 'heat', degrees: 66 });
+
+    expect(
+      bumpBaseForMode({
+        runningMode: 'off',
+        systemMode: 'heat',
+        heatSetpoint: 66,
+        coolSetpoint: 70,
+      }),
+    ).toEqual({ status: 'refused', reason: SWITCHING_TO_OFF_REASON });
+
+    expect(
+      bumpBaseForMode({
+        runningMode: null,
+        systemMode: 'heat',
+        heatSetpoint: 66,
+        coolSetpoint: 70,
+      }),
+    ).toEqual({ status: 'active', mode: 'heat', degrees: 66 });
+  });
+
+  it('continues queued temp or mode changes in the right order and drops invalid follow-ups', () => {
+    expect(
+      modeContinuation({
+        modeStatus: 'done',
+        landedMode: 'cool',
+        hasPendingTemp: true,
+        hasQueuedTarget: false,
+        resumeQueued: false,
+      }),
+    ).toBe('flush-pending');
+
+    expect(
+      modeContinuation({
+        modeStatus: 'done',
+        landedMode: 'heat',
+        hasPendingTemp: false,
+        hasQueuedTarget: true,
+        resumeQueued: false,
+      }),
+    ).toBe('run-queued-target');
+
+    expect(
+      modeContinuation({
+        modeStatus: 'done',
+        landedMode: 'off',
+        hasPendingTemp: true,
+        hasQueuedTarget: false,
+        resumeQueued: false,
+      }),
+    ).toBe('drop-queued');
+    expect(
+      modeContinuation({
+        modeStatus: 'cancelled',
+        landedMode: 'cool',
+        hasPendingTemp: false,
+        hasQueuedTarget: true,
+        resumeQueued: false,
+      }),
+    ).toBe('drop-queued');
+
+    expect(
+      tempContinuation({
+        tempStatus: 'done',
+        resumeQueued: false,
+        follow: true,
+        hasQueuedMode: true,
+      }),
+    ).toBe('follow');
+    expect(
+      tempContinuation({
+        tempStatus: 'done',
+        resumeQueued: false,
+        follow: false,
+        hasQueuedMode: true,
+      }),
+    ).toBe('run-queued-mode');
+    expect(
+      tempContinuation({
+        tempStatus: 'cancelled',
+        resumeQueued: false,
+        follow: false,
+        hasQueuedMode: true,
+      }),
+    ).toBe('drop-queued-mode');
+  });
+
+  it('formats queued progress copy and replacement locks when a follow-up is queued', () => {
+    expect(commandLocks({ commandVisible: false, desired: null, queued: true })).toEqual({
+      adjustments: false,
+      replacements: true,
+    });
+    expect(
+      commandProgressCopy({
+        commandKind: 'mode',
+        commandSystemMode: 'cool',
+        commandTarget: 0,
+        desiredSetpoint: 71,
+        queuedTarget: null,
+        queuedMode: null,
+      }),
+    ).toEqual({ primary: 'Setting mode to Cool', queued: 'Then setting to 71°' });
+    expect(
+      commandProgressCopy({
+        commandKind: 'setpoint',
+        commandTarget: 67,
+        desiredSetpoint: null,
+        queuedTarget: null,
+        queuedMode: 'cool',
+      }),
+    ).toEqual({ primary: 'Setting to 67°', queued: 'Then setting mode to Cool' });
   });
 });

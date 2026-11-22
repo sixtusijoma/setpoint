@@ -1,4 +1,6 @@
+import { refusalFor, resolveActive } from './modeSetpoint';
 import { planSetTo } from './planSetTo';
+import { isKnownMode, modeLabel, type KnownMode, type SystemMode } from './systemMode';
 
 export const BUMP_DEBOUNCE_MS = 350;
 
@@ -74,13 +76,17 @@ export function shownProgressTarget(desired: number | null, commandTarget: numbe
   return desired ?? commandTarget;
 }
 
-export function commandLocks(input: { commandVisible: boolean; desired: number | null }): {
+export function commandLocks(input: {
+  commandVisible: boolean;
+  desired: number | null;
+  queued?: boolean;
+}): {
   adjustments: boolean;
   replacements: boolean;
 } {
   return {
     adjustments: false,
-    replacements: input.commandVisible || input.desired !== null,
+    replacements: input.commandVisible || input.desired !== null || Boolean(input.queued),
   };
 }
 
@@ -96,6 +102,98 @@ export function commandContinuation(input: { resumeQueued: boolean; follow: bool
     return 'follow';
   }
   return 'stop';
+}
+
+export const SWITCHING_TO_OFF_REASON = 'Switching to Off, so there is no setpoint to change. Set Heat or Cool first.';
+
+export type BumpBaseResult =
+  | { status: 'active'; mode: KnownMode; degrees: number }
+  | { status: 'refused'; reason: string };
+
+export function bumpBaseForMode(input: {
+  runningMode: KnownMode | null;
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+}): BumpBaseResult {
+  if (input.runningMode === 'off') {
+    return { status: 'refused', reason: SWITCHING_TO_OFF_REASON };
+  }
+  const effectiveMode: SystemMode = input.runningMode ?? input.systemMode;
+  const active = resolveActive(effectiveMode, {
+    heat: input.heatSetpoint,
+    cool: input.coolSetpoint,
+  });
+  if (active.status !== 'active') {
+    return { status: 'refused', reason: refusalFor(active) ?? 'Set the virtual setpoint first.' };
+  }
+  return { status: 'active', mode: active.mode, degrees: active.degrees };
+}
+
+export function modeContinuation(input: {
+  modeStatus: CommandEndStatus;
+  landedMode: SystemMode;
+  hasPendingTemp: boolean;
+  hasQueuedTarget: boolean;
+  resumeQueued: boolean;
+}): 'resume' | 'run-queued-target' | 'flush-pending' | 'drop-queued' | 'stop' {
+  const hasTempFollowup = input.hasPendingTemp || input.hasQueuedTarget || input.resumeQueued;
+  if (input.modeStatus !== 'done' && input.modeStatus !== 'already') {
+    return hasTempFollowup ? 'drop-queued' : 'stop';
+  }
+  const canAdjustTemp = input.landedMode === 'heat' || input.landedMode === 'cool';
+  if (!canAdjustTemp) {
+    return hasTempFollowup ? 'drop-queued' : 'stop';
+  }
+  if (input.resumeQueued) {
+    return 'resume';
+  }
+  if (input.hasQueuedTarget) {
+    return 'run-queued-target';
+  }
+  if (input.hasPendingTemp) {
+    return 'flush-pending';
+  }
+  return 'stop';
+}
+
+export function tempContinuation(input: {
+  tempStatus: CommandEndStatus;
+  resumeQueued: boolean;
+  follow: boolean;
+  hasQueuedMode: boolean;
+}): 'resume' | 'follow' | 'run-queued-mode' | 'drop-queued-mode' | 'stop' {
+  if (input.resumeQueued) {
+    return 'resume';
+  }
+  if (input.follow) {
+    return 'follow';
+  }
+  if (input.hasQueuedMode) {
+    return input.tempStatus === 'done' || input.tempStatus === 'already' ? 'run-queued-mode' : 'drop-queued-mode';
+  }
+  return 'stop';
+}
+
+export function commandProgressCopy(input: {
+  commandKind: 'setpoint' | 'mode';
+  commandSystemMode?: SystemMode;
+  commandTarget: number;
+  desiredSetpoint: number | null;
+  queuedTarget: number | null;
+  queuedMode: KnownMode | null;
+}): { primary: string; queued: string | null } {
+  if (input.commandKind === 'mode' && isKnownMode(input.commandSystemMode)) {
+    const queuedTemp = input.desiredSetpoint ?? input.queuedTarget;
+    return {
+      primary: `Setting mode to ${modeLabel(input.commandSystemMode)}`,
+      queued: queuedTemp !== null ? `Then setting to ${queuedTemp}°` : null,
+    };
+  }
+  return {
+    primary: `Setting to ${shownProgressTarget(input.desiredSetpoint, input.commandTarget)}°`,
+    queued: input.queuedMode ? `Then setting mode to ${modeLabel(input.queuedMode)}` : null,
+  };
 }
 
 export function stepSetpoint(current: number, direction: 1 | -1, step: number, min: number, max: number): number {

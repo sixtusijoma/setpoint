@@ -1329,6 +1329,239 @@ describe('shared server', () => {
     );
     expect(saved.status).toBe(200);
   });
+
+  it('finishes mode change before running an immediate temp change against the new mode', async () => {
+    await db.patchState(null, {
+      settings: { ...settings, modeStep: 2 },
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+      systemMode: 'heat',
+      heatSetpoint: 66,
+      coolSetpoint: 74,
+      virtualSetpoint: 66,
+    });
+    const order: string[] = [];
+    let releaseMode: () => void = () => undefined;
+    const modePaused = new Promise<void>((resolve) => {
+      releaseMode = resolve;
+    });
+    let modeEntered = false;
+    let notifyModeEntered: () => void = () => undefined;
+    const entered = new Promise<void>((resolve) => {
+      notifyModeEntered = resolve;
+    });
+
+    const modeCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_mode', arguments: { mode: 'cool' } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        pressMode: async () => {
+          order.push('mode');
+          modeEntered = true;
+          notifyModeEntered();
+          await modePaused;
+        },
+      },
+    );
+    await entered;
+    expect(modeEntered).toBe(true);
+
+    const nudgeCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'nudge', arguments: { direction: 'up' } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        press: async (direction) => {
+          order.push(direction);
+        },
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(order).toEqual(['mode']);
+    releaseMode();
+
+    const [modeRes, nudgeRes] = await Promise.all([modeCall, nudgeCall]);
+    expect(textOf(modeRes)).toContain('"status":"done"');
+    expect(textOf(nudgeRes)).toContain('"status":"done"');
+    expect(order).toEqual(['mode', 'up']);
+    const after = await db.readState();
+    expect(after.systemMode).toBe('cool');
+    expect(after.coolSetpoint).toBe(75);
+    expect(after.heatSetpoint).toBe(66);
+    expect(after.virtualSetpoint).toBe(75);
+  });
+
+  it('finishes an in-flight temp change before switching mode', async () => {
+    await db.patchState(null, {
+      settings: { ...settings, modeStep: 2 },
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+      systemMode: 'heat',
+      heatSetpoint: 66,
+      coolSetpoint: 74,
+      virtualSetpoint: 66,
+    });
+    const order: string[] = [];
+    let releaseTemp: () => void = () => undefined;
+    const tempPaused = new Promise<void>((resolve) => {
+      releaseTemp = resolve;
+    });
+    let notifyTempEntered: () => void = () => undefined;
+    const tempEntered = new Promise<void>((resolve) => {
+      notifyTempEntered = resolve;
+    });
+
+    const tempCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_to', arguments: { temperatureF: 68 } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        press: async (direction) => {
+          order.push(direction);
+          if (order.length === 1) {
+            notifyTempEntered();
+            await tempPaused;
+          }
+        },
+      },
+    );
+    await tempEntered;
+
+    const modeCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'set_mode', arguments: { mode: 'cool' } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        pressMode: async () => {
+          order.push('mode');
+        },
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(order).toEqual(['up']);
+    releaseTemp();
+
+    const [tempRes, modeRes] = await Promise.all([tempCall, modeCall]);
+    expect(textOf(tempRes)).toContain('"status":"done"');
+    expect(textOf(modeRes)).toContain('"status":"done"');
+    expect(order).toEqual(['up', 'up', 'mode']);
+    const after = await db.readState();
+    expect(after.systemMode).toBe('cool');
+    expect(after.heatSetpoint).toBe(68);
+    expect(after.coolSetpoint).toBe(74);
+    expect(after.virtualSetpoint).toBe(74);
+  });
+
+  it('completes mode to Off and cleanly refuses a queued temp change', async () => {
+    await db.patchState(null, {
+      settings: { ...settings, modeStep: 2 },
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+      systemMode: 'heat',
+      heatSetpoint: 66,
+      coolSetpoint: 74,
+      virtualSetpoint: 66,
+    });
+    const order: string[] = [];
+    let releaseMode: () => void = () => undefined;
+    const modePaused = new Promise<void>((resolve) => {
+      releaseMode = resolve;
+    });
+    let notifyModeEntered: () => void = () => undefined;
+    const modeEntered = new Promise<void>((resolve) => {
+      notifyModeEntered = resolve;
+    });
+
+    const modeCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'set_mode', arguments: { mode: 'off' } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        pressMode: async () => {
+          order.push('mode');
+          if (order.length === 1) {
+            notifyModeEntered();
+            await modePaused;
+          }
+        },
+      },
+    );
+    await modeEntered;
+
+    const nudgeCall = handleMcp(
+      db,
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'nudge', arguments: { direction: 'up' } } },
+      {
+        armMs: 0,
+        timing: { sleep: async () => false },
+        press: async (direction) => {
+          order.push(direction);
+        },
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    releaseMode();
+
+    const [modeRes, nudgeRes] = await Promise.all([modeCall, nudgeCall]);
+    expect(textOf(modeRes)).toContain('"status":"done"');
+    expect(nudgeRes.result).toMatchObject({ isError: true });
+    expect(textOf(nudgeRes)).toMatch(/Off/);
+    expect(order).toEqual(['mode', 'mode']);
+    const after = await db.readState();
+    expect(after.systemMode).toBe('off');
+    expect(after.heatSetpoint).toBe(66);
+    expect(after.virtualSetpoint).toBeNull();
+  });
+
+  it('defers a scheduled tick while a mode change holds the lease', async () => {
+    const dueEvent = {
+      id: 'wake-due',
+      label: 'Wake',
+      hour: 10,
+      minute: 0,
+      targetF: 72,
+      days: [3],
+      enabled: true,
+    };
+    await db.patchState(null, {
+      mode: 'live',
+      settings: { ...settings, modeStep: 2 },
+      deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+      systemMode: 'heat',
+      heatSetpoint: 66,
+      coolSetpoint: 74,
+      virtualSetpoint: 66,
+      events: [dueEvent],
+      catchupFrom: '2026-11-11T14:55:00.000Z',
+    });
+    expect(await db.acquireLease('app', 30)).toBe(true);
+    const presses: string[] = [];
+    const outcome = await runSchedulerTick(db, {
+      now: () => wednesdayMorning,
+      timing: fast,
+      press: async (direction) => {
+        presses.push(direction);
+      },
+    });
+    expect(outcome).toEqual({ apply: null, note: null });
+    expect(presses).toEqual([]);
+    await db.releaseLease('app');
+    const afterRelease = await runSchedulerTick(db, {
+      now: () => wednesdayMorning,
+      timing: fast,
+      press: async (direction) => {
+        presses.push(direction);
+      },
+    });
+    expect(afterRelease.apply).toMatch(/Wake/);
+    expect(presses).toHaveLength(6);
+  });
 });
 
 describe('rest client', () => {

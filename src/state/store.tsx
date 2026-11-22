@@ -16,18 +16,22 @@ import { lifecycleEventForAppState, reduceLifecycle, type Lifecycle } from '@/do
 import { pushMessage, type AppMessage } from '@/domain/messages';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '@/domain/occurrences';
 import {
-  commandContinuation,
+  bumpBaseForMode,
   desiredSetpoint,
   dropsDesiredOnBusy,
   idlePending,
+  modeContinuation,
   reducePendingTarget,
   schedulerBlocked,
+  SWITCHING_TO_OFF_REASON,
+  tempContinuation,
+  type CommandEndStatus,
   type PendingEvent,
   type PendingStep,
   type PendingTarget,
   type StepLimits,
 } from '@/domain/pendingTarget';
-import { climateOf, reduceClimate, refusalFor, resolveActive, UNKNOWN_MODE_REASON } from '@/domain/modeSetpoint';
+import { climateOf, OFF_SETPOINT_REASON, reduceClimate, refusalFor, resolveActive, UNKNOWN_MODE_REASON } from '@/domain/modeSetpoint';
 import {
   beginModeSession,
   idleModeSession,
@@ -59,7 +63,7 @@ import {
 } from '@/domain/schedule';
 import { runDueSchedule } from '@/domain/scheduleRunner';
 import { writeSetpoint } from '@/domain/setpoint';
-import { isKnownMode, modeLabel, type KnownMode } from '@/domain/systemMode';
+import { isKnownMode, modeLabel, type KnownMode, type SystemMode } from '@/domain/systemMode';
 import { alreadyInMode } from '@/domain/recalibrateDraft';
 import { formatClock } from '@/domain/time';
 import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage } from '@/domain/history';
@@ -153,6 +157,8 @@ type AppContextValue = {
   clock: Date;
   command: CommandProgress | null;
   desiredSetpoint: number | null;
+  queuedTarget: number | null;
+  queuedMode: KnownMode | null;
   banner: string | null;
   refresh: RefreshPhase;
   devices: SwitchBotDevice[];
@@ -260,6 +266,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [clock, setClock] = useState(() => new Date());
   const [command, setCommand] = useState<CommandProgress | null>(null);
   const [desired, setDesired] = useState<number | null>(null);
+  const [queuedTarget, setQueuedTarget] = useState<number | null>(null);
+  const [queuedMode, setQueuedMode] = useState<KnownMode | null>(null);
   const [message, setMessage] = useState<AppMessage>(null);
   const [connection, setConnection] = useState<Connection>(initialConnection);
   const [refresh, setRefresh] = useState<Refresh>(initialRefresh);
@@ -285,8 +293,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const modeSessionRef = useRef<ModeSession>(idleModeSession());
   const deviceListRef = useRef<DeviceList>(idleDeviceList());
   const pendingRef = useRef<PendingTarget>(idlePending());
+  const queuedTargetRef = useRef<{ target: number; source: CommandSource } | null>(null);
+  const queuedModeRef = useRef<KnownMode | null>(null);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushRef = useRef<() => void>(() => undefined);
+  const setSystemModeRef = useRef<(mode: KnownMode) => Promise<void>>(async () => undefined);
   const runOnServerRef = useRef<
     (
       auth: { config: ServerConfig; appKey: string },
@@ -543,7 +554,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const pullShared = useCallback(async () => {
+  const pullShared = useCallback(async (options?: { allowDuringMode?: boolean }) => {
     if (pullFlight.current) {
       return pullFlight.current;
     }
@@ -553,7 +564,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       !auth ||
       stateRef.current.mode !== 'live' ||
       isRunning(sessionRef.current) ||
-      isModeRunning(modeSessionRef.current) ||
+      (!options?.allowDuringMode && isModeRunning(modeSessionRef.current)) ||
       !canPull(sync)
     ) {
       return;
@@ -684,6 +695,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const clearQueuedTarget = useCallback(() => {
+    queuedTargetRef.current = null;
+    setQueuedTarget((current) => (current === null ? current : null));
+  }, []);
+
+  const clearQueuedMode = useCallback(() => {
+    queuedModeRef.current = null;
+    setQueuedMode((current) => (current === null ? current : null));
+  }, []);
+
   const applyPending = useCallback(
     (event: PendingEvent): PendingStep => {
       const step = reducePendingTarget(pendingRef.current, event);
@@ -709,11 +730,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return;
     }
     if (isModeRunning(modeSessionRef.current)) {
-      clearDebounceTimer();
-      debounceTimer.current = setTimeout(() => {
-        debounceTimer.current = null;
-        flushRef.current();
-      }, 500);
       return;
     }
     if (isRunning(sessionRef.current)) {
@@ -750,11 +766,65 @@ export function AppProvider({ children }: { children: ReactNode }) {
     flushRef.current = flushPending;
   }, [flushPending]);
 
+  const finishModeSession = useCallback(
+    async (modeStatus: CommandEndStatus, landedMode: SystemMode) => {
+      const hasPendingTemp = pendingRef.current.status === 'pending';
+      const queued = queuedTargetRef.current;
+      const resumeQueued = resumeAfterRef.current;
+      const decision = modeContinuation({
+        modeStatus,
+        landedMode,
+        hasPendingTemp,
+        hasQueuedTarget: queued !== null,
+        resumeQueued,
+      });
+      if (decision === 'drop-queued') {
+        resumeAfterRef.current = false;
+        clearQueuedTarget();
+        applyPending({ type: 'cancel' });
+        if ((hasPendingTemp || queued !== null || resumeQueued) && landedMode === 'off') {
+          showMessage({ source: 'press', text: OFF_SETPOINT_REASON });
+          errorFeedback();
+        }
+        setCommand(null);
+        return;
+      }
+      if (decision === 'resume') {
+        resumeAfterRef.current = false;
+        clearQueuedTarget();
+        applyPending({ type: 'cancel' });
+        setCommand(null);
+        await finishResume();
+        return;
+      }
+      if (decision === 'run-queued-target' && queued) {
+        clearQueuedTarget();
+        applyPending({ type: 'cancel' });
+        await runTargetRef.current(queued.target, queued.source);
+        return;
+      }
+      if (decision === 'flush-pending') {
+        if (debounceTimer.current === null) {
+          flushRef.current();
+          if (!isRunning(sessionRef.current)) {
+            setCommand(null);
+          }
+        } else {
+          setCommand(null);
+        }
+        return;
+      }
+      setCommand(null);
+    },
+    [applyPending, clearQueuedTarget, finishResume, showMessage],
+  );
+
   const finishCommand = useCallback(async (result: CommandResult, resume: boolean): Promise<CommandResult> => {
     if (result.status === 'busy') {
       if (dropsDesiredOnBusy('foreign')) {
         applyPending({ type: 'foreign-busy' });
       }
+      clearQueuedMode();
       setCommand(null);
       return result;
     }
@@ -772,12 +842,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
             pressCap: settings.pressCap,
           },
         });
-    const continuation = commandContinuation({
+    const nextMode = queuedModeRef.current;
+    const continuation = tempContinuation({
+      tempStatus: result.status,
       resumeQueued: resume,
       follow: step?.effect.type === 'send',
+      hasQueuedMode: nextMode !== null,
     });
     if (continuation === 'resume') {
       applyPending({ type: 'cancel' });
+      clearQueuedMode();
       resumeAfterRef.current = false;
       setCommand(null);
       await finishResume();
@@ -789,17 +863,40 @@ export function AppProvider({ children }: { children: ReactNode }) {
       );
       return result;
     }
+    if (continuation === 'run-queued-mode' && nextMode) {
+      clearQueuedMode();
+      await setSystemModeRef.current(nextMode);
+      return result;
+    }
+    if (continuation === 'drop-queued-mode') {
+      clearQueuedMode();
+    }
     if (step?.effect.type === 'refuse') {
       showMessage({ source: 'press', text: step.effect.reason });
       errorFeedback();
     }
     setCommand(null);
     return result;
-  }, [applyPending, finishResume, showMessage]);
+  }, [applyPending, clearQueuedMode, finishResume, showMessage]);
 
   const runTarget = useCallback(
     async (target: number, source: CommandSource, options?: { wakeFirst?: boolean }): Promise<CommandResult> => {
-      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
+      if (isModeRunning(modeSessionRef.current)) {
+        if (source.kind === 'schedule' || source.kind === 'resume') {
+          const stoppedAt = stateRef.current.virtualSetpoint ?? target;
+          return { status: 'busy', stoppedAt, wanted: target, reason: 'A mode change is already running.' };
+        }
+        if (modeSessionRef.current.target === 'off') {
+          showMessage({ source: 'press', text: SWITCHING_TO_OFF_REASON });
+          errorFeedback();
+          return { status: 'refused', stoppedAt: target, wanted: target, reason: SWITCHING_TO_OFF_REASON };
+        }
+        applyPending({ type: 'cancel' });
+        queuedTargetRef.current = { target, source };
+        setQueuedTarget(target);
+        return { status: 'done', stoppedAt: target, wanted: target };
+      }
+      if (isRunning(sessionRef.current)) {
         const stoppedAt = stateRef.current.virtualSetpoint ?? target;
         const reason = 'A command is already running.';
         showMessage({ source: 'press', text: reason });
@@ -1091,6 +1188,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         schedulerBlocked(pendingRef.current) ||
         isRunning(sessionRef.current) ||
         isModeRunning(modeSessionRef.current) ||
+        queuedTargetRef.current !== null ||
+        queuedModeRef.current !== null ||
         tickLock.current
       ) {
         return;
@@ -1206,7 +1305,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       lifecycleRef.current = reduceLifecycle(lifecycleRef.current, event);
-      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
+      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current) || queuedTargetRef.current !== null || queuedModeRef.current !== null) {
         interruptRef.current = true;
         lifecycleRef.current = reduceLifecycle(lifecycleRef.current, 'press-interrupted');
       }
@@ -1513,8 +1612,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const setSystemMode = useCallback(
     async (target: KnownMode) => {
-      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
-        showMessage({ source: 'press', text: 'A command is already running.' });
+      if (pendingRef.current.status === 'pending' && !isModeRunning(modeSessionRef.current)) {
+        clearDebounceTimer();
+        flushRef.current();
+      }
+      if (isRunning(sessionRef.current) || pendingRef.current.status === 'pending') {
+        if (isModeRunning(modeSessionRef.current)) {
+          showMessage({ source: 'press', text: 'A mode change is already running.' });
+          return;
+        }
+        const currentMode = stateRef.current.systemMode;
+        if (currentMode === target) {
+          showMessage({ source: 'press', text: alreadyInMode(target) });
+          return;
+        }
+        if (currentMode === 'unknown') {
+          showMessage({ source: 'press', text: UNKNOWN_MODE_REASON });
+          return;
+        }
+        queuedModeRef.current = target;
+        setQueuedMode(target);
+        return;
+      }
+      if (isModeRunning(modeSessionRef.current)) {
+        showMessage({ source: 'press', text: 'A mode change is already running.' });
         return;
       }
       const snapshot = stateRef.current;
@@ -1539,6 +1660,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           showModeProgress(opened.progress);
         }
         let closed = false;
+        let modeStatus: CommandEndStatus = 'failed';
         const poll = setInterval(() => {
           void fetchRemoteSession(auth.config, auth.appKey)
             .then((remote) => {
@@ -1552,10 +1674,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const result = await runRemoteMode(auth.config, auth.appKey, target);
           closed = true;
           clearInterval(poll);
-          // The server already saved the mode it reached. Show it now, then let the
-          // pull below bring the rest. The mode session has to be idle first or
-          // pullShared skips the pull and Home keeps the old mode.
-          modeSessionRef.current = idleModeSession();
+          modeStatus =
+            result.status === 'done' ||
+            result.status === 'already' ||
+            result.status === 'cancelled' ||
+            result.status === 'failed' ||
+            result.status === 'refused' ||
+            result.status === 'busy' ||
+            result.status === 'ambiguous'
+              ? result.status
+              : 'failed';
           if (isKnownMode(result.systemMode) && result.systemMode !== stateRef.current.systemMode) {
             const reached = result.systemMode;
             const at = new Date().toISOString();
@@ -1575,21 +1703,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
           } else if (result.reason && result.status !== 'done' && result.status !== 'already') {
             showMessage({ source: 'press', text: result.reason });
           }
-          await pullShared();
+          await pullShared({ allowDuringMode: true });
         } catch (error) {
+          modeStatus = 'failed';
           noteAuth(error);
           showMessage({ source: 'press', text: explainError(error, appKeyRef.current) });
         } finally {
           closed = true;
           clearInterval(poll);
           modeSessionRef.current = idleModeSession();
-          setCommand(null);
+          await finishModeSession(modeStatus, stateRef.current.systemMode);
         }
         return;
       }
       cancelRef.current = false;
       interruptRef.current = false;
       showMessage(null);
+      let modeStatus: CommandEndStatus = 'failed';
       try {
         const settled = await runModeSession({
           from: snapshot.systemMode,
@@ -1628,6 +1758,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             pressFeedback();
           },
         });
+        modeStatus = settled.status;
         if (settled.status === 'ambiguous') {
           showMessage({ source: 'press', text: CHECK_THERMOSTAT });
           errorFeedback();
@@ -1640,15 +1771,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
           successFeedback();
         }
       } catch (error) {
+        modeStatus = 'failed';
         showMessage({ source: 'press', text: explainError(error) });
         errorFeedback();
       } finally {
         modeSessionRef.current = idleModeSession();
-        setCommand(null);
+        await finishModeSession(modeStatus, stateRef.current.systemMode);
       }
     },
-    [commit, noteAuth, pressMode, pullShared, sessionAuth, showMessage, showModeProgress],
+    [clearDebounceTimer, commit, finishModeSession, noteAuth, pressMode, pullShared, sessionAuth, showMessage, showModeProgress],
   );
+
+  useEffect(() => {
+    setSystemModeRef.current = setSystemMode;
+  }, [setSystemMode]);
 
   const recalibrateSystemMode = useCallback(
     async (mode: KnownMode): Promise<string | null> => {
@@ -1700,6 +1836,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       clock,
       command,
       desiredSetpoint: desired,
+      queuedTarget,
+      queuedMode,
       banner: message?.text ?? connectionBanner(connection),
       refresh: refresh.phase,
       devices,
@@ -1938,12 +2076,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       bump: async (direction) => {
         const snapshot = stateRef.current;
-        const active = resolveActive(snapshot.systemMode, { heat: snapshot.heatSetpoint, cool: snapshot.coolSetpoint });
-        if (active.status !== 'active') {
-          showMessage({ source: 'press', text: refusalFor(active) ?? 'Set the virtual setpoint first.' });
+        const runningMode = isModeRunning(modeSessionRef.current) ? modeSessionRef.current.target : null;
+        const base = bumpBaseForMode({
+          runningMode,
+          systemMode: snapshot.systemMode,
+          heatSetpoint: snapshot.heatSetpoint,
+          coolSetpoint: snapshot.coolSetpoint,
+        });
+        if (base.status !== 'active') {
+          showMessage({ source: 'press', text: base.reason });
+          errorFeedback();
           return;
         }
-        const setpoint = active.degrees;
+        if (queuedTargetRef.current !== null) {
+          clearQueuedTarget();
+        }
+        const setpoint = base.degrees;
         const limits: StepLimits = {
           step: snapshot.settings.step,
           min: snapshot.settings.minF,
@@ -1961,6 +2109,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       recalibrateSystemMode: (mode) => recalibrateSystemMode(mode),
       cancelCommand: () => {
         applyPending({ type: 'cancel' });
+        clearQueuedTarget();
+        clearQueuedMode();
         cancelRef.current = true;
         const auth = sessionAuth();
         if (auth && stateRef.current.mode === 'live') {
@@ -2333,6 +2483,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     clock,
     command,
     desired,
+    queuedTarget,
+    queuedMode,
     message,
     connection,
     refresh,
@@ -2357,6 +2509,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     refreshDevices,
     refreshClimate,
     applyPending,
+    clearQueuedTarget,
+    clearQueuedMode,
     runTarget,
     finishResume,
     setSystemMode,

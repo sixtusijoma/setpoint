@@ -18,7 +18,7 @@ import {
 } from './engine';
 import { importMeterCsv } from './importMeter';
 import type { SetpointDb } from './sqlDb';
-import type { CommandSource } from './types';
+import type { CommandSource, LeaseView } from './types';
 
 export const MCP_TOOLS = [
   {
@@ -265,6 +265,12 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     if (!isKnownMode(args.mode)) {
       throw new Error('Mode must be heat, off, or cool.');
     }
+    await waitForActiveCommandLease(
+      db,
+      (lease) => lease.progress?.kind === 'setpoint' || (lease.progress === null && lease.owner === 'mcp'),
+      now,
+      deps.timing,
+    );
     const result = await executeModePress(db, {
       target: args.mode,
       source: { kind: 'mcp' },
@@ -278,6 +284,12 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     return JSON.stringify(result);
   }
   if (name === 'set_to' || name === 'nudge') {
+    await waitForActiveCommandLease(
+      db,
+      (lease) => lease.progress?.kind === 'mode' || (lease.progress === null && lease.owner === 'mcp'),
+      now,
+      deps.timing,
+    );
     const state = await db.readState();
     const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
     if (active.status !== 'active') {
@@ -336,6 +348,30 @@ async function skipTool(db: SetpointDb, args: Record<string, unknown>, now: () =
   return { skipped: when.key, label: event.label };
 }
 
+async function waitForActiveCommandLease(
+  db: SetpointDb,
+  shouldWait: (lease: LeaseView) => boolean,
+  now: () => Date,
+  timing?: PressTiming,
+): Promise<void> {
+  const clock = timing?.clock ?? (() => Date.now());
+  const pause = timing?.clock && timing?.sleep
+    ? (ms: number) => timing.sleep!(ms, () => false)
+    : (ms: number) => new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms));
+  const maxWaitMs = 30_000;
+  const deadline = Math.min(clock() + maxWaitMs, timing?.deadlineAt ?? clock() + maxWaitMs);
+  while (clock() < deadline) {
+    const lease = await db.readLease();
+    if (lease.phase !== 'running' || !lease.leaseUntil || Date.parse(lease.leaseUntil) <= now().getTime()) {
+      return;
+    }
+    if (!shouldWait(lease)) {
+      return;
+    }
+    await pause(25);
+  }
+}
+
 async function runNowTool(
   db: SetpointDb,
   eventId: string,
@@ -343,6 +379,12 @@ async function runNowTool(
   press: (direction: 'up' | 'down', signal: AbortSignal) => Promise<void>,
   pressTiming?: PressTiming,
 ): Promise<unknown> {
+  await waitForActiveCommandLease(
+    db,
+    (lease) => lease.progress?.kind === 'mode' || (lease.progress === null && lease.owner === 'mcp'),
+    now,
+    pressTiming,
+  );
   const state = await db.readState();
   const event = state.events.find((item) => item.id === eventId);
   if (event && !event.enabled) {
