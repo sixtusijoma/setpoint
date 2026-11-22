@@ -118,11 +118,19 @@ export const MCP_TOOLS = [
   },
   {
     name: 'recalibrate',
-    description: 'Correct the active mode setpoint to what the thermostat display shows right now. Presses nothing. Refuses when the thermostat is Off or the mode is unknown.',
+    description:
+      'Correct the tracked mode and the stored Heat and Cool setpoints to what the thermostat shows right now. Presses nothing. Pass any of mode, heatF, and coolF; omitted fields stay as they are. The mode must already be known, or be included in this call. temperatureF still corrects only the active setpoint and cannot be combined with the other fields.',
     inputSchema: {
       type: 'object',
-      properties: { temperatureF: { type: 'number', description: 'What the thermostat display shows right now, in whole degrees F.' } },
-      required: ['temperatureF'],
+      properties: {
+        temperatureF: {
+          type: 'number',
+          description: 'Legacy: the active setpoint, in whole degrees F. Do not combine with mode, heatF, or coolF.',
+        },
+        mode: { type: 'string', enum: ['heat', 'off', 'cool'] },
+        heatF: { type: 'number', description: 'Stored Heat setpoint, in whole degrees F.' },
+        coolF: { type: 'number', description: 'Stored Cool setpoint, in whole degrees F.' },
+      },
     },
   },
   {
@@ -254,8 +262,20 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press, deps.timing));
   }
   if (name === 'recalibrate') {
-    const saved = await recalibrateShared(db, { temperatureF: args.temperatureF, now });
-    return JSON.stringify({ previous: saved.previous, setpoint: saved.setpoint });
+    const saved = await recalibrateShared(db, {
+      temperatureF: args.temperatureF,
+      mode: args.mode,
+      heatF: args.heatF,
+      coolF: args.coolF,
+      now,
+    });
+    return JSON.stringify({
+      previous: saved.previous,
+      setpoint: saved.setpoint,
+      systemMode: saved.systemMode,
+      heatSetpoint: saved.heatSetpoint,
+      coolSetpoint: saved.coolSetpoint,
+    });
   }
   if (name === 'recalibrate_mode') {
     const saved = await recalibrateModeShared(db, { mode: args.mode });

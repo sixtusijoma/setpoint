@@ -10,7 +10,14 @@ import { formatRoom, setpointAccent } from '@/domain/temperature';
 import { formatInstant, formatStamp } from '@/domain/time';
 import { ROOM_CAPTION, TOKEN_PATH } from '@/copy';
 import { refreshSpinner } from '@/domain/refresh';
-import { openDraft, pickMode, planRecalibrate, unknownModeNote, type RecalibrateDraft } from '@/domain/recalibrateDraft';
+import {
+  openDraft,
+  pickMode,
+  planRecalibrate,
+  setDraftDegrees,
+  unknownModeNote,
+  type RecalibrateDraft,
+} from '@/domain/recalibrateDraft';
 import { modeLabel } from '@/domain/systemMode';
 import { suggestedTarget, useApp } from '@/state/store';
 import { accentColor, colors, fonts, toneColor } from '@/theme';
@@ -51,7 +58,7 @@ export default function HomeScreen() {
   const [recalError, setRecalError] = useState<string | null>(null);
   const [recalSaving, setRecalSaving] = useState(false);
   const [draft, setDraft] = useState(setpoint);
-  const [recal, setRecal] = useState<RecalibrateDraft>({ mode: null, degrees: setpoint });
+  const [recal, setRecal] = useState<RecalibrateDraft>({ mode: null, heat: setpoint, cool: setpoint });
   const [recalNote, setRecalNote] = useState<string | null>(null);
   const [resumeOpen, setResumeOpen] = useState(false);
   const pullStart = useRef<number | null>(null);
@@ -163,14 +170,12 @@ export default function HomeScreen() {
       setRecalError(plan.reason);
       return;
     }
+    if (plan.setMode === null && plan.setHeat === null && plan.setCool === null) {
+      setRecalOpen(false);
+      return;
+    }
     setRecalSaving(true);
-    let reason: string | null = null;
-    if (plan.setMode) {
-      reason = await app.recalibrateSystemMode(plan.setMode);
-    }
-    if (!reason && plan.setDegrees !== null) {
-      reason = await app.recalibrate(plan.setDegrees);
-    }
+    const reason = await app.recalibrate({ mode: plan.setMode, heat: plan.setHeat, cool: plan.setCool });
     setRecalSaving(false);
     setRecalError(reason);
     if (!reason) {
@@ -480,7 +485,7 @@ export default function HomeScreen() {
       <Sheet visible={recalOpen} onClose={() => setRecalOpen(false)}>
         <Text style={styles.sheetTitle}>Recalibrate</Text>
         <Text style={styles.sheetBody}>
-          What does the thermostat display show right now? Saving records it. It does not press any buttons.
+          What does the thermostat display show right now? Saving records the mode and the Heat and Cool setpoints. It does not press any buttons.
         </Text>
         {recalNote ? (
           <Text testID="recalibrate-note" style={[styles.sheetBody, styles.recalNote]}>
@@ -497,7 +502,7 @@ export default function HomeScreen() {
               accessibilityState={{ selected: recal.mode === mode }}
               onPress={() => {
                 setRecalError(null);
-                setRecal((draft) => pickMode(draft, mode, recalContext));
+                setRecal((draft) => pickMode(draft, mode));
               }}
               style={[styles.modeItem, recal.mode === mode && styles.modeOn]}
             >
@@ -505,19 +510,35 @@ export default function HomeScreen() {
             </Pressable>
           ))}
         </View>
-        {recal.mode === 'heat' || recal.mode === 'cool' ? (
-          <>
-            <Text style={styles.sheetLabel}>{recal.mode === 'heat' ? 'Heat setpoint' : 'Cool setpoint'}</Text>
-            <Stepper
-              testID="recalibrate-value"
-              value={`${recal.degrees}°`}
-              onMinus={() => setRecal((draft) => ({ ...draft, degrees: Math.max(app.state.settings.minF, draft.degrees - 1) }))}
-              onPlus={() => setRecal((draft) => ({ ...draft, degrees: Math.min(app.state.settings.maxF, draft.degrees + 1) }))}
-            />
-          </>
-        ) : recal.mode === 'off' ? (
+        <Text style={styles.sheetLabel}>Heat setpoint</Text>
+        <Stepper
+          testID="recalibrate-heat"
+          value={`${recal.heat}°`}
+          minusLabel="Lower Heat setpoint"
+          plusLabel="Raise Heat setpoint"
+          onMinus={() =>
+            setRecal((draft) => setDraftDegrees(draft, 'heat', Math.max(app.state.settings.minF, draft.heat - 1)))
+          }
+          onPlus={() =>
+            setRecal((draft) => setDraftDegrees(draft, 'heat', Math.min(app.state.settings.maxF, draft.heat + 1)))
+          }
+        />
+        <Text style={styles.sheetLabel}>Cool setpoint</Text>
+        <Stepper
+          testID="recalibrate-cool"
+          value={`${recal.cool}°`}
+          minusLabel="Lower Cool setpoint"
+          plusLabel="Raise Cool setpoint"
+          onMinus={() =>
+            setRecal((draft) => setDraftDegrees(draft, 'cool', Math.max(app.state.settings.minF, draft.cool - 1)))
+          }
+          onPlus={() =>
+            setRecal((draft) => setDraftDegrees(draft, 'cool', Math.min(app.state.settings.maxF, draft.cool + 1)))
+          }
+        />
+        {recal.mode === 'off' ? (
           <Text testID="recalibrate-off" style={styles.sheetBody}>
-            Off has no setpoint.
+            Off has no number on the display. Heat and Cool above are the stored setpoints.
           </Text>
         ) : null}
         {recalError ? (

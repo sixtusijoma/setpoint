@@ -4,6 +4,14 @@ import { deviceNotes, type SwitchBotDevice } from '@/devices/switchbot';
 import { displayBatteries, lowBatterySentence } from '@/domain/batteryFetch';
 import type { Co2Tone } from '@/domain/co2';
 import { PRESS_SPACING_MS } from '@/domain/pressSession';
+import {
+  openDraft,
+  pickMode,
+  planRecalibrate,
+  setDraftDegrees,
+  type RecalibrateDraft,
+} from '@/domain/recalibrateDraft';
+import { modeLabel } from '@/domain/systemMode';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
 import { useState } from 'react';
@@ -19,7 +27,7 @@ export default function SettingsScreen() {
   const [recalOpen, setRecalOpen] = useState(false);
   const [recalError, setRecalError] = useState<string | null>(null);
   const [recalSaving, setRecalSaving] = useState(false);
-  const [recal, setRecal] = useState(app.state.virtualSetpoint ?? 70);
+  const [recal, setRecal] = useState<RecalibrateDraft>({ mode: null, heat: 70, cool: 70 });
   const settings = app.state.settings;
   const batteries = displayBatteries(app.state);
   const batteryWarning = lowBatterySentence(batteries);
@@ -276,7 +284,14 @@ export default function SettingsScreen() {
         label="Recalibrate"
         testID="settings-recalibrate"
         onPress={() => {
-          setRecal(app.state.virtualSetpoint ?? 70);
+          setRecal(
+            openDraft({
+              systemMode: app.state.systemMode,
+              heatSetpoint: app.state.heatSetpoint,
+              coolSetpoint: app.state.coolSetpoint,
+              fallbackDegrees: app.state.virtualSetpoint ?? app.state.heatSetpoint ?? app.state.coolSetpoint ?? 70,
+            }),
+          );
           setRecalError(null);
           setRecalOpen(true);
         }}
@@ -337,13 +352,43 @@ export default function SettingsScreen() {
       <Sheet visible={recalOpen} onClose={() => setRecalOpen(false)}>
         <Text style={styles.sheetTitle}>Recalibrate</Text>
         <Text style={styles.body}>
-          What does the thermostat display show right now? Saving replaces the virtual setpoint. It does not press any
-          buttons.
+          What does the thermostat display show right now? Saving records the mode and the Heat and Cool setpoints. It does not press any buttons.
         </Text>
+        <Text style={styles.rowLabel}>Mode</Text>
+        <View style={styles.segment}>
+          {(['heat', 'off', 'cool'] as const).map((mode) => (
+            <Pressable
+              key={`settings-recal-${mode}`}
+              testID={`settings-recalibrate-mode-${mode}`}
+              accessibilityRole="button"
+              accessibilityState={{ selected: recal.mode === mode }}
+              onPress={() => {
+                setRecalError(null);
+                setRecal((draft) => pickMode(draft, mode));
+              }}
+              style={[styles.segmentItem, recal.mode === mode && styles.segmentOn]}
+            >
+              <Text style={styles.segmentText}>{modeLabel(mode)}</Text>
+            </Pressable>
+          ))}
+        </View>
+        <Text style={styles.rowLabel}>Heat setpoint</Text>
         <Stepper
-          value={`${recal}°`}
-          onMinus={() => setRecal((value) => Math.max(settings.minF, value - 1))}
-          onPlus={() => setRecal((value) => Math.min(settings.maxF, value + 1))}
+          testID="settings-recalibrate-heat"
+          value={`${recal.heat}°`}
+          minusLabel="Lower Heat setpoint"
+          plusLabel="Raise Heat setpoint"
+          onMinus={() => setRecal((draft) => setDraftDegrees(draft, 'heat', Math.max(settings.minF, draft.heat - 1)))}
+          onPlus={() => setRecal((draft) => setDraftDegrees(draft, 'heat', Math.min(settings.maxF, draft.heat + 1)))}
+        />
+        <Text style={styles.rowLabel}>Cool setpoint</Text>
+        <Stepper
+          testID="settings-recalibrate-cool"
+          value={`${recal.cool}°`}
+          minusLabel="Lower Cool setpoint"
+          plusLabel="Raise Cool setpoint"
+          onMinus={() => setRecal((draft) => setDraftDegrees(draft, 'cool', Math.max(settings.minF, draft.cool - 1)))}
+          onPlus={() => setRecal((draft) => setDraftDegrees(draft, 'cool', Math.min(settings.maxF, draft.cool + 1)))}
         />
         {recalError ? (
           <Text testID="settings-recalibrate-error" style={[styles.body, styles.recalError]}>
@@ -351,13 +396,27 @@ export default function SettingsScreen() {
           </Text>
         ) : null}
         <PillButton
-          label={recalSaving ? 'Saving…' : 'Save setpoint'}
+          label={recalSaving ? 'Saving…' : 'Save'}
           testID="settings-recalibrate-save"
           disabled={recalSaving}
           onPress={() => {
             void (async () => {
+              const plan = planRecalibrate(recal, {
+                systemMode: app.state.systemMode,
+                heatSetpoint: app.state.heatSetpoint,
+                coolSetpoint: app.state.coolSetpoint,
+                fallbackDegrees: app.state.virtualSetpoint ?? app.state.heatSetpoint ?? app.state.coolSetpoint ?? 70,
+              });
+              if (!plan.ok) {
+                setRecalError(plan.reason);
+                return;
+              }
+              if (plan.setMode === null && plan.setHeat === null && plan.setCool === null) {
+                setRecalOpen(false);
+                return;
+              }
               setRecalSaving(true);
-              const reason = await app.recalibrate(recal);
+              const reason = await app.recalibrate({ mode: plan.setMode, heat: plan.setHeat, cool: plan.setCool });
               setRecalSaving(false);
               setRecalError(reason);
               if (!reason) {

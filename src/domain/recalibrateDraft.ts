@@ -1,14 +1,14 @@
 import { modeLabel, type KnownMode, type SystemMode } from './systemMode';
 
 /**
- * One Recalibrate sheet handles both things the display can disagree with:
- * the mode (Heat, Off, Cool) and the active setpoint. Nothing is pressed.
+ * One Recalibrate sheet corrects the mode and both stored setpoints.
+ * Save writes only the fields that differ from the record. Nothing is pressed.
  */
 export type RecalibrateDraft = {
-  /** null until a mode is picked. Starts null when the tracked mode is unknown. */
+  /** null until a mode is picked. Starts as the known current mode, or null when unknown. */
   mode: KnownMode | null;
-  /** Degrees on the display. Ignored when the picked mode is Off. */
-  degrees: number;
+  heat: number;
+  cool: number;
 };
 
 export type RecalibrateContext = {
@@ -19,46 +19,53 @@ export type RecalibrateContext = {
 };
 
 export type RecalibratePlan =
-  | { ok: true; setMode: KnownMode | null; setDegrees: number | null }
+  | { ok: true; setMode: KnownMode | null; setHeat: number | null; setCool: number | null }
   | { ok: false; reason: string };
 
 export const PICK_MODE_REASON = 'Pick the mode the thermostat display shows: Heat, Off, or Cool.';
 
-export function storedDegrees(mode: KnownMode | null, context: RecalibrateContext): number {
-  if (mode === 'heat') {
-    return context.heatSetpoint ?? context.fallbackDegrees;
-  }
-  if (mode === 'cool') {
-    return context.coolSetpoint ?? context.fallbackDegrees;
-  }
-  return context.fallbackDegrees;
-}
-
 export function openDraft(context: RecalibrateContext): RecalibrateDraft {
   const mode = context.systemMode === 'unknown' ? null : context.systemMode;
-  return { mode, degrees: storedDegrees(mode, context) };
+  return {
+    mode,
+    heat: context.heatSetpoint ?? context.fallbackDegrees,
+    cool: context.coolSetpoint ?? context.fallbackDegrees,
+  };
 }
 
-/** Picking a mode loads that mode's saved setpoint so the stepper starts somewhere sensible. */
-export function pickMode(draft: RecalibrateDraft, mode: KnownMode, context: RecalibrateContext): RecalibrateDraft {
+/** Picking a mode records that mode. It does not replace the Heat or Cool numbers already on the sheet. */
+export function pickMode(draft: RecalibrateDraft, mode: KnownMode): RecalibrateDraft {
   if (draft.mode === mode) {
     return draft;
   }
-  return { mode, degrees: storedDegrees(mode, context) };
+  return { ...draft, mode };
 }
 
-/** What Save has to do, in order: record the mode first, then the setpoint for that mode. */
+export function setDraftDegrees(draft: RecalibrateDraft, which: 'heat' | 'cool', degrees: number): RecalibrateDraft {
+  if (which === 'heat') {
+    return draft.heat === degrees ? draft : { ...draft, heat: degrees };
+  }
+  return draft.cool === degrees ? draft : { ...draft, cool: degrees };
+}
+
+/**
+ * What Save has to write. A known current mode counts, so the other setpoint
+ * can change without picking a mode. Unknown mode still has to be picked.
+ * null means that field matches the record and must not be written.
+ */
 export function planRecalibrate(draft: RecalibrateDraft, context: RecalibrateContext): RecalibratePlan {
-  if (draft.mode === null) {
+  const known = draft.mode ?? (context.systemMode === 'unknown' ? null : context.systemMode);
+  if (known === null) {
     return { ok: false, reason: PICK_MODE_REASON };
   }
-  const setMode = draft.mode === context.systemMode ? null : draft.mode;
-  if (draft.mode === 'off') {
-    return { ok: true, setMode, setDegrees: null };
-  }
-  const saved = draft.mode === 'heat' ? context.heatSetpoint : context.coolSetpoint;
-  const setDegrees = saved === draft.degrees ? null : draft.degrees;
-  return { ok: true, setMode, setDegrees };
+  const setMode = draft.mode !== null && draft.mode !== context.systemMode ? draft.mode : null;
+  const setHeat = context.heatSetpoint === draft.heat ? null : draft.heat;
+  const setCool = context.coolSetpoint === draft.cool ? null : draft.cool;
+  return { ok: true, setMode, setHeat, setCool };
+}
+
+export function recalibrateChangeLabel(mode: 'heat' | 'cool', degrees: number): string {
+  return mode === 'heat' ? `Recalibrated Heat · ${degrees}°` : `Recalibrated Cool · ${degrees}°`;
 }
 
 export function alreadyInMode(mode: KnownMode): string {

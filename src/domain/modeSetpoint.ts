@@ -75,6 +75,7 @@ export type ClimateControl = {
 
 export type ClimateEvent =
   | { type: 'recalibrate-mode'; mode: KnownMode }
+  | { type: 'recalibrate-record'; mode: KnownMode | null; heat: number | null; cool: number | null }
   | { type: 'commit-press'; step: ModeStep }
   | { type: 'set-active'; kind: 'adjust' | 'recalibrate'; degrees: number }
   | { type: 'seed'; degrees: number };
@@ -86,6 +87,26 @@ export function reduceClimate(
   if (event.type === 'recalibrate-mode') {
     const tracked = reduceTrackedMode(trackedFrom(state.systemMode), { type: 'recalibrate', mode: event.mode });
     return { state: { ...state, systemMode: modeOf(tracked) }, reason: null };
+  }
+  if (event.type === 'recalibrate-record') {
+    if ((event.heat !== null && !Number.isInteger(event.heat)) || (event.cool !== null && !Number.isInteger(event.cool))) {
+      return { state, reason: 'Temperatures are whole degrees.' };
+    }
+    let next = state;
+    if (event.mode !== null) {
+      const tracked = reduceTrackedMode(trackedFrom(next.systemMode), { type: 'recalibrate', mode: event.mode });
+      next = { ...next, systemMode: modeOf(tracked) };
+    }
+    if (event.heat !== null || event.cool !== null) {
+      next = {
+        ...next,
+        setpoints: {
+          heat: event.heat === null ? next.setpoints.heat : event.heat,
+          cool: event.cool === null ? next.setpoints.cool : event.cool,
+        },
+      };
+    }
+    return { state: next, reason: null };
   }
   if (event.type === 'commit-press') {
     if (state.systemMode === 'unknown') {

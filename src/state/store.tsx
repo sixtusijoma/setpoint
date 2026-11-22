@@ -62,9 +62,8 @@ import {
   type ScheduleEvent,
 } from '@/domain/schedule';
 import { runDueSchedule } from '@/domain/scheduleRunner';
-import { writeSetpoint } from '@/domain/setpoint';
 import { isKnownMode, modeLabel, type KnownMode, type SystemMode } from '@/domain/systemMode';
-import { alreadyInMode } from '@/domain/recalibrateDraft';
+import { alreadyInMode, PICK_MODE_REASON } from '@/domain/recalibrateDraft';
 import { formatClock } from '@/domain/time';
 import { LOCAL_HISTORY_CAP, pageLocalChanges, seedDemoHistory, type ChangePage } from '@/domain/history';
 import { localWindowData, type HistoryWindow, type HistoryWindowData } from '@/domain/historyWindow';
@@ -91,7 +90,6 @@ import {
   fetchState,
   isTransientNetworkError,
   readServerConfig,
-  recalibrateModeRemote,
   recalibrateRemote,
   requestRemoteMeter,
   runRemoteMode,
@@ -121,6 +119,7 @@ import {
   type Persisted,
   type Preset,
 } from '@/state/model';
+import { appliedWrite, recordRecalibration, type RecalibrateWrite } from '@/state/recalibrateRecord';
 import {
   acceptVersion,
   applySnapshot,
@@ -181,9 +180,8 @@ type AppContextValue = {
   forgetCredentials: () => Promise<void>;
   mapRole: (role: 'up' | 'down' | 'mode' | 'meter', device: SwitchBotDevice | null) => void;
   completeCalibration: (temp: number) => void;
-  recalibrate: (temp: number) => Promise<string | null>;
+  recalibrate: (write: RecalibrateWrite) => Promise<string | null>;
   setSystemMode: (mode: KnownMode) => Promise<void>;
-  recalibrateSystemMode: (mode: KnownMode) => Promise<string | null>;
   bump: (direction: 1 | -1) => Promise<void>;
   setTo: (target: number) => Promise<CommandResult>;
   applyPreset: (preset: Preset) => Promise<void>;
@@ -1786,49 +1784,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setSystemModeRef.current = setSystemMode;
   }, [setSystemMode]);
 
-  const recalibrateSystemMode = useCallback(
-    async (mode: KnownMode): Promise<string | null> => {
-      if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
-        return 'Wait for the press to finish before changing the mode.';
-      }
-      const apply = (nextMode: KnownMode) => {
-        const at = new Date().toISOString();
-        commit((prev) => {
-          const climate = reduceClimate(climateOf(prev), { type: 'recalibrate-mode', mode: nextMode });
-          return appendLog(
-            applyClimate(prev, climate.state),
-            'calibration',
-            `The thermostat is ${modeLabel(nextMode)}. No buttons were pressed.`,
-            at,
-          );
-        });
-      };
-      const auth = sessionAuth();
-      if (!auth || stateRef.current.mode !== 'live') {
-        apply(mode);
-        return null;
-      }
-      const sync = syncRef.current;
-      sync.recalibrating = true;
-      try {
-        const saved = await recalibrateModeRemote(auth.config, auth.appKey, mode);
-        acceptVersion(sync, saved.version);
-        if (saved.systemMode === 'heat' || saved.systemMode === 'off' || saved.systemMode === 'cool') {
-          apply(saved.systemMode);
-        }
-        return null;
-      } catch (error) {
-        if (noteAuth(error)) {
-          return 'The app key was rejected.';
-        }
-        return explainError(error, appKeyRef.current);
-      } finally {
-        sync.recalibrating = false;
-      }
-    },
-    [commit, noteAuth, sessionAuth],
-  );
-
   const value = useMemo<AppContextValue>(() => {
     return {
       ready,
@@ -2022,48 +1977,49 @@ export function AppProvider({ children }: { children: ReactNode }) {
             });
         }
       },
-      recalibrate: async (temp) => {
-        const active = resolveActive(stateRef.current.systemMode, {
-          heat: stateRef.current.heatSetpoint,
-          cool: stateRef.current.coolSetpoint,
-        });
-        if (active.status === 'off' || active.status === 'unknown') {
-          return refusalFor(active);
+      recalibrate: async (write) => {
+        const snapshot = stateRef.current;
+        const change: RecalibrateWrite = {
+          mode: write.mode !== null && write.mode !== snapshot.systemMode ? write.mode : null,
+          heat: write.heat !== null && write.heat !== snapshot.heatSetpoint ? write.heat : null,
+          cool: write.cool !== null && write.cool !== snapshot.coolSetpoint ? write.cool : null,
+        };
+        if (change.mode === null && change.heat === null && change.cool === null) {
+          return null;
         }
-        const session = sessionRef.current;
-        const written = writeSetpoint(active.status === 'active' ? active.degrees : null, { degrees: temp, source: 'recalibrated' }, session);
-        if (!written.ok) {
-          return written.reason;
+        if (snapshot.systemMode === 'unknown' && change.mode === null) {
+          return PICK_MODE_REASON;
         }
-        const range = stateRef.current.settings;
-        if (temp < range.minF || temp > range.maxF) {
-          return `${temp}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
+        if (isRunning(sessionRef.current) || isModeRunning(modeSessionRef.current)) {
+          return 'Wait for the press to finish before recalibrating.';
         }
-        const recalibrated = (setpoint: number, at: string) =>
-          commit((prev) => {
-            const climate = reduceClimate(climateOf(prev), { type: 'set-active', kind: 'recalibrate', degrees: setpoint });
-            const next = climate.reason ? prev : applyClimate(prev, climate.state);
-            return appendLog(
-              {
-                ...next,
-                changes: [...next.changes, { at, setpoint, source: 'manual', label: `Recalibrated · ${setpoint}°` }].slice(-400),
-              },
-              'calibration',
-              `Recalibrated the ${modeLabel(active.mode)} setpoint to ${setpoint}°. No buttons were pressed.`,
-              at,
-            );
-          });
+        const range = snapshot.settings;
+        for (const degrees of [change.heat, change.cool]) {
+          if (degrees === null) {
+            continue;
+          }
+          if (!Number.isInteger(degrees)) {
+            return 'Temperatures are whole degrees.';
+          }
+          if (degrees < range.minF || degrees > range.maxF) {
+            return `${degrees}° is outside ${range.minF}-${range.maxF}°. Widen the range or pick a temperature inside it.`;
+          }
+        }
         const auth = sessionAuth();
-        if (!auth || stateRef.current.mode !== 'live') {
-          recalibrated(temp, new Date().toISOString());
+        if (!auth || snapshot.mode !== 'live') {
+          commit((prev) => recordRecalibration(prev, change, new Date().toISOString()));
           return null;
         }
         const sync = syncRef.current;
         sync.recalibrating = true;
         try {
-          const saved = await recalibrateRemote(auth.config, auth.appKey, temp);
+          const saved = await recalibrateRemote(auth.config, auth.appKey, {
+            ...(change.mode ? { mode: change.mode } : {}),
+            ...(change.heat !== null ? { heatF: change.heat } : {}),
+            ...(change.cool !== null ? { coolF: change.cool } : {}),
+          });
           acceptVersion(sync, saved.version);
-          recalibrated(saved.setpoint, new Date().toISOString());
+          commit((prev) => recordRecalibration(prev, appliedWrite(prev, saved), new Date().toISOString()));
           return null;
         } catch (error) {
           if (noteAuth(error)) {
@@ -2106,7 +2062,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         await runTarget(preset.tempF, { kind: 'preset', label: preset.label });
       },
       setSystemMode: (mode) => setSystemMode(mode),
-      recalibrateSystemMode: (mode) => recalibrateSystemMode(mode),
       cancelCommand: () => {
         applyPending({ type: 'cancel' });
         clearQueuedTarget();
@@ -2514,7 +2469,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     runTarget,
     finishResume,
     setSystemMode,
-    recalibrateSystemMode,
   ]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

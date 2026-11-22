@@ -472,6 +472,8 @@ describe('chart geometry', () => {
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'manual', 'Home · 72°'), events)).toBe('Home preset');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'manual', 'Calibrated · 68°'), events)).toBe('Calibrated');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'recalibrated', 'Recalibrated · 66°'), events)).toBe('Recalibrated');
+    expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'recalibrated', 'Recalibrated Heat · 68°'), events)).toBe('Recalibrated');
+    expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'recalibrated', 'Recalibrated Cool · 74°'), events)).toBe('Recalibrated');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'wake-now', 'Wake now · 70°'), events)).toBe('Wake now');
     expect(describeChangeSource(at('2026-11-11T15:00:00.000Z', 'run-now', 'Nap now · 66°'), events)).toBe('Nap now');
   });
