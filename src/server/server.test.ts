@@ -600,9 +600,152 @@ describe('shared server', () => {
       `select setpoint, source, label, changed_at from public.setpoint_changes order by id`,
     );
     expect(changes.rows.map(({ setpoint, source, label }) => ({ setpoint, source, label }))).toEqual([
-      { setpoint: 66, source: 'recalibrated', label: 'Recalibrated · 66°' },
+      { setpoint: 66, source: 'recalibrated', label: 'Recalibrated Heat · 66°' },
     ]);
     expect(new Date(changes.rows[0]?.changed_at ?? 0).toISOString()).toBe(wednesdayMorning.toISOString());
+  });
+
+  it('recalibrates mode and both setpoints in one write and leaves unchanged fields alone', async () => {
+    const env = appEnv();
+    const before = await db.readState();
+    const recalibrate = (body: unknown) =>
+      handleRecalibrate(new Request('http://local/recalibrate', { method: 'POST', headers: appHeaders(), body: JSON.stringify(body) }), {
+        db,
+        env,
+        now: () => wednesdayMorning,
+      });
+
+    const mixed = await recalibrate({ temperatureF: 66, heatF: 68 });
+    expect(mixed.status).toBe(400);
+    expect((await mixed.json()).error).toBe('Pass temperatureF or the mode and setpoints, not both.');
+    expect((await db.readState()).version).toBe(before.version);
+
+    const fraction = await recalibrate({ mode: 'cool', heatF: 68.5, coolF: 74 });
+    expect(fraction.status).toBe(400);
+    expect((await fraction.json()).error).toBe('Temperatures are whole degrees.');
+
+    const outside = await recalibrate({ mode: 'off', heatF: 68, coolF: 40 });
+    expect(outside.status).toBe(400);
+    expect((await outside.json()).error).toContain('outside 50-85°');
+    const untouched = await db.readState();
+    expect(untouched.systemMode).toBe('heat');
+    expect(untouched.heatSetpoint).toBe(70);
+    expect(untouched.coolSetpoint).toBe(70);
+    expect(untouched.version).toBe(before.version);
+
+    const saved = await recalibrate({ mode: 'cool', heatF: 68, coolF: 74 });
+    expect(saved.status).toBe(200);
+    const body = await saved.json();
+    const after = await db.readState();
+    expect(after.version).toBe(before.version + 1);
+    expect(body).toMatchObject({
+      previous: 70,
+      setpoint: 74,
+      systemMode: 'cool',
+      heatSetpoint: 68,
+      coolSetpoint: 74,
+      version: after.version,
+    });
+    expect(after.systemMode).toBe('cool');
+    expect(after.heatSetpoint).toBe(68);
+    expect(after.coolSetpoint).toBe(74);
+    expect(after.virtualSetpoint).toBe(74);
+    expect((await db.readLease()).phase).toBe('idle');
+    const changes = await pg.query<{ setpoint: number; source: string; label: string }>(
+      `select setpoint, source, label from public.setpoint_changes order by id`,
+    );
+    expect(changes.rows).toEqual([
+      { setpoint: 68, source: 'recalibrated', label: 'Recalibrated Heat · 68°' },
+      { setpoint: 74, source: 'recalibrated', label: 'Recalibrated Cool · 74°' },
+    ]);
+
+    const same = await recalibrate({ mode: 'cool', heatF: 68, coolF: 74 });
+    expect(same.status).toBe(200);
+    expect((await db.readState()).version).toBe(after.version);
+    const still = await pg.query<{ n: number }>(`select count(*)::int as n from public.setpoint_changes`);
+    expect(still.rows[0]?.n).toBe(2);
+
+    const heatOnly = await recalibrate({ heatF: 67 });
+    expect(heatOnly.status).toBe(200);
+    const cooled = await db.readState();
+    expect(cooled.systemMode).toBe('cool');
+    expect(cooled.heatSetpoint).toBe(67);
+    expect(cooled.coolSetpoint).toBe(74);
+    expect(cooled.virtualSetpoint).toBe(74);
+    expect(cooled.version).toBe(after.version + 1);
+    const labels = await pg.query<{ label: string }>(`select label from public.setpoint_changes order by id`);
+    expect(labels.rows.map((row) => row.label)).toEqual([
+      'Recalibrated Heat · 68°',
+      'Recalibrated Cool · 74°',
+      'Recalibrated Heat · 67°',
+    ]);
+  });
+
+  it('refuses a setpoint-only recalibration while the mode is unknown and writes nothing', async () => {
+    const env = appEnv();
+    await db.patchState(null, { systemMode: 'unknown' });
+    const before = await db.readState();
+    const refused = await handleRecalibrate(
+      new Request('http://local/recalibrate', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ heatF: 68, coolF: 74 }),
+      }),
+      { db, env },
+    );
+    expect(refused.status).toBe(400);
+    expect((await refused.json()).error).toBe('Pick the mode the thermostat display shows: Heat, Off, or Cool.');
+    expect((await db.readState()).heatSetpoint).toBe(before.heatSetpoint);
+    expect((await db.readState()).systemMode).toBe('unknown');
+
+    const saved = await handleRecalibrate(
+      new Request('http://local/recalibrate', {
+        method: 'POST',
+        headers: appHeaders(),
+        body: JSON.stringify({ mode: 'off', heatF: 68, coolF: 74 }),
+      }),
+      { db, env, now: () => wednesdayMorning },
+    );
+    expect(saved.status).toBe(200);
+    const after = await db.readState();
+    expect(after.systemMode).toBe('off');
+    expect(after.heatSetpoint).toBe(68);
+    expect(after.coolSetpoint).toBe(74);
+    expect(after.virtualSetpoint).toBeNull();
+    expect((await saved.json()).setpoint).toBeNull();
+  });
+
+  it('recalibrates mode and both setpoints through the MCP tool without pressing', async () => {
+    const pressed: string[] = [];
+    const result = await handleMcp(
+      db,
+      {
+        jsonrpc: '2.0',
+        id: 11,
+        method: 'tools/call',
+        params: { name: 'recalibrate', arguments: { mode: 'cool', heatF: 68, coolF: 74 } },
+      },
+      {
+        press: async (direction) => {
+          pressed.push(direction);
+        },
+      },
+    );
+    expect(JSON.parse(textOf(result))).toEqual({
+      previous: 70,
+      setpoint: 74,
+      systemMode: 'cool',
+      heatSetpoint: 68,
+      coolSetpoint: 74,
+    });
+    expect(pressed).toEqual([]);
+    const state = await db.readState();
+    expect(state.systemMode).toBe('cool');
+    expect(state.heatSetpoint).toBe(68);
+    expect(state.coolSetpoint).toBe(74);
+    expect(state.virtualSetpoint).toBe(74);
+    const changes = await pg.query<{ label: string }>(`select label from public.setpoint_changes order by id`);
+    expect(changes.rows.map((row) => row.label)).toEqual(['Recalibrated Heat · 68°', 'Recalibrated Cool · 74°']);
   });
 
   it('refuses to recalibrate while a press is running', async () => {
@@ -637,7 +780,13 @@ describe('shared server', () => {
         },
       });
     const saved = await call(68);
-    expect(JSON.parse(textOf(saved))).toEqual({ previous: 70, setpoint: 68 });
+    expect(JSON.parse(textOf(saved))).toEqual({
+      previous: 70,
+      setpoint: 68,
+      systemMode: 'heat',
+      heatSetpoint: 68,
+      coolSetpoint: 70,
+    });
     expect((await db.readState()).virtualSetpoint).toBe(68);
     const refused = await call(90);
     expect(refused.result).toMatchObject({ isError: true });

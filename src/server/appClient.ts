@@ -178,12 +178,28 @@ export function saveState(
   return call(config, appKey, 'state', { method: 'PUT', body: JSON.stringify(patch) });
 }
 
+export type RecalibrateBody = {
+  temperatureF?: number;
+  mode?: 'heat' | 'off' | 'cool';
+  heatF?: number;
+  coolF?: number;
+};
+
+export type RecalibrateRemoteResult = {
+  previous: number | null;
+  setpoint: number | null;
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+  version: number;
+};
+
 export function recalibrateRemote(
   config: ServerConfig,
   appKey: string,
-  temperatureF: number,
-): Promise<{ previous: number | null; setpoint: number; version: number }> {
-  return call(config, appKey, 'recalibrate', { method: 'POST', body: JSON.stringify({ temperatureF }) });
+  body: RecalibrateBody,
+): Promise<RecalibrateRemoteResult> {
+  return call(config, appKey, 'recalibrate', { method: 'POST', body: JSON.stringify(body) });
 }
 
 export function runRemotePress(

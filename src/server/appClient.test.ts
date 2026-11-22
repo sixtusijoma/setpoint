@@ -77,7 +77,7 @@ describe('transient network errors', () => {
     await expect(runRemotePress(config, appKey, { target: 70, source: { kind: 'manual' } })).rejects.toThrow(
       /network connection was lost/,
     );
-    await expect(recalibrateRemote(config, appKey, 70)).rejects.toThrow(/network connection was lost/);
+    await expect(recalibrateRemote(config, appKey, { temperatureF: 70 })).rejects.toThrow(/network connection was lost/);
     expect(calls).toBe(3);
 
     calls = 0;

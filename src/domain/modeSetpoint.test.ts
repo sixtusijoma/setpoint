@@ -68,6 +68,23 @@ describe('per-mode setpoints', () => {
     expect(named.state.setpoints).toEqual({ heat: 70, cool: 70 });
   });
 
+  it('records the mode and either setpoint together, including while Off', () => {
+    const saved = reduceClimate(climate(), { type: 'recalibrate-record', mode: 'cool', heat: 68, cool: 74 });
+    expect(saved.reason).toBeNull();
+    expect(saved.state).toEqual({ systemMode: 'cool', setpoints: { heat: 68, cool: 74 } });
+    const off = reduceClimate(climate({ systemMode: 'off' }), {
+      type: 'recalibrate-record',
+      mode: null,
+      heat: 69,
+      cool: null,
+    });
+    expect(off.state).toEqual({ systemMode: 'off', setpoints: { heat: 69, cool: 74 } });
+    expect(reduceClimate(climate(), { type: 'recalibrate-record', mode: null, heat: 68.5, cool: null })).toEqual({
+      state: climate(),
+      reason: 'Temperatures are whole degrees.',
+    });
+  });
+
   it('does not adjust a mode that has no number yet', () => {
     const blank = climate({ setpoints: { heat: null, cool: 74 } });
     const refused = reduceClimate(blank, { type: 'set-active', kind: 'adjust', degrees: 71 });

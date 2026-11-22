@@ -218,9 +218,15 @@ export async function handleRecalibrate(request: Request, options: HandlerOption
   if (request.method !== 'POST') {
     return json(request, options.env, { error: 'Method not allowed.' }, 405);
   }
-  const body = (await request.json()) as { temperatureF?: unknown };
+  const body = (await request.json()) as { temperatureF?: unknown; mode?: unknown; heatF?: unknown; coolF?: unknown };
   try {
-    const result = await recalibrateShared(options.db, { temperatureF: body.temperatureF, now: options.now });
+    const result = await recalibrateShared(options.db, {
+      temperatureF: body.temperatureF,
+      mode: body.mode,
+      heatF: body.heatF,
+      coolF: body.coolF,
+      now: options.now,
+    });
     return json(request, options.env, result);
   } catch (error) {
     if (error instanceof RecalibrateError) {

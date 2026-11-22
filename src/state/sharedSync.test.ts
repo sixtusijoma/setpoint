@@ -29,7 +29,7 @@ function server(state: Persisted, version: number, patch: Partial<SharedSnapshot
 }
 
 describe('shared sync', () => {
-  it('keeps a recalibrated setpoint when a reload races it', () => {
+  it('keeps a recalibrated mode and both setpoints when a reload races it', () => {
     const sync = createSharedSync();
     let local = live(70);
     acceptVersion(sync, 10);
@@ -40,16 +40,22 @@ describe('shared sync', () => {
     sync.recalibrating = true;
     expect(canPull(sync)).toBe(false);
 
-    // The server takes the recalibrate at version 11.
+    // The server takes the recalibrate at version 11: mode, Heat, and Cool together.
     acceptVersion(sync, 11);
-    local = { ...local, virtualSetpoint: 66, heatSetpoint: 66 };
+    local = { ...local, systemMode: 'cool', virtualSetpoint: 74, heatSetpoint: 68, coolSetpoint: 74 };
     sync.recalibrating = false;
 
     expect(mergePulled(sync, local, stale)).toBeNull();
-    expect(local.virtualSetpoint).toBe(66);
+    expect(local.systemMode).toBe('cool');
+    expect(local.heatSetpoint).toBe(68);
+    expect(local.coolSetpoint).toBe(74);
+    expect(local.virtualSetpoint).toBe(74);
 
-    const fresh = mergePulled(sync, local, server(local, 12, { virtualSetpoint: 66 }));
-    expect(fresh?.virtualSetpoint).toBe(66);
+    const fresh = mergePulled(sync, local, server(local, 12));
+    expect(fresh?.systemMode).toBe('cool');
+    expect(fresh?.heatSetpoint).toBe(68);
+    expect(fresh?.coolSetpoint).toBe(74);
+    expect(fresh?.virtualSetpoint).toBe(74);
     expect(sync.version).toBe(12);
   });
 
@@ -57,7 +63,14 @@ describe('shared sync', () => {
     const sync = createSharedSync();
     acceptVersion(sync, 4);
     const prev = live(70);
-    const next = { ...prev, roomLabel: 'Office', virtualSetpoint: 60, heatSetpoint: 60 };
+    const next = {
+      ...prev,
+      roomLabel: 'Office',
+      systemMode: 'cool' as const,
+      virtualSetpoint: 60,
+      heatSetpoint: 68,
+      coolSetpoint: 74,
+    };
     noteLocalChange(sync, prev, next);
     const patch = takePatch(sync, next);
     expect(patch).toEqual({ version: 4, roomLabel: 'Office' });

@@ -1,5 +1,6 @@
 import { reduceBatteryFetch, shouldFetchBatteries, stateFromCache, type BatteryReading } from '../domain/batteryFetch';
 import { refusalFor, resolveActive } from '../domain/modeSetpoint';
+import { PICK_MODE_REASON, recalibrateChangeLabel } from '../domain/recalibrateDraft';
 import { modeProgress, runModeSession, type ModeSession, type ModeSource } from '../domain/modePress';
 import type { Direction } from '../domain/planSetTo';
 import { planSetTo } from '../domain/planSetTo';
@@ -381,14 +382,68 @@ export class RecalibrateError extends Error {
   }
 }
 
-export async function recalibrateShared(
-  db: SetpointDb,
-  input: { temperatureF: unknown; now?: () => Date },
-): Promise<{ previous: number | null; setpoint: number; version: number }> {
-  const now = input.now ?? (() => new Date());
-  const degrees = input.temperatureF;
-  if (typeof degrees !== 'number' || !Number.isInteger(degrees)) {
+export type RecalibrateInput = {
+  /** Legacy: correct only the active setpoint. Cannot be combined with mode, heatF, or coolF. */
+  temperatureF?: unknown;
+  mode?: unknown;
+  heatF?: unknown;
+  coolF?: unknown;
+  now?: () => Date;
+};
+
+export type RecalibrateSaved = {
+  previous: number | null;
+  setpoint: number | null;
+  systemMode: SystemMode;
+  heatSetpoint: number | null;
+  coolSetpoint: number | null;
+  version: number;
+};
+
+function wholeDegrees(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
     throw new RecalibrateError('Temperatures are whole degrees.', 'invalid');
+  }
+  return value;
+}
+
+function outsideRange(degrees: number, minF: number, maxF: number): string | null {
+  if (degrees < minF || degrees > maxF) {
+    return `${degrees}° is outside ${minF}-${maxF}°. Widen the range or pick a temperature inside it.`;
+  }
+  return null;
+}
+
+function previousSetpoint(state: SharedSnapshot): number | null {
+  const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
+  return active.status === 'active' ? active.degrees : null;
+}
+
+export async function recalibrateShared(db: SetpointDb, input: RecalibrateInput): Promise<RecalibrateSaved> {
+  const now = input.now ?? (() => new Date());
+  const explicit = input.mode !== undefined || input.heatF !== undefined || input.coolF !== undefined;
+  if (explicit && input.temperatureF !== undefined) {
+    throw new RecalibrateError('Pass temperatureF or the mode and setpoints, not both.', 'invalid');
+  }
+  let mode: KnownMode | undefined;
+  let heat: number | undefined;
+  let cool: number | undefined;
+  let legacy: number | undefined;
+  if (explicit) {
+    if (input.mode !== undefined) {
+      if (!isKnownMode(input.mode)) {
+        throw new RecalibrateError('Mode must be heat, off, or cool.', 'invalid');
+      }
+      mode = input.mode;
+    }
+    if (input.heatF !== undefined) {
+      heat = wholeDegrees(input.heatF);
+    }
+    if (input.coolF !== undefined) {
+      cool = wholeDegrees(input.coolF);
+    }
+  } else {
+    legacy = wholeDegrees(input.temperatureF);
   }
   const acquired = await db.acquireLease(RECALIBRATE_OWNER, RECALIBRATE_LEASE_SECONDS);
   if (!acquired) {
@@ -396,23 +451,65 @@ export async function recalibrateShared(
   }
   try {
     const state = await db.readState();
-    const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
-    if (active.status !== 'active' && active.status !== 'unset') {
-      throw new RecalibrateError(refusalFor(active) ?? 'Set the virtual setpoint first.', 'invalid');
-    }
     const { minF, maxF } = state.settings;
-    if (degrees < minF || degrees > maxF) {
-      throw new RecalibrateError(`${degrees}° is outside ${minF}-${maxF}°. Widen the range or pick a temperature inside it.`, 'invalid');
+    const patch: Record<string, unknown> = {};
+    const logs: { setpoint: number; label: string }[] = [];
+    if (legacy !== undefined) {
+      const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
+      if (active.status !== 'active' && active.status !== 'unset') {
+        throw new RecalibrateError(refusalFor(active) ?? 'Set the virtual setpoint first.', 'invalid');
+      }
+      const range = outsideRange(legacy, minF, maxF);
+      if (range) {
+        throw new RecalibrateError(range, 'invalid');
+      }
+      if (active.status !== 'active' || active.degrees !== legacy) {
+        patch[active.mode === 'heat' ? 'heatSetpoint' : 'coolSetpoint'] = legacy;
+        logs.push({ setpoint: legacy, label: recalibrateChangeLabel(active.mode, legacy) });
+      }
+    } else {
+      const nextMode = mode ?? state.systemMode;
+      if (nextMode === 'unknown') {
+        throw new RecalibrateError(PICK_MODE_REASON, 'invalid');
+      }
+      if (heat !== undefined) {
+        const range = outsideRange(heat, minF, maxF);
+        if (range) {
+          throw new RecalibrateError(range, 'invalid');
+        }
+      }
+      if (cool !== undefined) {
+        const range = outsideRange(cool, minF, maxF);
+        if (range) {
+          throw new RecalibrateError(range, 'invalid');
+        }
+      }
+      if (mode !== undefined && mode !== state.systemMode) {
+        patch.systemMode = mode;
+      }
+      if (heat !== undefined && heat !== state.heatSetpoint) {
+        patch.heatSetpoint = heat;
+        logs.push({ setpoint: heat, label: recalibrateChangeLabel('heat', heat) });
+      }
+      if (cool !== undefined && cool !== state.coolSetpoint) {
+        patch.coolSetpoint = cool;
+        logs.push({ setpoint: cool, label: recalibrateChangeLabel('cool', cool) });
+      }
     }
-    const saved = await patchRetry(db, active.mode === 'heat' ? { heatSetpoint: degrees } : { coolSetpoint: degrees });
-    await db.insertChange({
-      at: now().toISOString(),
-      setpoint: degrees,
-      source: 'recalibrated',
-      label: `Recalibrated · ${degrees}°`,
-    });
-    const previous = active.status === 'active' ? active.degrees : null;
-    return { previous, setpoint: saved.virtualSetpoint ?? degrees, version: saved.version };
+    const previous = previousSetpoint(state);
+    const saved = Object.keys(patch).length === 0 ? state : await patchRetry(db, patch);
+    const at = now().toISOString();
+    for (const entry of logs) {
+      await db.insertChange({ at, setpoint: entry.setpoint, source: 'recalibrated', label: entry.label });
+    }
+    return {
+      previous,
+      setpoint: saved.virtualSetpoint,
+      systemMode: saved.systemMode,
+      heatSetpoint: saved.heatSetpoint,
+      coolSetpoint: saved.coolSetpoint,
+      version: saved.version,
+    };
   } finally {
     await db.releaseLease(RECALIBRATE_OWNER);
   }
