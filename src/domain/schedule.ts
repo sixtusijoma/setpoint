@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
 
+import { isKnownMode, type KnownMode } from './systemMode';
 import { TIME_ZONE } from './time';
 
 export type ScheduleEvent = {
@@ -10,6 +11,8 @@ export type ScheduleEvent = {
   targetF: number;
   days: number[];
   enabled: boolean;
+  /** Absent means leave the thermostat mode alone when the event fires. */
+  mode?: KnownMode;
 };
 
 export type Occurrence = {
@@ -18,7 +21,12 @@ export type Occurrence = {
   label: string;
   targetF: number;
   at: string;
+  mode?: KnownMode;
 };
+
+export function eventMode(value: unknown): KnownMode | undefined {
+  return isKnownMode(value) ? value : undefined;
+}
 
 export type RunStatus =
   | 'skipped'
@@ -120,13 +128,22 @@ export function occurrenceKey(eventId: string, atIso: string): string {
 
 function toOccurrence(event: ScheduleEvent, at: DateTime): Occurrence {
   const iso = at.toUTC().toISO() ?? at.toISO() ?? '';
-  return {
-    key: occurrenceKey(event.id, iso),
+  return occurrenceFrom(event, iso, event.label);
+}
+
+function occurrenceFrom(event: ScheduleEvent, at: string, label: string): Occurrence {
+  const occurrence: Occurrence = {
+    key: occurrenceKey(event.id, at),
     eventId: event.id,
-    label: event.label,
+    label,
     targetF: event.targetF,
-    at: iso,
+    at,
   };
+  const mode = eventMode(event.mode);
+  if (mode) {
+    occurrence.mode = mode;
+  }
+  return occurrence;
 }
 
 export function listOccurrences(events: ScheduleEvent[], start: DateTime, end: DateTime): Occurrence[] {
@@ -228,13 +245,7 @@ export function resolveHold(
   const nowDt = instant(now);
   if (deadlineAt.isValid && deadlineAt > nowDt) {
     const deadline = event
-      ? {
-          key: occurrenceKey(event.id, occurrenceAt),
-          eventId: event.id,
-          label,
-          targetF: event.targetF,
-          at: occurrenceAt,
-        }
+      ? occurrenceFrom(event, occurrenceAt, label)
       : {
           key: occurrenceKey(hold.eventId, occurrenceAt),
           eventId: hold.eventId,
@@ -441,6 +452,9 @@ export function scheduleEditResetsCursor(before: ScheduleEvent, after: ScheduleE
     return true;
   }
   if (before.targetF !== after.targetF) {
+    return true;
+  }
+  if ((before.mode ?? null) !== (after.mode ?? null)) {
     return true;
   }
   if (!before.enabled && after.enabled) {

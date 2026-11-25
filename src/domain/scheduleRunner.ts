@@ -1,4 +1,16 @@
+import {
+  alreadyCopy,
+  ambiguousCopy,
+  doneCopy,
+  performScheduleApply,
+  type ModePressReport,
+  type ScheduleClimate,
+  type ScheduleExecuteStatus,
+} from './scheduleApply';
 import { catchupSentence, completionStatus, planDue, upsertRecord, type HoldState, type RunRecord, type ScheduleEvent } from './schedule';
+import type { KnownMode } from './systemMode';
+
+export type { ScheduleExecuteStatus };
 
 export type ScheduleLogKind = 'schedule' | 'miss' | 'cancel' | 'failure';
 
@@ -7,8 +19,6 @@ export type ScheduleLogLine = {
   message: string;
 };
 
-export type ScheduleExecuteStatus = 'done' | 'cancelled' | 'failed' | 'refused' | 'ambiguous' | 'busy' | 'already';
-
 export type SchedulePhase = 'armed' | 'paused-after-failure';
 
 export async function runDueSchedule(input: {
@@ -16,11 +26,12 @@ export async function runDueSchedule(input: {
   events: ScheduleEvent[];
   records: RunRecord[];
   hold: HoldState;
-  setpoint: number;
+  climate: ScheduleClimate;
   catchupFrom: string | null;
   retryFailed: boolean;
   step?: number;
   schedulePhase?: SchedulePhase;
+  pressMode: (target: KnownMode) => Promise<ModePressReport>;
   execute: (target: number) => Promise<{ status: ScheduleExecuteStatus; stoppedAt: number; wanted: number; reason?: string }>;
 }): Promise<{
   records: RunRecord[];
@@ -28,6 +39,7 @@ export async function runDueSchedule(input: {
   log: ScheduleLogLine[];
   catchupNote: string | null;
   schedulePhase: SchedulePhase;
+  notifyCheck: boolean;
 }> {
   const decision = planDue({
     events: input.events,
@@ -48,12 +60,38 @@ export async function runDueSchedule(input: {
       log: missedOnly.log,
       catchupNote: null,
       schedulePhase: phase,
+      notifyCheck: false,
     };
   }
   const apply = decision.apply;
-  if (input.setpoint === apply.targetF) {
+  const result = await performScheduleApply({
+    mode: apply.mode ?? null,
+    targetF: apply.targetF,
+    climate: input.climate,
+    pressMode: input.pressMode,
+    pressTemperature: async (target) => {
+      const pressed = await input.execute(target);
+      return {
+        status: pressed.status,
+        reason: pressed.reason,
+        stoppedAt: pressed.stoppedAt,
+        wanted: pressed.wanted,
+      };
+    },
+  });
+  if (result.status === 'busy') {
+    return {
+      records: input.records,
+      hold: input.hold,
+      log: [],
+      catchupNote: null,
+      schedulePhase: phase,
+      notifyCheck: false,
+    };
+  }
+  if (result.status === 'already') {
     const missedOnly = writeMissed(input.records, decision.missed, recordedAt);
-    const message = `Already at ${apply.targetF}°. No presses sent.`;
+    const copy = alreadyCopy(apply.label, apply.targetF, result);
     const records = upsertRecord(missedOnly.records, {
       key: apply.key,
       eventId: apply.eventId,
@@ -61,7 +99,7 @@ export async function runDueSchedule(input: {
       label: apply.label,
       targetF: apply.targetF,
       status: 'already',
-      message,
+      message: copy.record,
       recordedAt,
       via: decision.missed.length > 0 ? 'catch-up' : 'scheduler',
     });
@@ -70,34 +108,22 @@ export async function runDueSchedule(input: {
     if (note) {
       log.push({ kind: 'schedule' as const, message: note });
     }
-    log.push({
-      kind: 'schedule' as const,
-      message: `${apply.label} was already at ${apply.targetF}°. No presses sent.`,
-    });
+    log.push({ kind: 'schedule' as const, message: copy.log });
     return {
       records,
       hold: null,
       log,
       catchupNote: note,
       schedulePhase: 'armed',
-    };
-  }
-  const result = await input.execute(apply.targetF);
-  if (result.status === 'busy') {
-    return {
-      records: input.records,
-      hold: input.hold,
-      log: [],
-      catchupNote: null,
-      schedulePhase: phase,
+      notifyCheck: false,
     };
   }
   const missedOnly = writeMissed(input.records, decision.missed, recordedAt);
   const via = decision.missed.length > 0 ? 'catch-up' : 'scheduler';
-  if (result.status === 'done' || result.status === 'already') {
-    const status = result.status === 'already' ? 'already' : completionStatus(apply.at, input.now, via);
+  if (result.status === 'done') {
+    const status = completionStatus(apply.at, input.now, via);
     const note = decision.missed.length > 0 ? catchupSentence(decision.missed, apply.label) : null;
-    const message = note ?? `${apply.label} set to ${apply.targetF}°.`;
+    const message = note ?? doneCopy(apply.label, apply.targetF, result);
     const records = upsertRecord(missedOnly.records, {
       key: apply.key,
       eventId: apply.eventId,
@@ -115,6 +141,7 @@ export async function runDueSchedule(input: {
       log: [...missedOnly.log, { kind: 'schedule', message }],
       catchupNote: note,
       schedulePhase: 'armed',
+      notifyCheck: false,
     };
   }
   if (result.status === 'cancelled') {
@@ -136,6 +163,7 @@ export async function runDueSchedule(input: {
       log: [...missedOnly.log, { kind: 'cancel', message }],
       catchupNote: null,
       schedulePhase: 'armed',
+      notifyCheck: false,
     };
   }
   if (result.status === 'refused') {
@@ -158,10 +186,11 @@ export async function runDueSchedule(input: {
       log: [...missedOnly.log, { kind: 'failure', message }],
       catchupNote: null,
       schedulePhase: 'armed',
+      notifyCheck: false,
     };
   }
   if (result.status === 'ambiguous') {
-    const message = `Check the thermostat. ${apply.label} may have moved, and the degree was not counted. Later schedules still run.`;
+    const message = ambiguousCopy(apply.label, result);
     const records = upsertRecord(missedOnly.records, {
       key: apply.key,
       eventId: apply.eventId,
@@ -179,6 +208,7 @@ export async function runDueSchedule(input: {
       log: [...missedOnly.log, { kind: 'failure', message }],
       catchupNote: null,
       schedulePhase: 'armed',
+      notifyCheck: true,
     };
   }
   const message = result.reason
@@ -202,6 +232,7 @@ export async function runDueSchedule(input: {
     log: [...missedOnly.log, { kind: 'failure', message }],
     catchupNote: null,
     schedulePhase: 'paused-after-failure',
+    notifyCheck: false,
   };
 }
 

@@ -58,6 +58,7 @@ import {
   defaultEvents,
   holdFor,
   intendedTarget,
+  planDue,
   scheduleEditResetsCursor,
   type ScheduleEvent,
 } from '@/domain/schedule';
@@ -289,6 +290,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const interruptRef = useRef(false);
   const sessionRef = useRef<PressSession>(idleSession());
   const modeSessionRef = useRef<ModeSession>(idleModeSession());
+  const pressModeRef = useRef<(signal: AbortSignal) => Promise<void>>(async () => {
+    throw new PressOutcomeError('Map the mode bot before changing the thermostat mode.', 'rejected');
+  });
   const deviceListRef = useRef<DeviceList>(idleDeviceList());
   const pendingRef = useRef<PendingTarget>(idlePending());
   const queuedTargetRef = useRef<{ target: number; source: CommandSource } | null>(null);
@@ -1200,7 +1204,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return;
       }
       if (snapshot.virtualSetpoint === null) {
-        return;
+        const preview = planDue({
+          events: snapshot.events,
+          records: snapshot.records,
+          now,
+          hold: snapshot.hold,
+          catchupFrom: snapshot.catchupFrom,
+          retryFailed: snapshot.schedulePhase === 'armed',
+          step: snapshot.settings.step,
+        });
+        if (!preview.apply?.mode) {
+          return;
+        }
       }
       tickLock.current = true;
       try {
@@ -1209,11 +1224,67 @@ export function AppProvider({ children }: { children: ReactNode }) {
           events: snapshot.events,
           records: snapshot.records,
           hold: snapshot.hold,
-          setpoint: snapshot.virtualSetpoint,
+          climate: {
+            systemMode: snapshot.systemMode,
+            heatSetpoint: snapshot.heatSetpoint,
+            coolSetpoint: snapshot.coolSetpoint,
+          },
           catchupFrom: snapshot.catchupFrom,
           retryFailed: snapshot.schedulePhase === 'armed',
           step: snapshot.settings.step,
           schedulePhase: snapshot.schedulePhase,
+          pressMode: async (target) => {
+            const from = stateRef.current.systemMode;
+            if (from === 'unknown') {
+              return { status: 'refused', reason: UNKNOWN_MODE_REASON, reached: 'unknown' };
+            }
+            cancelRef.current = false;
+            interruptRef.current = false;
+            const settled = await runModeSession({
+              from,
+              target,
+              step: stateRef.current.settings.modeStep,
+              source: { kind: 'set-mode' },
+              delayMs: stateRef.current.settings.delayMs,
+              press: (signal) => pressModeRef.current(signal),
+              sleep: (ms, isCancelled) => sleepUnless(ms, isCancelled),
+              beforeSend: async (index, isCancelled) => {
+                if (index === 0) {
+                  return sleepUnless(FIRST_ARM_MS, isCancelled);
+                }
+                return isCancelled();
+              },
+              isCancelled: () => cancelRef.current,
+              isInterrupted: () => interruptRef.current,
+              onSession: (session) => {
+                modeSessionRef.current = session;
+                const progress = modeProgress(session);
+                if (progress) {
+                  setCommand(modeCommandProgress(progress));
+                }
+              },
+              onCommitted: (mode) => {
+                const at = new Date().toISOString();
+                commit((prev) => {
+                  const climate = reduceClimate(climateOf(prev), { type: 'recalibrate-mode', mode });
+                  return appendLog(
+                    applyClimate(prev, climate.state),
+                    'press',
+                    `Mode bot press. The thermostat is ${modeLabel(mode)}.`,
+                    at,
+                  );
+                });
+                pressFeedback();
+              },
+            });
+            modeSessionRef.current = idleModeSession();
+            if (settled.status === 'ambiguous') {
+              showMessage({ source: 'press', text: CHECK_THERMOSTAT });
+              errorFeedback();
+              void notifyCheckThermostat(CHECK_THERMOSTAT);
+            }
+            return { status: settled.status, reason: settled.reason, reached: settled.tracked };
+          },
           execute: async (nextTarget) => {
             const result = await runTarget(nextTarget, { kind: 'schedule' });
             if (result.status === 'done' || result.status === 'already' || result.status === 'cancelled' || result.status === 'busy') {
@@ -1246,7 +1317,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         tickLock.current = false;
       }
     },
-    [commitShared, pullShared, runTarget, showMessage],
+    [commit, commitShared, pullShared, runTarget, showMessage],
   );
 
   tickImpl.current = tick;
@@ -1284,7 +1355,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [applyConnection, connection]);
 
   useEffect(() => {
-    if (!ready || (state.virtualSetpoint === null && state.mode !== 'live')) {
+    if (!ready) {
       return;
     }
     void tickImpl.current(new Date());
@@ -1359,7 +1430,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         document.removeEventListener('visibilitychange', onVisible);
       }
     };
-  }, [applyConnection, commit, ready, state.virtualSetpoint === null && state.mode !== 'live']);
+  }, [applyConnection, commit, ready]);
 
   useEffect(() => {
     return watchNotificationOpen(() => {
@@ -1603,6 +1674,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       throw new PressOutcomeError(explainError(error), 'rejected');
     }
   }, []);
+
+  useEffect(() => {
+    pressModeRef.current = pressMode;
+  }, [pressMode]);
 
   const showModeProgress = useCallback((progress: { index: number; total: number; target: KnownMode; label: 'press' | 'finishing' }) => {
     setCommand(modeCommandProgress(progress));
@@ -2129,7 +2204,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               catchupFrom: prev.virtualSetpoint === null ? prev.catchupFrom : reset ? at : prev.catchupFrom,
             },
             'schedule',
-            `Updated ${event.label} · ${formatClock(event.hour, event.minute)} · ${event.targetF}°.`,
+            `Updated ${event.label} · ${formatClock(event.hour, event.minute)} · ${event.targetF}°${event.mode ? ` · ${modeLabel(event.mode)}` : ''}.`,
             at,
           );
         });

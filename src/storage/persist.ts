@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { LOCAL_HISTORY_CAP, type HistorySample, type SetpointChange } from '@/domain/history';
-import { defaultEvents, normalizeStatus, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
+import { defaultEvents, eventMode, normalizeStatus, type HoldState, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
 import { initialClimate } from '@/devices/simulator';
 import { isSystemMode, modeStepOf } from '@/domain/systemMode';
 import { activeDegrees } from '@/domain/modeSetpoint';
@@ -174,7 +174,15 @@ function cleanEvents(value: ScheduleEvent[] | undefined): ScheduleEvent[] {
   if (!Array.isArray(value)) {
     return defaultEvents();
   }
-  return value.filter((event) => event && typeof event.id === 'string' && Array.isArray(event.days));
+  return value.filter((event) => event && typeof event.id === 'string' && Array.isArray(event.days)).map((event) => {
+    const mode = eventMode(event.mode);
+    if (!mode) {
+      const next = { ...event };
+      delete next.mode;
+      return next;
+    }
+    return { ...event, mode };
+  });
 }
 
 function cleanHold(value: unknown, events: ScheduleEvent[]): HoldState {

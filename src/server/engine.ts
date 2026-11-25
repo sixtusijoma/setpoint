@@ -12,7 +12,8 @@ import {
   type PressSession,
 } from '../domain/pressSession';
 import { isKnownMode, modeStepOf, type KnownMode, type SystemMode } from '../domain/systemMode';
-import { holdFor, scheduleEditResetsCursor, type ScheduleEvent } from '../domain/schedule';
+import { holdFor, planDue, scheduleEditResetsCursor, type ScheduleEvent } from '../domain/schedule';
+import type { ModePressReport } from '../domain/scheduleApply';
 import { runDueSchedule } from '../domain/scheduleRunner';
 import type { HistorySample } from '../domain/history';
 import { SWITCHBOT_TIMEOUT_MS } from '../devices/switchbot';
@@ -206,33 +207,53 @@ export async function runSchedulerTick(
     now?: () => Date;
     timing?: PressTiming;
     press: (direction: Direction, signal: AbortSignal) => Promise<void>;
+    pressMode: (signal: AbortSignal) => Promise<void>;
   },
-): Promise<{ apply: string | null; note: string | null }> {
+): Promise<{ apply: string | null; note: string | null; notifyCheck: boolean }> {
   const now = input.now ?? (() => new Date());
+  const at = now();
   const state = await db.readState();
+  if (state.mode !== 'live') {
+    return { apply: null, note: null, notifyCheck: false };
+  }
   const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
-  if (state.mode !== 'live' || active.status !== 'active') {
-    return { apply: null, note: state.mode === 'live' ? refusalFor(active) : null };
+  const preview = planDue({
+    events: state.events,
+    records: state.records,
+    now: at,
+    hold: state.hold,
+    catchupFrom: state.catchupFrom,
+    retryFailed: state.schedulePhase === 'armed',
+    step: state.settings.step,
+  });
+  if (!preview.apply?.mode && active.status !== 'active') {
+    return { apply: null, note: refusalFor(active), notifyCheck: false };
   }
   const lease = await db.readLease();
-  if (lease.phase === 'running' && lease.leaseUntil && Date.parse(lease.leaseUntil) > now().getTime()) {
-    return { apply: null, note: null };
+  if (lease.phase === 'running' && lease.leaseUntil && Date.parse(lease.leaseUntil) > at.getTime()) {
+    return { apply: null, note: null, notifyCheck: false };
   }
+  const owner = input.owner ?? 'scheduler';
   const outcome = await runDueSchedule({
-    now: now(),
+    now: at,
     events: state.events,
     records: state.records,
     hold: state.hold,
-    setpoint: active.degrees,
+    climate: {
+      systemMode: state.systemMode,
+      heatSetpoint: state.heatSetpoint,
+      coolSetpoint: state.coolSetpoint,
+    },
     catchupFrom: state.catchupFrom,
     retryFailed: state.schedulePhase === 'armed',
     step: state.settings.step,
     schedulePhase: state.schedulePhase,
+    pressMode: (target) => pressScheduledMode(db, { target, owner, now, timing: input.timing, press: input.pressMode }),
     execute: async (target) => {
       const result = await executeSharedPress(db, {
         target,
         source: { kind: 'schedule' },
-        owner: input.owner ?? 'scheduler',
+        owner,
         now,
         timing: input.timing,
         press: input.press,
@@ -257,7 +278,28 @@ export async function runSchedulerTick(
     catchupNote: outcome.catchupNote,
   });
   const applied = outcome.records.find((record) => record.via === 'catch-up' || record.via === 'scheduler');
-  return { apply: applied?.label ?? null, note: outcome.catchupNote };
+  return { apply: applied?.label ?? null, note: outcome.catchupNote, notifyCheck: outcome.notifyCheck };
+}
+
+async function pressScheduledMode(
+  db: SetpointDb,
+  input: {
+    target: KnownMode;
+    owner: string;
+    now: () => Date;
+    timing?: PressTiming;
+    press: (signal: AbortSignal) => Promise<void>;
+  },
+): Promise<ModePressReport> {
+  const result = await executeModePress(db, {
+    target: input.target,
+    source: { kind: 'set-mode' },
+    owner: input.owner,
+    now: input.now,
+    timing: input.timing,
+    press: input.press,
+  });
+  return { status: result.status, reason: result.reason, reached: result.systemMode };
 }
 
 export async function storeMeterRead(db: SetpointDb, sample: HistorySample): Promise<void> {
@@ -275,10 +317,38 @@ function normalizeDays(days: number[] | undefined): number[] | undefined {
   return next;
 }
 
-function createdEvent(
-  eventId: string,
-  patch: Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>>,
-): ScheduleEvent {
+export type ScheduleEventPatch = Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>> & {
+  mode?: KnownMode | null;
+};
+
+type StoredMode = 'omit' | 'clear' | KnownMode;
+
+function storedMode(mode: KnownMode | null | undefined): StoredMode {
+  if (mode === undefined) {
+    return 'omit';
+  }
+  if (mode === null) {
+    return 'clear';
+  }
+  if (!isKnownMode(mode)) {
+    throw new Error('Mode must be heat, cool, or off.');
+  }
+  return mode;
+}
+
+function withStoredMode(event: ScheduleEvent, mode: StoredMode): ScheduleEvent {
+  if (mode === 'omit') {
+    return event;
+  }
+  if (mode === 'clear') {
+    const next = { ...event };
+    delete next.mode;
+    return next;
+  }
+  return { ...event, mode };
+}
+
+function createdEvent(eventId: string, patch: ScheduleEventPatch, mode: StoredMode): ScheduleEvent {
   if (
     !eventId ||
     typeof patch.label !== 'string' ||
@@ -290,25 +360,29 @@ function createdEvent(
   ) {
     throw new Error('To add an event, provide label, hour, minute, targetF, and days.');
   }
-  return {
-    id: eventId,
-    label: patch.label.trim(),
-    hour: patch.hour,
-    minute: patch.minute,
-    targetF: patch.targetF,
-    days: patch.days,
-    enabled: patch.enabled ?? true,
-  };
+  return withStoredMode(
+    {
+      id: eventId,
+      label: patch.label.trim(),
+      hour: patch.hour,
+      minute: patch.minute,
+      targetF: patch.targetF,
+      days: patch.days,
+      enabled: patch.enabled ?? true,
+    },
+    mode,
+  );
 }
 
 export async function editScheduleEvent(
   db: SetpointDb,
   eventId: string,
-  patch: Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>>,
+  patch: ScheduleEventPatch,
   now = new Date(),
 ): Promise<SharedSnapshot> {
   const state = await db.readState();
   const days = normalizeDays(patch.days);
+  const mode = storedMode(patch.mode);
   const clean: Partial<Pick<ScheduleEvent, 'label' | 'hour' | 'minute' | 'targetF' | 'days' | 'enabled'>> = {};
   if (typeof patch.label === 'string') {
     clean.label = patch.label;
@@ -330,13 +404,13 @@ export async function editScheduleEvent(
   }
   const current = state.events.find((event) => event.id === eventId);
   if (!current) {
-    const created = createdEvent(eventId, clean);
+    const created = createdEvent(eventId, clean, mode);
     return patchRetry(db, {
       events: [...state.events, created],
       catchupFrom: state.catchupFrom,
     });
   }
-  const next: ScheduleEvent = { ...current, ...clean, id: current.id };
+  const next = withStoredMode({ ...current, ...clean, id: current.id }, mode);
   const events = state.events.map((event) => (event.id === eventId ? next : event));
   const reset = scheduleEditResetsCursor(current, next);
   return patchRetry(db, {

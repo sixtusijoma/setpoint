@@ -27,6 +27,7 @@ import {
 import { handleMcp } from './mcp';
 import { createRestDb } from './restDb';
 import { defaultEvents } from '../domain/schedule';
+import { advanceMode, type KnownMode } from '../domain/systemMode';
 import { createSqlDb, type SetpointDb } from './sqlDb';
 
 const migration = [
@@ -35,6 +36,7 @@ const migration = [
   'supabase/migrations/20261112180000_setpoint_change_pages.sql',
   'supabase/migrations/20261113090000_history_windows.sql',
   'supabase/migrations/20261118120000_system_mode.sql',
+  'supabase/migrations/20261125120000_schedule_event_mode.sql',
 ]
   .map((file) => readFileSync(path.join(process.cwd(), file), 'utf8'))
   .join('\n');
@@ -51,6 +53,10 @@ const settings = { step: 1, delayMs: 0, minF: 50, maxF: 85, pressCap: 15, wakeFi
 const wednesdayMorning = new Date('2026-11-11T15:00:00.000Z');
 
 const gaps: number[] = [];
+const noModePress = async () => {
+  throw new Error('mode press was not expected');
+};
+
 const fast = {
   sleep: async (ms: number, isCancelled: () => boolean) => {
     gaps.push(ms);
@@ -220,7 +226,7 @@ describe('shared server', () => {
 
     gaps.length = 0;
     await db.patchState(null, { hold: null, virtualSetpoint: 68, catchupFrom: '2026-11-11T01:00:00.000Z' });
-    const tick = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined });
+    const tick = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined, pressMode: noModePress });
     expect(tick.apply).not.toBeNull();
     expect(gaps).toEqual([6000]);
   });
@@ -342,6 +348,7 @@ describe('shared server', () => {
     const outcome = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
       timing: fast,
+      pressMode: noModePress,
       press: async (direction) => {
         presses.push(direction);
       },
@@ -365,7 +372,7 @@ describe('shared server', () => {
     }, { now: () => wednesdayMorning, armMs: 0, timing: fast, press: async () => undefined });
     const skippedText = textOf(skipped);
     expect(skippedText).toContain('default-wake');
-    const quiet = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined });
+    const quiet = await runSchedulerTick(db, { now: () => wednesdayMorning, timing: fast, press: async () => undefined, pressMode: noModePress });
     expect(quiet.apply).toBeNull();
     const state = await db.readState();
     const skip = state.records.find((record) => record.eventId === 'default-wake' && record.status === 'skipped');
@@ -403,6 +410,7 @@ describe('shared server', () => {
     const again = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
       timing: fast,
+      pressMode: noModePress,
       press: async () => {
         throw new Error('should not press a finished wake');
       },
@@ -518,6 +526,7 @@ describe('shared server', () => {
       const outcome = await runSchedulerTick(db, {
         now: () => wednesdayMorning,
         timing: fast,
+        pressMode: noModePress,
         press: async (direction) => {
           presses.push(direction);
         },
@@ -535,6 +544,7 @@ describe('shared server', () => {
       const outcome = await runSchedulerTick(db, {
         now: () => wednesdayMorning,
         timing: fast,
+        pressMode: noModePress,
         press: async () => {
           throw new Error('should not press a Wake that passed while disabled');
         },
@@ -1694,22 +1704,409 @@ describe('shared server', () => {
     const outcome = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
       timing: fast,
+      pressMode: noModePress,
       press: async (direction) => {
         presses.push(direction);
       },
     });
-    expect(outcome).toEqual({ apply: null, note: null });
+    expect(outcome).toEqual({ apply: null, note: null, notifyCheck: false });
     expect(presses).toEqual([]);
     await db.releaseLease('app');
     const afterRelease = await runSchedulerTick(db, {
       now: () => wednesdayMorning,
       timing: fast,
+      pressMode: noModePress,
       press: async (direction) => {
         presses.push(direction);
       },
     });
     expect(afterRelease.apply).toMatch(/Wake/);
     expect(presses).toHaveLength(6);
+  });
+
+  describe('schedule event mode', () => {
+    const eightThirty = new Date('2026-11-11T13:30:00.000Z');
+
+    function simulatedDevice(start: { mode: KnownMode; heat: number; cool: number; step: 1 | 2 }) {
+      const device = {
+        mode: start.mode,
+        heat: start.heat,
+        cool: start.cool,
+        modePresses: 0,
+        tempPresses: [] as string[],
+      };
+      let loseNext = false;
+      return {
+        device,
+        loseNext() {
+          loseNext = true;
+        },
+        async pressMode() {
+          if (loseNext) {
+            loseNext = false;
+            throw new PressOutcomeError('The response was lost.', 'ambiguous');
+          }
+          device.mode = advanceMode(device.mode, start.step);
+          device.modePresses += 1;
+        },
+        async press(direction: 'up' | 'down') {
+          if (device.mode === 'off') {
+            throw new Error('temperature press while Off');
+          }
+          if (loseNext) {
+            loseNext = false;
+            throw new PressOutcomeError('The response was lost.', 'ambiguous');
+          }
+          if (device.mode === 'heat') {
+            device.heat += direction === 'up' ? 1 : -1;
+          } else {
+            device.cool += direction === 'up' ? 1 : -1;
+          }
+          device.tempPresses.push(direction);
+        },
+      };
+    }
+
+    async function storedRow() {
+      const rows = await pg.query<{ system_mode: string; heat_setpoint: number | null; cool_setpoint: number | null; events: unknown }>(
+        'select system_mode, heat_setpoint, cool_setpoint, events from public.shared_state where id = 1',
+      );
+      const row = rows.rows[0];
+      if (!row) {
+        throw new Error('shared_state row missing');
+      }
+      const events = typeof row.events === 'string' ? JSON.parse(row.events) : row.events;
+      return { ...row, events };
+    }
+
+    async function arm(
+      events: Record<string, unknown>[],
+      extra: { systemMode?: KnownMode; modeStep?: 1 | 2; heat?: number; cool?: number } = {},
+    ) {
+      const systemMode = extra.systemMode ?? 'heat';
+      const heat = extra.heat ?? 70;
+      const cool = extra.cool ?? 74;
+      await db.patchState(null, {
+        mode: 'live',
+        settings: { ...settings, modeStep: extra.modeStep ?? 2 },
+        deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+        systemMode,
+        heatSetpoint: heat,
+        coolSetpoint: cool,
+        events,
+        records: [],
+        schedulePhase: 'armed',
+        catchupFrom: '2026-11-11T11:00:00.000Z',
+      });
+    }
+
+    it('skips the mode press when the thermostat is already in that mode, then sets the temperature', async () => {
+      const sim = simulatedDevice({ mode: 'heat', heat: 70, cool: 74, step: 2 });
+      await arm([{ id: 'morning', label: 'Morning', hour: 8, minute: 0, targetF: 72, days: [3], enabled: true, mode: 'heat' }]);
+      const outcome = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(outcome).toMatchObject({ apply: 'Morning', notifyCheck: false });
+      expect(sim.device.modePresses).toBe(0);
+      expect(sim.device.tempPresses).toEqual(['up', 'up']);
+      expect(sim.device).toMatchObject({ mode: 'heat', heat: 72, cool: 74 });
+      const row = await storedRow();
+      expect(row).toMatchObject({ system_mode: 'heat', heat_setpoint: 72, cool_setpoint: 74 });
+      expect(row.events[0].mode).toBe('heat');
+    });
+
+    it('switches mode before setting that mode setpoint', async () => {
+      const sim = simulatedDevice({ mode: 'heat', heat: 70, cool: 74, step: 2 });
+      await arm([{ id: 'evening', label: 'Evening', hour: 8, minute: 0, targetF: 76, days: [3], enabled: true, mode: 'cool' }]);
+      const outcome = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(outcome.notifyCheck).toBe(false);
+      expect(sim.device.modePresses).toBe(1);
+      expect(sim.device.tempPresses).toEqual(['up', 'up']);
+      expect(sim.device).toMatchObject({ mode: 'cool', heat: 70, cool: 76 });
+      const row = await storedRow();
+      expect(row).toMatchObject({ system_mode: 'cool', heat_setpoint: 70, cool_setpoint: 76 });
+    });
+
+    it('switches to Off and presses no temperature buttons', async () => {
+      const sim = simulatedDevice({ mode: 'heat', heat: 70, cool: 74, step: 1 });
+      await arm(
+        [{ id: 'away', label: 'Away', hour: 8, minute: 0, targetF: 80, days: [3], enabled: true, mode: 'off' }],
+        { modeStep: 1 },
+      );
+      const outcome = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(outcome).toMatchObject({ apply: 'Away', notifyCheck: false });
+      expect(sim.device.modePresses).toBe(1);
+      expect(sim.device.tempPresses).toEqual([]);
+      expect(sim.device.mode).toBe('off');
+      const row = await storedRow();
+      expect(row.system_mode).toBe('off');
+      expect(row.heat_setpoint).toBe(70);
+      expect(row.cool_setpoint).toBe(74);
+      const state = await db.readState();
+      expect(state.virtualSetpoint).toBeNull();
+      expect(state.records.find((record) => record.label === 'Away')?.message).toContain('No temperature presses');
+      expect(state.schedulePhase).toBe('armed');
+    });
+
+    it('stops on a lost mode press, leaves later schedules armed, and applies only the latest missed change', async () => {
+      const sim = simulatedDevice({ mode: 'heat', heat: 70, cool: 74, step: 2 });
+      sim.loseNext();
+      await arm([
+        { id: 'early', label: 'Early', hour: 8, minute: 0, targetF: 76, days: [3], enabled: true, mode: 'cool' },
+        { id: 'later', label: 'Later', hour: 9, minute: 0, targetF: 72, days: [3], enabled: true },
+      ]);
+      const lost = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(lost.notifyCheck).toBe(true);
+      expect(sim.device.modePresses).toBe(0);
+      expect(sim.device.tempPresses).toEqual([]);
+      expect(sim.device.mode).toBe('heat');
+      const afterLost = await db.readState();
+      expect(afterLost.schedulePhase).toBe('armed');
+      expect(afterLost.systemMode).toBe('heat');
+      expect(afterLost.records.find((record) => record.label === 'Early')).toMatchObject({ status: 'ambiguous' });
+      expect(afterLost.records.find((record) => record.label === 'Early')?.message).toContain('Later schedules still run');
+
+      const later = await runSchedulerTick(db, {
+        now: () => wednesdayMorning,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(later.notifyCheck).toBe(false);
+      const afterLater = await db.readState();
+      expect(afterLater.records.find((record) => record.label === 'Early')?.status).toBe('ambiguous');
+      expect(afterLater.records.find((record) => record.label === 'Later')?.status).toBe('done-late');
+      expect(afterLater.schedulePhase).toBe('armed');
+      expect(sim.device.modePresses).toBe(0);
+      expect(sim.device.tempPresses).toEqual(['up', 'up']);
+      expect(sim.device).toMatchObject({ mode: 'heat', heat: 72, cool: 74 });
+      expect((await storedRow()).heat_setpoint).toBe(72);
+
+      const both = simulatedDevice({ mode: 'heat', heat: 70, cool: 74, step: 2 });
+      await arm([
+        { id: 'first', label: 'First', hour: 7, minute: 0, targetF: 60, days: [3], enabled: true, mode: 'off' },
+        { id: 'second', label: 'Second', hour: 9, minute: 0, targetF: 74, days: [3], enabled: true, mode: 'cool' },
+      ]);
+      const latest = await runSchedulerTick(db, {
+        now: () => wednesdayMorning,
+        timing: fast,
+        pressMode: both.pressMode,
+        press: both.press,
+      });
+      expect(latest.note).toBe('First was missed, applied Second.');
+      expect(both.device.modePresses).toBe(1);
+      expect(both.device.tempPresses).toEqual([]);
+      expect(both.device).toMatchObject({ mode: 'cool', heat: 70, cool: 74 });
+      const state = await db.readState();
+      expect(state.records.find((record) => record.label === 'First')?.status).toBe('missed');
+      expect(state.systemMode).toBe('cool');
+    });
+
+    it('leaves an Off thermostat alone until an event names a mode', async () => {
+      await arm([{ id: 'plain', label: 'Plain', hour: 8, minute: 0, targetF: 72, days: [3], enabled: true }], { systemMode: 'off' });
+      const quiet = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: async () => {
+          throw new Error('no mode on this event');
+        },
+        press: async () => {
+          throw new Error('no temperature while Off');
+        },
+      });
+      expect(quiet.apply).toBeNull();
+      expect(quiet.note).toContain('Off');
+      expect((await db.readState()).records).toEqual([]);
+
+      const sim = simulatedDevice({ mode: 'off', heat: 70, cool: 74, step: 2 });
+      await arm(
+        [{ id: 'return', label: 'Return', hour: 8, minute: 0, targetF: 72, days: [3], enabled: true, mode: 'heat' }],
+        { systemMode: 'off' },
+      );
+      const outcome = await runSchedulerTick(db, {
+        now: () => eightThirty,
+        timing: fast,
+        pressMode: sim.pressMode,
+        press: sim.press,
+      });
+      expect(outcome.apply).toBe('Return');
+      expect(sim.device.modePresses).toBe(1);
+      expect(sim.device.tempPresses).toEqual(['up', 'up']);
+      expect(sim.device).toMatchObject({ mode: 'heat', heat: 72 });
+      expect((await storedRow()).system_mode).toBe('heat');
+    });
+
+    it('accepts mode on edit_schedule, returns it from show_schedule, and checks the stored events', async () => {
+      const listed = await handleMcp(db, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const tools = (listed.result as { tools: { name: string; inputSchema: { properties: Record<string, { enum?: unknown[] }> } }[] }).tools;
+      expect(tools.find((tool) => tool.name === 'edit_schedule')?.inputSchema.properties.mode?.enum).toEqual(['heat', 'cool', 'off', null]);
+
+      await db.patchState(null, { catchupFrom: '2026-11-01T00:00:00.000Z' });
+      const call = (id: number, args: Record<string, unknown>) =>
+        handleMcp(
+          db,
+          { jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'edit_schedule', arguments: args } },
+          { now: () => wednesdayMorning },
+        );
+      const created = await call(2, {
+        eventId: 'evening',
+        label: 'Evening',
+        hour: 18,
+        minute: 30,
+        targetF: 68,
+        days: [1, 2, 3, 4, 5],
+        mode: 'heat',
+      });
+      const createdBody = JSON.parse(textOf(created)) as { events: { id: string; mode?: string }[]; catchupFrom: string };
+      expect(createdBody.catchupFrom).toContain('2026-11-01');
+      expect(createdBody.events.find((event) => event.id === 'evening')?.mode).toBe('heat');
+      const shown = JSON.parse(textOf(await handleMcp(db, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'show_schedule', arguments: {} },
+      }))) as { events: { id: string; mode?: string }[]; summary: string[] };
+      expect(shown.events.find((event) => event.id === 'evening')?.mode).toBe('heat');
+      expect(shown.summary.find((line) => line.startsWith('Evening'))).toContain('Heat');
+      const row = await storedRow();
+      expect(row.events.find((event: { id: string }) => event.id === 'evening').mode).toBe('heat');
+
+      const renamed = await call(4, { eventId: 'evening', label: 'Evening heat' });
+      const renamedBody = JSON.parse(textOf(renamed)) as { events: { id: string; mode?: string; label: string }[]; catchupFrom: string };
+      expect(renamedBody.catchupFrom).toContain('2026-11-01');
+      expect(renamedBody.events.find((event) => event.id === 'evening')).toMatchObject({ label: 'Evening heat', mode: 'heat' });
+
+      const cooled = await call(5, { eventId: 'evening', mode: 'cool' });
+      expect(Date.parse(JSON.parse(textOf(cooled)).catchupFrom)).toBe(wednesdayMorning.getTime());
+      expect(JSON.parse(textOf(cooled)).events.find((event: { id: string }) => event.id === 'evening').mode).toBe('cool');
+
+      await db.patchState(null, { catchupFrom: '2026-11-01T00:00:00.000Z' });
+      const cleared = await call(6, { eventId: 'evening', mode: null });
+      const clearedEvent = JSON.parse(textOf(cleared)).events.find((event: { id: string }) => event.id === 'evening');
+      expect(clearedEvent.mode).toBeUndefined();
+      expect(JSON.parse(textOf(cleared)).catchupFrom).not.toContain('2026-11-01');
+      expect((await storedRow()).events.find((event: { id: string }) => event.id === 'evening').mode).toBeUndefined();
+
+      const invalid = await call(7, { eventId: 'evening', mode: 'fan' });
+      expect((invalid.result as { isError?: boolean }).isError).toBe(true);
+      expect(textOf(invalid)).toContain('heat, cool, or off');
+    });
+
+    it('runs an event with a mode now, and stops when that mode press is lost or unmapped', async () => {
+      await db.patchState(null, {
+        settings: { ...settings, modeStep: 2 },
+        deviceMap: { up: bot('up'), down: bot('down'), mode: bot('mode'), meter: { ...bot('meter'), deviceType: 'Meter' } },
+        systemMode: 'heat',
+        heatSetpoint: 70,
+        coolSetpoint: 70,
+        virtualSetpoint: 70,
+      });
+      await editScheduleEvent(db, 'default-wake', { mode: 'cool' }, wednesdayMorning);
+      const presses: string[] = [];
+      const ran = await handleMcp(db, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'run_schedule_now', arguments: { eventId: 'default-wake' } },
+      }, {
+        now: () => wednesdayMorning,
+        armMs: 0,
+        timing: fast,
+        press: async (direction) => {
+          presses.push(direction);
+        },
+        pressMode: async () => {
+          presses.push('mode');
+        },
+      });
+      const body = JSON.parse(textOf(ran)) as { status: string; modeNote: { kind: string; mode: string }; step: string };
+      expect(body.status).toBe('done');
+      expect(body.modeNote).toEqual({ kind: 'switched', mode: 'cool' });
+      expect(body.step).toBe('mode');
+      expect(presses).toEqual(['mode']);
+      expect((await db.readState()).systemMode).toBe('cool');
+
+      await db.patchState(null, { systemMode: 'heat', records: [], virtualSetpoint: 70 });
+      const lost = await handleMcp(db, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'run_schedule_now', arguments: { eventId: 'default-wake' } },
+      }, {
+        now: () => wednesdayMorning,
+        armMs: 0,
+        timing: fast,
+        press: async () => {
+          throw new Error('temperature waits');
+        },
+        pressMode: async () => {
+          throw new PressOutcomeError('The response was lost.', 'ambiguous');
+        },
+      });
+      const lostBody = JSON.parse(textOf(lost)) as { status: string; notifyCheck: boolean };
+      expect(lostBody.status).toBe('ambiguous');
+      expect(lostBody.notifyCheck).toBe(true);
+      expect((await db.readState()).systemMode).toBe('heat');
+
+      const unmapped = await handleMcp(db, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'run_schedule_now', arguments: { eventId: 'default-wake' } },
+      }, {
+        now: () => wednesdayMorning,
+        armMs: 0,
+        timing: fast,
+        press: async () => undefined,
+      });
+      expect(textOf(unmapped)).toContain('Map the mode bot');
+    });
+
+    it('refuses a schedule tick outside live mode and rejects a bad event mode', async () => {
+      await db.patchState(null, { mode: 'demo' });
+      const quiet = await runSchedulerTick(db, {
+        now: () => wednesdayMorning,
+        timing: fast,
+        press: async () => {
+          throw new Error('demo does not press');
+        },
+        pressMode: async () => {
+          throw new Error('demo does not press');
+        },
+      });
+      expect(quiet).toEqual({ apply: null, note: null, notifyCheck: false });
+      await expect(editScheduleEvent(db, 'default-wake', { mode: 'fan' as 'heat' })).rejects.toThrow(/heat, cool, or off/);
+      await expect(editScheduleEvent(db, 'new-event', { mode: 'heat' })).rejects.toThrow(/label, hour, minute/);
+    });
+
+    it('rejects an event mode outside heat, cool, and off', async () => {
+      await expect(
+        pg.exec(`update public.shared_state set events = '[{"id":"bad","mode":"fan"}]'::jsonb where id = 1`),
+      ).rejects.toThrow(/shared_state_events_mode_check/);
+      await pg.exec(
+        `update public.shared_state set events = '[{"id":"plain"},{"id":"heat","mode":"heat"},{"id":"empty","mode":null}]'::jsonb where id = 1`,
+      );
+      const row = await storedRow();
+      expect(row.events.map((event: { mode?: string | null }) => event.mode ?? null)).toEqual([null, 'heat', null]);
+    });
   });
 });
 
