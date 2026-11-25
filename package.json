@@ -40,8 +40,10 @@
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.16",
+    "@playwright/test": "^1.58.2",
     "@types/luxon": "^3.7.6",
     "@types/react": "~19.3.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "eslint": "^9.0.0",
     "eslint-config-expo": "~58.0.4",
     "typescript": "~6.0.3",
@@ -54,6 +56,8 @@
     "web": "expo start --web --port 43117 --host lan",
     "lint": "expo lint",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit"
   },
   "private": true

@@ -368,6 +368,7 @@ export async function handleTick(request: Request, options: HandlerOptions): Pro
     now: options.now,
     timing: options.timing,
     press: await pressWith(options, state),
+    pressMode: await pressModeWith(options, state),
   });
   return json(request, options.env, result);
 }

@@ -114,6 +114,10 @@ describe('schedule edits, chip, and catch-up copy', () => {
     expect(scheduleEditResetsCursor(sleep, { ...sleep, days: [1, 2, 3, 4, 5, 6] })).toBe(false);
     expect(scheduleEditResetsCursor(sleep, { ...sleep, minute: 50 })).toBe(true);
     expect(scheduleEditResetsCursor(sleep, { ...sleep, targetF: 62 })).toBe(true);
+    expect(scheduleEditResetsCursor(sleep, { ...sleep, mode: 'heat' })).toBe(true);
+    expect(scheduleEditResetsCursor({ ...sleep, mode: 'heat' }, { ...sleep, mode: 'heat' })).toBe(false);
+    expect(scheduleEditResetsCursor({ ...sleep, mode: 'heat' }, { ...sleep, mode: 'cool' })).toBe(true);
+    expect(scheduleEditResetsCursor({ ...sleep, mode: 'cool' }, sleep)).toBe(true);
   });
 
   it('resets the cursor when an event is re-enabled, not when it is disabled', () => {

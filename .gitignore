@@ -3,6 +3,12 @@
 # dependencies
 node_modules/
 
+# test output
+coverage/
+test-results/
+playwright-report/
+blob-report/
+
 # Expo
 .expo/
 dist/

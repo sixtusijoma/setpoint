@@ -1,6 +1,7 @@
 import { ConfirmDialog, PillButton, Sheet, Stepper } from '@/components/ui';
 import { upcomingForEvent } from '@/domain/occurrences';
 import { latestRecord, nextOccurrence, openCancelled, upcomingOccurrences, type RunRecord, type ScheduleEvent } from '@/domain/schedule';
+import { modeLabel, type KnownMode } from '@/domain/systemMode';
 import { TIME_ZONE_LABEL, dayNames, formatClock, formatInstant, to12Hour, to24Hour } from '@/domain/time';
 import { useApp } from '@/state/store';
 import { colors, fonts } from '@/theme';
@@ -9,6 +10,26 @@ import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const DAY_LABELS = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+
+const MODE_CHOICES: { id: 'keep' | KnownMode; label: string; mode: KnownMode | null }[] = [
+  { id: 'keep', label: 'Keep current', mode: null },
+  { id: 'heat', label: 'Heat', mode: 'heat' },
+  { id: 'cool', label: 'Cool', mode: 'cool' },
+  { id: 'off', label: 'Off', mode: 'off' },
+];
+
+function withEventMode(event: ScheduleEvent, mode: KnownMode | null): ScheduleEvent {
+  if (mode === null) {
+    const next = { ...event };
+    delete next.mode;
+    return next;
+  }
+  return { ...event, mode };
+}
+
+function modePhrase(event: ScheduleEvent): string {
+  return event.mode ? modeLabel(event.mode) : 'Keeps mode';
+}
 
 export default function ScheduleScreen() {
   const app = useApp();
@@ -78,8 +99,8 @@ export default function ScheduleScreen() {
                 <Text style={styles.eventTitle}>{event.label}</Text>
                 <Text style={styles.eventTemp}>{event.targetF}°</Text>
               </View>
-              <Text style={styles.body}>
-                {dayNames(event.days)} · {formatClock(event.hour, event.minute)}
+              <Text testID={`event-mode-${event.id}`} style={styles.body}>
+                {dayNames(event.days)} · {formatClock(event.hour, event.minute)} · {modePhrase(event)}
                 {event.enabled ? '' : ' · off'}
               </Text>
             </Pressable>
@@ -133,7 +154,7 @@ export default function ScheduleScreen() {
       </Text>
       {reminders.map((item) => (
         <Text key={item.key} style={styles.reminder}>
-          {item.label} · set to {item.targetF}° · {formatInstant(item.at, true)}
+          {item.label} · set to {item.targetF}°{item.mode ? ` · ${modeLabel(item.mode)}` : ''} · {formatInstant(item.at, true)}
         </Text>
       ))}
       <PillButton label="Restore defaults" tone="ghost" testID="restore-defaults" onPress={() => setRestoreOpen(true)} />
@@ -272,8 +293,10 @@ function Editor({
   const [error, setError] = useState<string | null>(null);
   const clock = to12Hour(draft.hour);
   const aligned = setpoint === null || (draft.targetF - setpoint) % step === 0;
+  const modeId = draft.mode ?? 'keep';
   return (
     <Sheet visible onClose={onClose}>
+      <ScrollView style={styles.editorScrollView} contentContainerStyle={styles.editorScroll}>
       <Text style={styles.editorTitle}>Edit event</Text>
       <TextInput
         value={draft.label}
@@ -342,6 +365,24 @@ function Editor({
           );
         })}
       </View>
+      <Text style={styles.kicker}>Mode</Text>
+      <View style={styles.modeRow}>
+        {MODE_CHOICES.map((choice) => {
+          const selected = modeId === choice.id;
+          return (
+            <Pressable
+              key={choice.id}
+              testID={`mode-${choice.id}`}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
+              style={[styles.modeChip, selected && styles.modeChipOn]}
+              onPress={() => setDraft(withEventMode(draft, choice.mode))}
+            >
+              <Text style={styles.modeChipText}>{choice.label}</Text>
+            </Pressable>
+          );
+        })}
+      </View>
       <Stepper
         value={`${draft.targetF}°`}
         onMinus={() => setDraft({ ...draft, targetF: Math.max(minF, draft.targetF - step) })}
@@ -377,6 +418,7 @@ function Editor({
         }}
       />
       <PillButton label="Delete" tone="ghost" onPress={onDelete} />
+      </ScrollView>
     </Sheet>
   );
 }
@@ -407,7 +449,20 @@ const styles = StyleSheet.create({
   cancelled: { backgroundColor: colors.card, borderRadius: 16, padding: 14, gap: 8 },
   section: { color: colors.text, fontFamily: fonts.semibold, fontSize: 18, marginTop: 8 },
   reminder: { color: colors.muted, fontFamily: fonts.body, fontSize: 14 },
+  editorScrollView: { maxHeight: 640 },
+  editorScroll: { gap: 14 },
   editorTitle: { color: colors.text, fontFamily: fonts.displayStrong, fontSize: 28 },
+  modeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  modeChip: {
+    minHeight: 44,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: colors.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modeChipOn: { backgroundColor: colors.coral },
+  modeChipText: { color: colors.text, fontFamily: fonts.semibold, fontSize: 14 },
   input: {
     backgroundColor: colors.bg,
     color: colors.text,

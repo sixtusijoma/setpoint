@@ -3,7 +3,8 @@ import { historyQuery } from '../domain/history';
 import { refusalFor, resolveActive } from '../domain/modeSetpoint';
 import { applyTransition, nextSkippable, occurrenceForRunNow, occurrenceOnDate } from '../domain/occurrences';
 import type { Occurrence, ScheduleEvent } from '../domain/schedule';
-import { isKnownMode } from '../domain/systemMode';
+import { performScheduleApply } from '../domain/scheduleApply';
+import { isKnownMode, modeLabel, type KnownMode } from '../domain/systemMode';
 import { dayNames, formatClock } from '../domain/time';
 import {
   deviceIds,
@@ -63,13 +64,13 @@ export const MCP_TOOLS = [
   {
     name: 'show_schedule',
     description:
-      'Show the shared schedule, skips, and recent occurrence states. Each event says enabled or disabled. Disabled events never run.',
+      'Show the shared schedule, skips, and recent occurrence states. Each event says enabled or disabled. Disabled events never run. mode is heat, cool, or off when the event switches the thermostat; otherwise the event leaves the mode alone.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'edit_schedule',
     description:
-      'Edit one schedule event, or create it when the id is new. Pass enabled=false to turn an event off (it stays in the list and never runs) and enabled=true to turn it back on. Time or temperature edits, and re-enabling a disabled event, reset the catch-up cursor. Days, renames, disabling, and new events do not.',
+      'Edit one schedule event, or create it when the id is new. Pass enabled=false to turn an event off (it stays in the list and never runs) and enabled=true to turn it back on. Time, temperature, or mode edits, and re-enabling a disabled event, reset the catch-up cursor. Days, renames, disabling, and new events do not. Pass mode heat, cool, or off to switch the thermostat when the event fires. Omit mode to leave the saved mode unchanged. Pass null so the event does not change the thermostat mode.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -80,6 +81,11 @@ export const MCP_TOOLS = [
         targetF: { type: 'number' },
         days: { type: 'array', items: { type: 'number' }, description: 'Weekdays to run, Monday=1 through Sunday=7. Must not be empty. To stop an event running, pass enabled=false instead.' },
         enabled: { type: 'boolean', description: 'true runs the event on its days, false turns it off without changing anything else.' },
+        mode: {
+          type: ['string', 'null'],
+          enum: ['heat', 'cool', 'off', null],
+          description: 'Thermostat mode when the event fires. Omit to leave the saved mode unchanged. null leaves the thermostat mode alone.',
+        },
       },
       required: ['eventId'],
     },
@@ -182,7 +188,21 @@ function describeEvent(event: ScheduleEvent): ScheduleEvent & { status: 'enabled
 }
 
 function summaryLine(event: ScheduleEvent): string {
-  return `${event.label} (${event.id}): ${event.enabled ? 'ENABLED' : 'DISABLED, will not run'} · ${formatClock(event.hour, event.minute)} · ${event.targetF}° · ${dayNames(event.days)}`;
+  const mode = event.mode ? ` · ${modeLabel(event.mode)}` : '';
+  return `${event.label} (${event.id}): ${event.enabled ? 'ENABLED' : 'DISABLED, will not run'} · ${formatClock(event.hour, event.minute)} · ${event.targetF}°${mode} · ${dayNames(event.days)}`;
+}
+
+function scheduleModeArgument(value: unknown): KnownMode | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
+    return null;
+  }
+  if (isKnownMode(value)) {
+    return value;
+  }
+  throw new Error('Mode must be heat, cool, or off, or null to leave the thermostat mode alone.');
 }
 
 async function callTool(db: SetpointDb, name: string | undefined, args: Record<string, unknown>, deps: ToolDeps): Promise<string> {
@@ -252,6 +272,7 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
       targetF: typeof args.targetF === 'number' ? args.targetF : undefined,
       days: Array.isArray(args.days) ? args.days.map((day) => Number(day)) : undefined,
       enabled: typeof args.enabled === 'boolean' ? args.enabled : undefined,
+      mode: scheduleModeArgument(args.mode),
     }, now());
     return JSON.stringify({ events: saved.events.map(describeEvent), catchupFrom: saved.catchupFrom });
   }
@@ -259,7 +280,7 @@ async function callTool(db: SetpointDb, name: string | undefined, args: Record<s
     return JSON.stringify(await skipTool(db, args, now));
   }
   if (name === 'run_schedule_now') {
-    return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press, deps.timing));
+    return JSON.stringify(await runNowTool(db, String(args.eventId ?? ''), now, press, deps.pressMode, deps.timing));
   }
   if (name === 'recalibrate') {
     const saved = await recalibrateShared(db, {
@@ -397,6 +418,7 @@ async function runNowTool(
   eventId: string,
   now: () => Date,
   press: (direction: 'up' | 'down', signal: AbortSignal) => Promise<void>,
+  pressMode: ((signal: AbortSignal) => Promise<void>) | undefined,
   pressTiming?: PressTiming,
 ): Promise<unknown> {
   await waitForActiveCommandLease(
@@ -407,28 +429,59 @@ async function runNowTool(
   );
   const state = await db.readState();
   const event = state.events.find((item) => item.id === eventId);
-  if (event && !event.enabled) {
+  if (!event) {
+    throw new Error('That schedule cannot run right now.');
+  }
+  if (!event.enabled) {
     throw new Error(`${event.label} is disabled, so it was not run. Enable it with edit_schedule (enabled=true) first.`);
   }
   const active = resolveActive(state.systemMode, { heat: state.heatSetpoint, cool: state.coolSetpoint });
-  if (!event || active.status !== 'active') {
-    throw new Error(active.status === 'active' ? 'That schedule cannot run right now.' : (refusalFor(active) ?? 'That schedule cannot run right now.'));
+  if (!event.mode && active.status !== 'active') {
+    throw new Error(refusalFor(active) ?? 'That schedule cannot run right now.');
   }
   const when = occurrenceForRunNow(state.events, eventId, now());
   if (!when) {
     throw new Error('That event has no occurrence to mark.');
   }
-  const result = await executeSharedPress(db, {
-    target: event.targetF,
-    source: { kind: 'run-now', eventId: event.id, label: event.label, occurrenceKey: when.key },
-    owner: 'mcp',
-    now,
-    armMs: 0,
-    timing: pressTiming,
-    press,
+  const previous = active.status === 'active' ? active.degrees : undefined;
+  const result = await performScheduleApply({
+    mode: event.mode ?? null,
+    targetF: event.targetF,
+    climate: { systemMode: state.systemMode, heatSetpoint: state.heatSetpoint, coolSetpoint: state.coolSetpoint },
+    pressMode: async (target) => {
+      const pressed = await executeModePress(db, {
+        target,
+        source: { kind: 'mcp' },
+        owner: 'mcp',
+        now,
+        timing: pressTiming,
+        press: pressMode ?? (async () => {
+          throw new Error('Map the mode bot before changing the thermostat mode.');
+        }),
+      });
+      return { status: pressed.status, reason: pressed.reason, reached: pressed.systemMode };
+    },
+    pressTemperature: async (target) => {
+      const pressed = await executeSharedPress(db, {
+        target,
+        source: { kind: 'run-now', eventId: event.id, label: event.label, occurrenceKey: when.key },
+        owner: 'mcp',
+        now,
+        armMs: 0,
+        timing: pressTiming,
+        press,
+      });
+      return { status: pressed.status, reason: pressed.reason, stoppedAt: pressed.stoppedAt, wanted: pressed.wanted };
+    },
   });
   if (result.status !== 'done' && result.status !== 'already') {
-    return result;
+    return {
+      status: result.status,
+      stoppedAt: result.stoppedAt,
+      wanted: result.wanted,
+      reason: result.reason,
+      notifyCheck: result.notifyCheck,
+    };
   }
   const latest = await db.readState();
   const timing = now().getTime() < Date.parse(when.at) ? 'early' : 'late';
@@ -437,7 +490,7 @@ async function runNowTool(
     when,
     { type: 'run-now', when: timing },
     now().toISOString(),
-    { via: 'run-now', previousSetpoint: active.degrees },
+    { via: 'run-now', previousSetpoint: previous },
   );
   if (!('error' in moved)) {
     await db.patchState(latest.version, { records: moved.records, hold: null });
